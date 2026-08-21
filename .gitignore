@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+.agit/
+
+# Planning notes: exploratory thinking and the build plan. Kept locally,
+# not part of the shipped artifact.
+docs/
