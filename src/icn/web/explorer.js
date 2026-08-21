@@ -427,6 +427,154 @@ document.getElementById('lbl').onclick = ev => {
 };
 addEventListener('resize', () => draw());
 
+/* ------------------------------------------------------------------ export */
+/* Everything here runs in the browser against the embedded graph. The markdown
+   deliberately mirrors export.to_markdown() byte for byte, including the
+   trailing JSON block, so a file saved from this page re-imports through
+   `icn-explore import` exactly like one written by the CLI. Diverging would
+   produce a file that looks right and silently fails to import. */
+const MEM_ORDER = ['security','invariant','warning','contract','failed_attempt',
+  'decision','bug_history','fix_history','migration','performance','convention',
+  'rationale','test_evidence'];
+
+function toast(msg) {
+  let el = document.querySelector('.toast');
+  if (!el) { el = document.createElement('div'); el.className = 'toast';
+             document.body.appendChild(el); }
+  el.textContent = msg;
+  requestAnimationFrame(() => el.classList.add('show'));
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 2600);
+}
+
+function download(name, blob) {
+  const url = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast('Saved ' + name);
+}
+
+const slug = s => (s || 'knowledge').replace(/[^a-z0-9._-]+/gi, '-').toLowerCase();
+
+function toMarkdown(graph) {
+  const mems = graph.nodes.filter(n => n.kind === 'memory');
+  const out = [
+    `# Knowledge: ${graph.repo_name}`, '',
+    `Exported ${graph.exported_at} from \`${graph.repo_id}\`.`,
+    `${mems.length} memories over ${graph.stats.nodes} nodes` +
+      ` and ${graph.stats.edges} edges.`, '',
+    'Import with `icn-explore import <this file>`.', '',
+  ];
+
+  const labels = new Map(graph.nodes.map(n => [n.id, n.label]));
+  const anchored = new Map();
+  for (const e of graph.edges) if (e.kind === 'ANCHORED_TO')
+    (anchored.get(e.from) || anchored.set(e.from, []).get(e.from))
+      .push(labels.get(e.to) || e.to);
+
+  const byKind = new Map();
+  for (const m of mems) {
+    const k = m.detail?.memory_kind || 'rationale';
+    (byKind.get(k) || byKind.set(k, []).get(k)).push(m);
+  }
+  const kinds = [...MEM_ORDER.filter(k => byKind.has(k)),
+                 ...[...byKind.keys()].filter(k => !MEM_ORDER.includes(k)).sort()];
+
+  for (const kind of kinds) {
+    out.push('## ' + kind.replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase()), '');
+    for (const m of byKind.get(kind).sort((a,b) => (a.label||'').localeCompare(b.label||''))) {
+      const d = m.detail || {};
+      const flag = d.anchor_status === 'ACTIVE' ? '' : ` **[${d.anchor_status}]**`;
+      out.push(`### ${m.label}${flag}`, '');
+      out.push(`- severity: ${d.severity} | authority: ${d.authority}`);
+      const at = anchored.get(m.id) || [];
+      if (at.length) out.push('- applies to: ' + at.slice(0,8).map(a => '`'+a+'`').join(', '));
+      out.push('');
+      const body = (d.body || '').trim();
+      if (body && body !== m.label) out.push(body, '');
+    }
+  }
+
+  out.push('---', '', '<!-- infinite-code-next:graph -->', '```json',
+           JSON.stringify(graph, null, 1), '```', '');
+  return out.join('\n');
+}
+
+function visibleGraph() {
+  // What is on screen, as a real graph: filters and search already decided
+  // this, so exporting it is how a filtered view becomes a shareable subset.
+  const ids = new Set(vis.map(n => n.id));
+  const nodes = vis.map(({x,y,vx,vy,deg,r,hit,...keep}) => keep);
+  const edges = vedges.filter(e => ids.has(e.from) && ids.has(e.to));
+  const byNodeKind = {}, byEdgeKind = {};
+  for (const n of nodes) byNodeKind[n.kind] = (byNodeKind[n.kind]||0)+1;
+  for (const e of edges) byEdgeKind[e.kind] = (byEdgeKind[e.kind]||0)+1;
+  return {...GRAPH, nodes, edges,
+          exported_at: new Date().toISOString().replace(/\.(\d{3})Z$/, '.$1+00:00'),
+          stats:{nodes:nodes.length, edges:edges.length,
+                 by_node_kind:byNodeKind, by_edge_kind:byEdgeKind}};
+}
+
+function exportPng() {
+  // Compose onto an opaque ground: the canvas is transparent, and a PNG that
+  // renders as dark-on-dark everywhere except a white viewer is a trap.
+  const out = document.createElement('canvas');
+  out.width = cv.width; out.height = cv.height;
+  const c = out.getContext('2d');
+  c.fillStyle = getComputedStyle(document.documentElement)
+                  .getPropertyValue('--stage').trim() || '#141930';
+  c.fillRect(0, 0, out.width, out.height);
+  c.drawImage(cv, 0, 0);
+  out.toBlob(b => download(slug(GRAPH.repo_name) + '-graph.png', b), 'image/png');
+}
+
+const EXPORTS = {
+  md:   () => download(slug(GRAPH.repo_name) + '-knowledge.md',
+                new Blob([toMarkdown(GRAPH)], {type:'text/markdown;charset=utf-8'})),
+  json: () => download(slug(GRAPH.repo_name) + '-graph.json',
+                new Blob([JSON.stringify(GRAPH, null, 1)], {type:'application/json'})),
+  html: () => download(slug(GRAPH.repo_name) + '-explorer.html',
+                new Blob(['<!doctype html>\n' + document.documentElement.outerHTML],
+                         {type:'text/html;charset=utf-8'})),
+  png:  exportPng,
+  clip: async () => {
+    const md = toMarkdown(visibleGraph());
+    try {
+      await navigator.clipboard.writeText(md);
+      toast(`Copied ${vis.length} nodes as markdown`);
+    } catch {
+      // Clipboard needs a secure context; falling back to a file is better
+      // than telling someone their export vanished.
+      download(slug(GRAPH.repo_name) + '-visible.md',
+               new Blob([md], {type:'text/markdown;charset=utf-8'}));
+    }
+  },
+};
+
+const exportBtn = document.getElementById('exportBtn');
+const exportMenu = document.getElementById('exportMenu');
+function closeMenu() {
+  exportMenu.hidden = true;
+  exportBtn.classList.remove('on');
+  exportBtn.setAttribute('aria-expanded', 'false');
+}
+exportBtn.onclick = ev => {
+  ev.stopPropagation();
+  const open = exportMenu.hidden;
+  exportMenu.hidden = !open;
+  exportBtn.classList.toggle('on', open);
+  exportBtn.setAttribute('aria-expanded', String(open));
+};
+exportMenu.querySelectorAll('button[data-fmt]').forEach(b => b.onclick = () => {
+  closeMenu();
+  try { EXPORTS[b.dataset.fmt](); }
+  catch (err) { toast('Export failed: ' + err.message); }
+});
+addEventListener('click', ev => {
+  if (!exportMenu.hidden && !exportMenu.contains(ev.target)) closeMenu();
+});
+
 /* --------------------------------------------------------------- lifecycle */
 function seed() {
   nodes.forEach((n,i) => {

@@ -212,3 +212,47 @@ def test_the_page_cannot_be_broken_by_content(workspace, tmp_path):
     payload = page.split('id="data" type="application/json">', 1)[1].split("</script>", 1)[0]
     assert json.loads(payload), "an embedded </script> must not truncate the data block"
     assert "window.__pwned" not in page.split("__DATA__")[0]
+
+
+def test_the_page_offers_every_export_the_cli_does(workspace):
+    """Export was CLI-only, which is invisible to anyone using the UI."""
+    record_baseline(workspace)
+    page = explorer.render(graph_of(workspace))
+
+    for fmt in ('data-fmt="md"', 'data-fmt="json"', 'data-fmt="html"',
+                'data-fmt="png"', 'data-fmt="clip"'):
+        assert fmt in page, f"export menu is missing {fmt}"
+    assert 'id="exportBtn"' in page
+
+
+def test_browser_and_cli_markdown_agree(workspace):
+    """The page rebuilds markdown in JS rather than calling back to the
+    server, so the two implementations must not drift: a browser export that
+    looks right and silently fails to import is the worst outcome."""
+    record_baseline(workspace)
+    graph = graph_of(workspace)
+    page = explorer.render(graph)
+
+    # The JS mirrors to_markdown(); check the structural contract both sides
+    # depend on, not the prose.
+    for anchor in ('# Knowledge: ', 'Import with `icn-explore import <this file>`.',
+                   '<!-- infinite-code-next:graph -->'):
+        assert anchor in export.to_markdown(graph)
+        assert anchor in page, f"page markdown builder is missing {anchor!r}"
+
+    # And the memory-kind ordering, which decides section order in both.
+    assert "MEM_ORDER" in page
+    for kind in ('security', 'invariant', 'warning', 'failed_attempt', 'test_evidence'):
+        assert f"'{kind}'" in page
+
+
+def test_exports_need_no_server(workspace):
+    """A saved page must still export. Anything fetching from the origin it
+    was served from breaks the moment someone opens it from disk."""
+    record_baseline(workspace)
+    page = explorer.render(graph_of(workspace))
+
+    js = page.split('id="data"', 1)[1]
+    for call in ('fetch(', 'XMLHttpRequest', 'EventSource'):
+        assert call not in js, f"export path must not use {call}"
+    assert 'URL.createObjectURL' in js, "downloads should come from an in-memory Blob"

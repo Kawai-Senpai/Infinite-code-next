@@ -114,9 +114,9 @@ icn-explore           # if the package is on your PATH
 <img src="assets/explorer.png" alt="The knowledge explorer: filters on the left, force-directed graph in the centre, node inspector on the right" width="900">
 </div>
 
-Above: a `bug_history` memory selected. Its neighbourhood lights up — the two
-files it is anchored to, the symbol it governs, the test that guards it (green,
-dashed), the six symbols it impacts (amber, dashed) — while everything else
+Above: the export menu open over the graph. Selecting a node instead lights up
+its neighbourhood — the files it is anchored to, the test that guards it
+(green, dashed), the symbols it impacts (amber, dashed) — while everything else
 fades back.
 
 | | |
@@ -126,6 +126,7 @@ fades back.
 | **Inspect** | click a node for its full body, metadata, and every typed connection |
 | **Navigate** | click any connection to jump there — walk from a warning to the code it guards to the test that covers it |
 | **Zoom & pan** | scroll and drag; node size is call-degree, so load-bearing code looks load-bearing |
+| **Export** | markdown, graph JSON, the page itself, a PNG, or just what is currently on screen |
 
 Self-contained: one HTML file with the data inlined. No CDN, no build step, no
 npm. Save it, email it, commit it — it still works.
@@ -142,6 +143,22 @@ icn-explore --include-deleted           # include tombstoned code
 
 Hand another codebase's hard-won knowledge to someone else — or to another
 agent.
+
+### From the explorer
+
+The **Export** button offers everything below without leaving the page. It all
+runs offline in the browser against the embedded graph — no server call, so a
+saved page still exports.
+
+| | |
+|---|---|
+| **Markdown** | readable anywhere, and re-importable |
+| **Graph JSON** | nodes and edges, raw |
+| **This page** | the self-contained explorer, to send to someone |
+| **Image** | PNG of the current view |
+| **Copy visible** | *only what is on screen* — filter and search first, and the filtered view becomes a shareable subset |
+
+### From the CLI
 
 ```bash
 icn-explore export -o knowledge.md      # readable markdown, renders anywhere
