@@ -149,8 +149,11 @@ def workspace(
                 "ok": True,
                 "resolved_root": str(current.root),
                 "repo_id": current.repo_id,
-                "registered": current.info.get("created"),
-                "reattached": current.info.get("reattached"),
+                # "registered" read as "is this repository known", and was
+                # False on every open after the first - the opposite of the
+                # truth for a repository with knowledge already stored.
+                "first_seen": bool(current.info.get("created")),
+                "reattached": bool(current.info.get("reattached")),
                 "identity": state["identity"],
                 "head": current.commit,
                 "index": report,

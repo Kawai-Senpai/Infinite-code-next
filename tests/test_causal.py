@@ -22,6 +22,16 @@ def rec(ws, **payload):
 
 
 def memory_of(result, kind):
+    """The memory of this kind that the event's causal edge attached to.
+
+    An event can produce several memories of one kind (a summary plus each
+    listed fact), so "the first one of this kind" is not necessarily the one a
+    causal edge names. record() reports which is primary; prefer it.
+    """
+    primary = result.get("primary_memory")
+    for entry in result["memories_created"]:
+        if entry["kind"] == kind and entry["memory_id"] == primary:
+            return entry["memory_id"]
     for entry in result["memories_created"]:
         if entry["kind"] == kind:
             return entry["memory_id"]
@@ -54,7 +64,8 @@ def story(workspace):
               tests=["test_parallel_refresh_regression"],
               caused_by=[{"memory": f_id, "kind": "LED_TO"}])
     return {"decision": d_id, "bug": b_id, "failed": f_id,
-            "invariant": memory_of(fix, "invariant")}
+            "invariant": memory_of(fix, "invariant"),
+            "fix": fix["primary_memory"]}
 
 
 def test_causal_edges_are_written(workspace, story):
@@ -156,3 +167,66 @@ def test_causal_history_appears_in_investigate_capsules(workspace, story):
     assert capsule is not None
     assert capsule["why_it_exists"] is not None
     assert capsule["why_it_exists"]["may_reintroduce"]
+
+
+def test_a_causal_edge_names_one_memory_not_all_of_them(workspace):
+    """Fanning out to every memory an event produced invents causality.
+
+    Observed live producing "warm-open bug CAUSED MCP annotation invariant",
+    which is simply false. A wrong causal chain is worse than none, because it
+    reads as authoritative.
+    """
+    first = rec(workspace, kind="decision", summary="an unrelated earlier decision",
+                decisions=["do the earlier thing"], symbols=["rotate_token"])
+    prior = first["primary_memory"]
+
+    later = rec(workspace, kind="bug_fix", summary="a fix with several facts",
+                invariants=["some invariant"], warnings=["some warning"],
+                tests=["test_something"], symbols=["refresh_session"],
+                caused_by=[prior])
+
+    from_prior = rows(workspace.store.execute(
+        "SELECT to_id FROM memory_edges WHERE from_id=? AND kind='CAUSED'"
+        " AND status='ACTIVE'", (prior,)))
+    assert len(from_prior) == 1, \
+        f"one caused_by must create one causal edge, got {len(from_prior)}"
+    assert from_prior[0]["to_id"] == later["primary_memory"]
+
+
+def test_record_reports_which_memory_is_primary(workspace):
+    """Without it a caller passing caused_by next has to guess from an
+    unordered list, and naming the wrong memory builds a false chain."""
+    result = rec(workspace, kind="bug_fix", summary="a fix",
+                 invariants=["inv"], tests=["test_x"], symbols=["refresh_session"])
+
+    primary = result["primary_memory"]
+    assert primary, "record must say which memory represents the event"
+    flagged = [m for m in result["memories_created"] if m.get("primary")]
+    assert len(flagged) == 1 and flagged[0]["memory_id"] == primary
+
+
+def test_a_fix_is_not_reported_as_the_risk_it_removed(workspace):
+    """bug_fix and incident both mapping to bug_history made a remedy
+    indistinguishable from a failure, so "why does this exist" reported the
+    fix as something removing the code might reintroduce."""
+    incident = rec(workspace, kind="incident", summary="the outage",
+                   bugs=["tokens were invalidated concurrently"],
+                   symbols=["refresh_session"])
+    fix = rec(workspace, kind="bug_fix", summary="serialize the refreshes",
+              invariants=["refreshes are serialized"],
+              symbols=["RefreshCoordinator.acquire"],
+              caused_by=[{"memory": incident["primary_memory"], "kind": "LED_TO"}])
+
+    kinds = {m["kind"] for m in fix["memories_created"]}
+    assert "fix_history" in kinds, "a fix must not be stored as bug history"
+    assert "bug_history" not in kinds
+
+    story = causal.why_does_this_exist(
+        workspace.store,
+        one(workspace.store.execute(
+            "SELECT symbol_id FROM symbols WHERE symbol_path='RefreshCoordinator.acquire'"
+        ))["symbol_id"])
+    assert story is not None
+    # The incident is the risk; the fix that removed it is not.
+    assert any("outage" in r for r in story["may_reintroduce"])
+    assert not any("serialize" in r.lower() for r in story["may_reintroduce"]),         "the remedy must never be reported as the risk"

@@ -88,7 +88,23 @@ def create_anchor(conn: sqlite3.Connection, memory_id: str, symbol: dict[str, An
 
 
 def _record_transition(anchor: dict[str, Any], kind: str, detail: dict[str, Any]) -> str:
+    """Append one transition, keeping only what is worth auditing.
+
+    A no-op verification is not history. Recording every "unchanged" pass fills
+    the ring buffer with identical entries and evicts the real re-anchors it
+    exists to preserve - measured live at 25 consecutive "unchanged" rows on a
+    single anchor, which is also dead weight in every memory(get) response.
+    """
     history = jload(anchor.get("reanchor_history"), []) or []
+
+    if kind == "unchanged":
+        # Keep one, as evidence the anchor is being checked, and refresh its
+        # timestamp rather than growing the list.
+        if history and history[-1].get("transition") == "unchanged":
+            history[-1]["at"] = now()
+            history[-1]["repeats"] = int(history[-1].get("repeats", 1)) + 1
+            return jdump(history[-25:])
+
     history.append({
         "at": now(),
         "transition": kind,

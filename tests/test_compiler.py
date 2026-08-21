@@ -13,7 +13,7 @@ def test_one_event_becomes_many_facts(workspace):
 
     assert result["ok"]
     kinds = {m["kind"] for m in result["memories_created"]}
-    assert {"invariant", "warning", "failed_attempt", "bug_history"} <= kinds
+    assert {"invariant", "warning", "failed_attempt", "fix_history"} <= kinds
     assert result["edges_created"] > len(result["memories_created"])
     assert result["unresolved_references"] == []
 

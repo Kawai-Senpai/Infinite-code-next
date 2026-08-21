@@ -383,6 +383,7 @@ def _apply_schema(conn: sqlite3.Connection, schema: str) -> None:
             conn.executescript(schema)
             _migrate(conn)
             _backfill_fts(conn)
+            _repair_ref_commits(conn)
             _set_version(conn)
             return
         except sqlite3.OperationalError as exc:
@@ -420,6 +421,47 @@ def _backfill_fts(conn: sqlite3.Connection) -> None:
             "INSERT INTO fts_memories (memory_id, title, body, kind) VALUES (?,?,?,?)",
             [(r[0], r[1] or "", (r[2] or "")[:4000], r[3] or "") for r in missing],
         )
+        conn.execute("COMMIT")
+    except sqlite3.OperationalError:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
+
+# Ref names are not commit ids. A store that recorded one has a permanently
+# broken equality test: `unreviewed_caller` compares a symbol's last_seen_commit
+# against an anchor's last_verified_commit, so "HEAD" on one side and a real SHA
+# on the other reports every governed symbol as unreviewed, forever.
+_REF_NAMES = ("HEAD", "head", "@", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD")
+
+_REF_COLUMNS = (
+    ("memories", ("created_commit", "last_verified_commit")),
+    ("anchors", ("commit_observed", "last_verified_commit")),
+    ("symbols", ("last_seen_commit", "deleted_at_commit")),
+    ("files", ("first_seen_commit", "last_seen_commit", "deleted_at_commit")),
+    ("code_edges", ("valid_from_commit", "valid_until_commit")),
+)
+
+
+def _repair_ref_commits(conn: sqlite3.Connection) -> None:
+    """Null out ref names stored where a commit id belongs.
+
+    NULL is honest - "we do not know which commit" is a state the graph already
+    handles, whereas a ref name is a value that compares wrongly forever. Runs
+    once per store in practice: after the first pass there is nothing to match.
+    """
+    placeholders = ",".join("?" for _ in _REF_NAMES)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for table, columns in _REF_COLUMNS:
+            for column in columns:
+                try:
+                    conn.execute(
+                        f"UPDATE {table} SET {column} = NULL"
+                        f" WHERE {column} IN ({placeholders})", _REF_NAMES)
+                except sqlite3.OperationalError:
+                    continue        # table or column absent in this schema
         conn.execute("COMMIT")
     except sqlite3.OperationalError:
         try:

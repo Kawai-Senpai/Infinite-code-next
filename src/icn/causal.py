@@ -198,6 +198,8 @@ def why_does_this_exist(conn: sqlite3.Connection, symbol_id: str,
         # BEFORE it - upstream in the chain. A fix is itself stored as
         # bug_history, so scanning the whole chain reports the remedy as the risk.
         for node in chain["caused_by"]:
+            # fix_history is deliberately absent: a fix upstream in the chain
+            # is what removed the risk, not the risk itself.
             if node.get("kind") in ("bug_history", "incident"):
                 risks.append(node["title"])
         for node in chain["caused_by"] + chain["led_to"] + [dict(memory)]:

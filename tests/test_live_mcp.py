@@ -151,7 +151,7 @@ def test_every_tool_documents_itself(live):
 def test_workspace_opens_and_indexes_on_first_call(live):
     opened = live["opened"]
     assert opened["ok"] is True
-    assert opened["registered"] is True
+    assert opened["first_seen"] is True
     assert opened["identity"]["vcs"] == "git"
     assert opened["identity"]["strength"] == "strong"
     assert opened["index"]["symbols_active"] >= 5
@@ -168,7 +168,7 @@ def test_record_compiles_one_event_into_many_facts(live):
     recorded = live["recorded"]
     assert recorded["ok"] is True
     kinds = {m["kind"] for m in recorded["memories_created"]}
-    assert {"invariant", "warning", "failed_attempt", "bug_history"} <= kinds
+    assert {"invariant", "warning", "failed_attempt", "fix_history"} <= kinds
     assert recorded["edges_created"] > 5
     assert recorded["unresolved_references"] == []
     assert recorded["entities_resolved"][0]["resolved_to"] == "RefreshCoordinator.acquire"

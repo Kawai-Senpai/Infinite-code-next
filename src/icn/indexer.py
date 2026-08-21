@@ -149,6 +149,7 @@ class Indexer:
 
     def index_file(self, abs_path: Path, commit: str | None) -> dict[str, Any]:
         """Parse and store one file. Convenience wrapper for single-file use."""
+        commit = normalize_commit(commit)
         parsed = self.read_and_parse(abs_path)
         if parsed is None or parsed.get("skipped"):
             return parsed or {"skipped": "unknown"}
@@ -156,6 +157,7 @@ class Indexer:
 
     def store_parsed(self, parsed: dict[str, Any], commit: str | None) -> dict[str, Any]:
         """Write an already-parsed file. Must run inside a write transaction."""
+        commit = normalize_commit(commit)
         rel_path = parsed["path"]
         lang = parsed["lang"]
         data = parsed["data"]
@@ -480,6 +482,29 @@ def index_state(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+# Ref names that are emphatically not commit ids. Storing one silently
+# corrupts every commit comparison downstream: `unreviewed_caller` compares a
+# symbol's last_seen_commit against an anchor's last_verified_commit, so a
+# store holding "HEAD" on one side and a real SHA on the other reports every
+# governed symbol as unreviewed, permanently.
+_NOT_A_COMMIT = {"HEAD", "head", "@", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD"}
+
+
+def normalize_commit(commit: str | None) -> str | None:
+    """Accept a commit id, reject a ref name.
+
+    A ref is a moving pointer; a commit id is a fact. Only the latter can be
+    compared for equality later, so anything else becomes None - unknown is a
+    state the graph handles, a wrong value is not.
+    """
+    if not commit:
+        return None
+    text = str(commit).strip()
+    if not text or text in _NOT_A_COMMIT:
+        return None
+    return text
+
+
 def head_commit(root: Path) -> str | None:
     code, out, _ = run_git(["rev-parse", "HEAD"], root)
-    return out if code == 0 and out else None
+    return normalize_commit(out) if code == 0 and out else None

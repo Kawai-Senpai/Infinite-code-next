@@ -88,7 +88,9 @@ def open_workspace(explicit_root: str | None = None) -> Workspace:
         checkout_id=info["checkout_id"],
         catalog=catalog,
         store=store,
-        commit=info.get("head"),
+        # A ref name is not a commit id; storing one corrupts every later
+        # commit comparison (see indexer.normalize_commit).
+        commit=indexer_mod.normalize_commit(info.get("head")),
         info=info,
     )
 

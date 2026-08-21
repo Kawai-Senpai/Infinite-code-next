@@ -42,8 +42,13 @@ FIELD_KINDS = {
     "tests": ("test_evidence", "low"),
 }
 
+# A fix and a failure are not the same fact. Mapping both to bug_history made
+# them indistinguishable, so "why does this exist" reported the remedy as a
+# risk the code protects against - the exact inversion the feature exists to
+# avoid. `bug_fix` is the remedy; `incident` and the `bugs=[...]` field are
+# the failure.
 EVENT_KIND_TO_MEMORY = {
-    "bug_fix": ("bug_history", "medium"),
+    "bug_fix": ("fix_history", "medium"),
     "decision": ("decision", "medium"),
     "refactor": ("rationale", "low"),
     "investigation": ("rationale", "low"),
@@ -139,6 +144,8 @@ def _as_list(value: Any) -> list[str]:
 def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id: str,
                  root: Path, commit: str | None, payload: dict[str, Any]) -> dict[str, Any]:
     """Compile one event into the graph. Returns the delta that was written."""
+    from .indexer import normalize_commit
+    commit = normalize_commit(commit)
     event_id = ids.new_id(ids.EVENT)
     kind = str(payload.get("kind") or "note")
     summary = str(payload.get("summary") or "").strip()
@@ -251,10 +258,19 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
     cross_links = _link_contracts(catalog, payload, resolved, created_memories, commit)
     causal_links = _link_causal(conn, payload, created_memories)
 
+    # Say which memory represents this event. A caller passing caused_by next
+    # would otherwise have to guess from an unordered list, and a causal edge
+    # naming the wrong one silently builds a false chain.
+    primary_id = _primary_memory(created_memories)["memory_id"] if created_memories else None
+    for entry in created_memories:
+        if entry["memory_id"] == primary_id:
+            entry["primary"] = True
+
     return {
         "ok": True,
         "event_id": event_id,
         "memories_created": created_memories,
+        "primary_memory": primary_id,
         "edges_created": created_edges,
         "cross_repo_links": cross_links,
         "causal_links": causal_links,
@@ -343,6 +359,22 @@ def _link_test_coverage(conn: sqlite3.Connection,
                                  {"declared_by": "record(tests=...)"})
     return created
 
+
+# Which memory an event is "about", when a causal edge names the event rather
+# than a specific fact. Ordered by how much each kind carries the story.
+_PRIMARY_ORDER = ("bug_history", "fix_history", "decision", "invariant", "warning",
+                  "contract", "security", "failed_attempt", "migration",
+                  "performance", "rationale", "convention", "test_evidence")
+
+
+def _primary_memory(memories: list[dict[str, Any]]) -> dict[str, Any]:
+    """The one memory that best represents this event."""
+    ranked = sorted(
+        memories,
+        key=lambda m: _PRIMARY_ORDER.index(m["kind"]) if m["kind"] in _PRIMARY_ORDER
+        else len(_PRIMARY_ORDER))
+    return ranked[0]
+
 def _link_causal(conn: sqlite3.Connection, payload: dict[str, Any],
                  memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Attach this event's memories to the story that produced them.
@@ -371,12 +403,27 @@ def _link_causal(conn: sqlite3.Connection, payload: dict[str, Any],
                 continue
             if not prior:
                 continue
-            # Every memory this event produced continues from the prior one.
+            # Link to ONE memory - the event's primary claim - not to all of
+            # them. Fanning out to every memory the event produced invents
+            # causality that was never asserted: recording a bug fix with
+            # caused_by=[X] would claim X caused the invariant, the test
+            # evidence and the decision alike. Observed live producing a chain
+            # reading "warm-open bug CAUSED MCP annotation invariant", which is
+            # simply false, and a wrong causal chain is worse than none because
+            # it reads as authoritative.
+            target = _primary_memory(memories)
+            result = causal.link_causal(conn, prior, target["memory_id"], kind)
+            out.append(result)
+
+            # The event's other memories hang off its primary one, so the
+            # story stays connected without inventing causality. An invariant
+            # recorded alongside a fix was ESTABLISHED by that fix; it did not
+            # independently follow from whatever caused the fix.
             for memory in memories:
-                result = causal.link_causal(conn, prior, memory["memory_id"], kind)
-                out.append(result)
-                if not result.get("ok"):
-                    break
+                if memory["memory_id"] == target["memory_id"]:
+                    continue
+                causal.link_causal(conn, target["memory_id"], memory["memory_id"],
+                                   "ESTABLISHED")
     return out
 
 def title_for(body: str) -> str:

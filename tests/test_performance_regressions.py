@@ -15,7 +15,7 @@ from conftest import record_baseline
 
 from icn import parsing, search as search_mod
 from icn import workspace as ws_mod
-from icn.db import init_repo_store, one
+from icn.db import init_repo_store, one, rows
 from icn.indexer import Indexer, iter_source_files
 from icn import paths
 
@@ -203,3 +203,71 @@ def test_a_no_op_open_does_not_re_resolve_every_symbol(workspace, project, monke
     assert seen, "resolve_calls should still be called"
     assert seen[-1] is not None, "an empty touched set must never mean 'resolve everything'"
     assert seen[-1] == set(), "nothing was touched, so nothing should be resolved"
+
+
+def test_a_ref_name_is_never_stored_as_a_commit_id(workspace, project):
+    """A ref is a moving pointer; a commit id is a fact.
+
+    Storing "HEAD" where a commit id belongs breaks equality forever:
+    `unreviewed_caller` compares a symbol's last_seen_commit against an
+    anchor's last_verified_commit, so a store holding "HEAD" on one side and a
+    real SHA on the other reports every governed symbol as unreviewed. Measured
+    live: 34 memories and 380 symbols all carrying "HEAD".
+    """
+    from icn.indexer import normalize_commit
+
+    for ref in ("HEAD", "head", "@", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "", "  "):
+        assert normalize_commit(ref) is None, f"{ref!r} is a ref, not a commit"
+    assert normalize_commit("ebd11e85a825ce9817104075cc72ea9a70d11215") is not None
+
+    # And it holds through the public path, whatever a caller passes.
+    from icn import compiler
+    compiler.record_event(workspace.store, workspace.catalog, workspace.repo_id,
+                          workspace.root, "HEAD",
+                          {"kind": "note", "summary": "recorded with a ref name",
+                           "warnings": ["careful"], "symbols": ["refresh_session"]})
+
+    stored = rows(workspace.store.execute(
+        "SELECT created_commit FROM memories WHERE created_commit IS NOT NULL"))
+    assert not any(r["created_commit"] == "HEAD" for r in stored)
+
+
+def test_an_existing_store_holding_ref_names_is_repaired(workspace):
+    """Existing stores must heal, not live with permanent false positives."""
+    from icn.db import _repair_ref_commits, write_tx
+
+    with write_tx(workspace.store):
+        workspace.store.execute("UPDATE symbols SET last_seen_commit='HEAD'")
+    assert rows(workspace.store.execute(
+        "SELECT 1 FROM symbols WHERE last_seen_commit='HEAD' LIMIT 1"))
+
+    _repair_ref_commits(workspace.store)
+
+    assert not rows(workspace.store.execute(
+        "SELECT 1 FROM symbols WHERE last_seen_commit='HEAD' LIMIT 1")), \
+        "a ref name must be nulled out; unknown is honest, wrong is not"
+
+
+def test_repeated_verification_does_not_grow_anchor_history(workspace, project):
+    """A no-op verification is not history.
+
+    Recording every "unchanged" pass filled the 25-entry ring buffer with
+    identical rows and evicted the real re-anchors it exists to preserve -
+    measured live at 25 consecutive "unchanged" entries on one anchor, shipped
+    in every memory(get) response.
+    """
+    import json
+
+    record_baseline(workspace)
+    for _ in range(8):
+        ws_mod.ensure_indexed(workspace)
+
+    histories = [json.loads(r["reanchor_history"] or "[]") for r in rows(
+        workspace.store.execute("SELECT reanchor_history FROM anchors"))]
+    assert histories, "expected anchors"
+    worst = max(len(h) for h in histories)
+    assert worst <= 2, f"no-op verifications must collapse, got {worst} entries"
+
+    for history in histories:
+        unchanged = [e for e in history if e.get("transition") == "unchanged"]
+        assert len(unchanged) <= 1, "consecutive no-ops must collapse into one"
