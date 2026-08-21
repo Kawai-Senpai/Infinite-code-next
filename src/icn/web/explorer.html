@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ - Knowledge Explorer</title>
+<link rel="stylesheet" href="explorer.css">
+</head>
+<body>
+<div id="app">
+  <div class="card rail">
+    <div class="brand">
+      <h1>__TITLE__</h1>
+      <p id="stats"></p>
+    </div>
+    <div class="scroll">
+      <div class="search">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+        <input type="search" id="q" placeholder="Search"><kbd>/</kbd>
+      </div>
+      <h2>Show</h2><div id="kinds"></div>
+      <h2>Severity</h2><div id="sevs"></div>
+      <h2>Anchor</h2><div id="anchors"></div>
+      <h2>Relationships</h2><div id="edges"></div>
+    </div>
+  </div>
+
+  <div class="stage">
+    <canvas id="c"></canvas>
+    <div class="float toolbar">
+      <button class="btn" id="fit" title="Fit to view">Fit</button>
+      <button class="btn" id="relayout" title="Re-run layout">Re-layout</button>
+      <button class="btn" id="lbl" title="Toggle labels">Labels</button>
+    </div>
+    <div class="float legend" id="legend"></div>
+    <div class="float count" id="count"></div>
+  </div>
+
+  <div class="card" id="side">
+    <div class="shead">
+      <div id="shead-tags"></div>
+      <button class="close" id="close" title="Close">&times;</button>
+    </div>
+    <div class="sbody" id="sbody"></div>
+  </div>
+</div>
+<div class="tip" id="tip"></div>
+
+<script id="data" type="application/json">__DATA__</script>
+<script src="explorer.js"></script>
+</body>
+</html>

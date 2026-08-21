@@ -1,22 +1,20 @@
 <div align="center">
 
-# Infinite Code Next
-
-### Code remembers *what* it does. This remembers **why**.
+<img src="assets/banner.svg" alt="Infinite Code Next - code remembers what it does, this remembers why" width="820">
 
 A zero-config MCP server that gives AI coding agents persistent, verifiable
 memory of a codebase — the decisions behind it, what was already tried and
 rejected, and what must never break — anchored to the code and carried with it
 as the code moves.
 
-[![tests](https://img.shields.io/badge/tests-159%20passing-3fb950?style=flat-square)](#testing)
-[![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)](#install)
-[![mcp](https://img.shields.io/badge/protocol-MCP-d2a8ff?style=flat-square)](#install)
-[![offline](https://img.shields.io/badge/LLM%20calls-none-58a6ff?style=flat-square)](#no-llm-in-the-loop)
+[![tests](https://img.shields.io/badge/tests-159_passing-34d399?style=for-the-badge&labelColor=1c2340)](#testing)
+[![python](https://img.shields.io/badge/python-3.10+-4d7cfe?style=for-the-badge&labelColor=1c2340)](#quick-start)
+[![mcp](https://img.shields.io/badge/protocol-MCP-8b5cf6?style=for-the-badge&labelColor=1c2340)](#quick-start)
+[![no llm](https://img.shields.io/badge/LLM_calls-none-fbbf24?style=for-the-badge&labelColor=1c2340)](#no-llm-in-the-loop)
 
 **[Quick start](#quick-start) · [Explorer](#the-knowledge-explorer) ·
 [Sharing](#sharing-knowledge) · [For agents](#guide-for-ai-agents) ·
-[How it works](#how-it-works)**
+[How it works](#how-it-works) · [Brand](#brand)**
 
 </div>
 
@@ -112,21 +110,14 @@ explore.bat           # Windows
 icn-explore           # if the package is on your PATH
 ```
 
-```
-┌── FILTERS ────────┬─────────── GRAPH ────────────┬── INSPECTOR ────┐
-│ ☑ symbol     421  │                              │ memory  high    │
-│ ☑ memory      48  │        ╱─○──○─╲              │                 │
-│ ☑ file        39  │      ○──●══●───○             │ stdio servers   │
-│                   │       ╲  ║  ╱                │ must detach     │
-│ SEVERITY          │        ○─●─○                 │ subprocess      │
-│ ☑ high        18  │           ║                  │ stdin           │
-│ ☑ medium      17  │           ○                  │                 │
-│                   │                              │ CONNECTIONS(13) │
-│ ANCHOR STATUS     │  ● memory   ○ symbol         │ → ANCHORED_TO   │
-│ ☑ ACTIVE      48  │  ═ anchored ─ calls          │   run_git       │
-│ ☐ NEEDS_REVIEW 3  │                              │ → GUARDED_BY    │
-└───────────────────┴──────────────────────────────┴─────────────────┘
-```
+<div align="center">
+<img src="assets/explorer.png" alt="The knowledge explorer: filters on the left, force-directed graph in the centre, node inspector on the right" width="900">
+</div>
+
+Above: a `bug_history` memory selected. Its neighbourhood lights up — the two
+files it is anchored to, the symbol it governs, the test that guards it (green,
+dashed), the six symbols it impacts (amber, dashed) — while everything else
+fades back.
 
 | | |
 |---|---|
@@ -394,6 +385,57 @@ explicitly rather than silently inheriting upstream's memories.
 
 Lookups go through a resolver that never raises: "cannot currently resolve" is
 returned as data, with whatever was last known.
+
+---
+
+## Brand
+
+<table>
+<tr>
+<td width="130" align="center"><img src="assets/mark.svg" width="88"></td>
+<td>
+
+The mark is the product's one idea: a piece of **knowledge** (violet) anchored
+to **code** (green) that would otherwise carry no memory of it. The ring is
+left open — knowledge is never finished being verified.
+
+Stroke weights are set so the shape survives to a 16px favicon: the memory node
+stays dominant and the three anchors read as a triangle even when the ring
+blurs away.
+
+</td>
+</tr>
+</table>
+
+| | Hex | Means |
+|---|---|---|
+| ![](https://img.shields.io/badge/-8b5cf6?style=flat-square&color=8b5cf6) | `#8b5cf6` | memory, anchoring — knowledge |
+| ![](https://img.shields.io/badge/-34d399?style=flat-square&color=34d399) | `#34d399` | symbols, tests — verified code |
+| ![](https://img.shields.io/badge/-4d7cfe?style=flat-square&color=4d7cfe) | `#4d7cfe` | files — structure |
+| ![](https://img.shields.io/badge/-fbbf24?style=flat-square&color=fbbf24) | `#fbbf24` | repository, caution |
+| ![](https://img.shields.io/badge/-f4677c?style=flat-square&color=f4677c) | `#f4677c` | critical, causal chains |
+| ![](https://img.shields.io/badge/-1c2340?style=flat-square&color=1c2340) | `#1c2340` | card surface |
+| ![](https://img.shields.io/badge/-151a2e?style=flat-square&color=151a2e) | `#151a2e` | ground |
+
+One rule governs the whole UI: **structure is quiet, knowledge is loud.**
+`CALLS` and `DEFINES` recede into the background so that anchor and causal
+edges — the thing no other tool can show you — carry the colour.
+
+Assets live in [`assets/`](assets/); the explorer's own source is
+[`src/icn/web/`](src/icn/web/):
+
+```
+src/icn/web/
+  explorer.html    shell and markup
+  explorer.css     the design system above, as custom properties
+  explorer.js      force layout, canvas rendering, inspector
+  mark.svg         logo
+  banner.svg       header
+```
+
+Real `.html`, `.css` and `.js` rather than string literals, so an editor
+treats them as what they are. They are inlined at render time, because the
+published page must stay a single self-contained file.
 
 ---
 

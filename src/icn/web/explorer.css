@@ -1,0 +1,184 @@
+/* Visual language: soft cards floating on a tinted ground, generous padding,
+   one saturated accent per meaning. Depth comes from elevation and radius
+   rather than borders, so the graph canvas reads as the surface everything
+   else sits above. */
+:root {
+  --ground:#151a2e;          /* page behind the cards */
+  --card:#1c2340;            /* panel surface */
+  --card-2:#232b4d;          /* raised inside a panel */
+  --stage:#141930;           /* canvas well */
+  --line:rgba(255,255,255,.07);
+
+  --text:#eef1fa;
+  --dim:#9aa3c4;
+  --faint:#6b7499;
+
+  --blue:#4d7cfe;            /* files, structure */
+  --violet:#8b5cf6;          /* memories, knowledge */
+  --green:#34d399;           /* symbols, tests passing */
+  --amber:#fbbf24;           /* repository, caution */
+  --rose:#f4677c;            /* critical, causal */
+
+  --crit:#f4677c; --high:#fb923c; --med:#fbbf24; --low:#7b849f;
+
+  --r-lg:20px; --r-md:14px; --r-sm:10px;
+  --shadow:0 10px 34px rgba(6,9,22,.5);
+}
+
+* { box-sizing:border-box; }
+html,body { height:100%; }
+body {
+  margin:0; overflow:hidden;
+  background:var(--ground); color:var(--text);
+  font:13px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Inter,system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+
+#app {
+  display:grid; grid-template-columns:272px 1fr 0px; gap:14px;
+  height:100vh; padding:14px;
+  transition:grid-template-columns .2s cubic-bezier(.4,0,.2,1);
+}
+#app.open { grid-template-columns:272px 1fr 384px; }
+
+.card {
+  background:var(--card); border-radius:var(--r-lg); box-shadow:var(--shadow);
+  display:flex; flex-direction:column; min-height:0; overflow:hidden;
+}
+
+/* ------------------------------------------------------------------ rail */
+.brand { padding:20px 20px 16px; }
+.brand h1 { margin:0; font-size:15px; font-weight:650; letter-spacing:-.015em; }
+.brand p { margin:4px 0 0; font-size:11.5px; color:var(--faint);
+           font-variant-numeric:tabular-nums; }
+
+.scroll { overflow-y:auto; padding:0 14px 20px; flex:1; min-height:0; }
+.scroll::-webkit-scrollbar { width:10px; }
+.scroll::-webkit-scrollbar-thumb {
+  background:rgba(255,255,255,.09); border-radius:10px; border:3px solid var(--card); }
+
+.search { position:relative; margin:0 6px 18px; }
+.search input {
+  width:100%; padding:11px 34px 11px 36px; border-radius:var(--r-md);
+  border:1px solid transparent; background:var(--card-2); color:var(--text); font:inherit;
+}
+.search input::placeholder { color:var(--faint); }
+.search input:focus { outline:none; border-color:var(--blue);
+                      box-shadow:0 0 0 4px rgba(77,124,254,.16); }
+.search svg { position:absolute; left:13px; top:12px; width:14px; height:14px;
+              stroke:var(--faint); fill:none; stroke-width:2; }
+.search kbd { position:absolute; right:11px; top:11px; font-size:10px; color:var(--faint);
+              background:rgba(255,255,255,.06); border-radius:5px; padding:2px 6px;
+              font-family:inherit; }
+
+h2 { font-size:10px; text-transform:uppercase; letter-spacing:.12em; color:var(--faint);
+     margin:20px 6px 9px; font-weight:700; }
+
+/* Filter rows read as toggles, not checkboxes: enabled is a filled pill, and
+   disabled visibly recedes so a hidden category is never a silent surprise. */
+.row {
+  display:flex; align-items:center; gap:10px; padding:8px 11px; border-radius:var(--r-sm);
+  cursor:pointer; user-select:none; transition:background .14s,opacity .14s;
+  background:transparent;
+}
+.row:hover { background:var(--card-2); }
+.row.off { opacity:.32; }
+.row.off .name { text-decoration:line-through; text-decoration-thickness:1px; }
+.row .dot { width:10px; height:10px; border-radius:50%; flex:none;
+            box-shadow:0 0 0 3px rgba(255,255,255,.05); }
+.row .bar { width:14px; height:3px; border-radius:3px; flex:none; }
+.row .name { flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+             font-size:12.5px; }
+.row .n { font-size:11px; color:var(--faint); font-variant-numeric:tabular-nums; }
+
+/* ----------------------------------------------------------------- stage */
+.stage { position:relative; min-width:0; background:var(--stage);
+         border-radius:var(--r-lg); box-shadow:var(--shadow); overflow:hidden; }
+canvas { display:block; cursor:grab; }
+canvas.drag { cursor:grabbing; }
+
+.float { position:absolute; z-index:5; }
+.toolbar { top:16px; right:16px; display:flex; gap:8px; }
+.btn {
+  background:rgba(35,43,77,.82); backdrop-filter:blur(12px); color:var(--text);
+  border:1px solid var(--line); border-radius:var(--r-md); padding:9px 14px;
+  font:inherit; font-size:12px; font-weight:500; cursor:pointer;
+  transition:background .14s,border-color .14s;
+}
+.btn:hover { background:rgba(52,62,105,.9); }
+.btn.on { background:var(--blue); border-color:var(--blue); color:#fff; }
+
+.legend {
+  bottom:16px; left:16px; display:flex; gap:16px; flex-wrap:wrap; align-items:center;
+  background:rgba(28,35,64,.86); backdrop-filter:blur(12px);
+  border-radius:var(--r-md); padding:11px 16px; font-size:11.5px; color:var(--dim);
+  max-width:min(680px,74%); box-shadow:var(--shadow);
+}
+.legend b { color:var(--text); font-weight:500; }
+.legend i { width:9px; height:9px; border-radius:50%; display:inline-block;
+            margin-right:6px; vertical-align:-1px; font-style:normal; }
+.legend .ln { width:18px; height:0; border-top:2px solid var(--dim);
+              display:inline-block; margin-right:6px; vertical-align:4px; }
+.legend .ln.dash { border-top-style:dashed; }
+
+.count {
+  bottom:16px; right:16px; font-size:11.5px; color:var(--dim);
+  background:rgba(28,35,64,.86); backdrop-filter:blur(12px);
+  border-radius:var(--r-md); padding:9px 14px; font-variant-numeric:tabular-nums;
+  box-shadow:var(--shadow);
+}
+
+.tip {
+  position:fixed; z-index:40; pointer-events:none;
+  background:rgba(21,26,46,.96); backdrop-filter:blur(10px);
+  border-radius:var(--r-sm); padding:9px 12px; font-size:12px; max-width:340px;
+  display:none; box-shadow:0 12px 32px rgba(6,9,22,.6);
+}
+.tip .k { font-size:9.5px; color:var(--faint); text-transform:uppercase;
+          letter-spacing:.09em; display:block; margin-bottom:3px; font-weight:700; }
+
+/* ------------------------------------------------------------- inspector */
+.shead { padding:18px 20px 14px; display:flex; align-items:center; gap:8px;
+         flex-wrap:wrap; }
+.shead .close { margin-left:auto; background:var(--card-2); border:0; color:var(--dim);
+                cursor:pointer; font-size:15px; line-height:1; padding:5px 10px;
+                border-radius:8px; }
+.shead .close:hover { background:#2e386180; color:var(--text); }
+.sbody { overflow-y:auto; padding:0 20px 22px; flex:1; min-height:0; }
+.sbody::-webkit-scrollbar { width:10px; }
+.sbody::-webkit-scrollbar-thumb {
+  background:rgba(255,255,255,.09); border-radius:10px; border:3px solid var(--card); }
+
+.tag { display:inline-flex; align-items:center; padding:4px 11px; border-radius:999px;
+       font-size:10.5px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; }
+.title { font-size:16px; font-weight:600; line-height:1.42; margin:6px 0 6px;
+         letter-spacing:-.015em; }
+.path { font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--faint);
+        word-break:break-all; }
+
+/* The body of a memory is the payload: give it a real card, not a blockquote. */
+.quote { background:var(--card-2); border-radius:var(--r-md); padding:14px 16px;
+         margin:16px 0; font-size:12.5px; line-height:1.68; white-space:pre-wrap;
+         word-break:break-word; }
+.quote.warn { background:rgba(251,146,60,.11); color:#ffd8b4; }
+
+.meta { display:grid; grid-template-columns:auto 1fr; gap:8px 16px; font-size:11.5px;
+        margin:16px 0; }
+.meta dt { color:var(--faint); }
+.meta dd { margin:0; font-variant-numeric:tabular-nums; }
+
+.group { margin-top:20px; }
+.group h3 { font-size:10px; text-transform:uppercase; letter-spacing:.11em;
+            color:var(--faint); margin:0 0 8px; font-weight:700; }
+.link { display:flex; align-items:center; gap:11px; padding:9px 12px; margin:0 -12px;
+        border-radius:var(--r-sm); cursor:pointer; transition:background .14s; }
+.link:hover { background:var(--card-2); }
+.link .dot { width:8px; height:8px; border-radius:50%; flex:none; }
+.link .lbl { flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+             font-size:12.5px; }
+.link .rel { font-size:12px; color:var(--faint); flex:none; }
+.hint { color:var(--faint); font-size:12px; }
+
+.empty { display:flex; flex-direction:column; align-items:center; justify-content:center;
+         height:100%; gap:12px; color:var(--faint); text-align:center; padding:34px; }
+.empty svg { width:38px; height:38px; stroke:currentColor; fill:none; stroke-width:1.3; }
