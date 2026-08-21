@@ -34,7 +34,11 @@ ALIAS_WEIGHT = {"root_commit": 0.97, "project_id": 0.95, "remote": 0.80, "path":
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Milliseconds, not seconds. Ordering questions ("did this caller
+    # appear after that memory was verified?") are decided by comparing
+    # these, and second precision made same-second events compare equal,
+    # so a genuinely late caller went unreported.
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def open_catalog() -> sqlite3.Connection:

@@ -1,85 +1,225 @@
+<div align="center">
+
 # Infinite Code Next
 
-A persistent code-intelligence and provenance layer for AI coding agents,
-delivered as a single zero-config MCP server.
+### Code remembers *what* it does. This remembers **why**.
 
-Git blame tells you who changed a line. This tells an agent *why the code
-exists*, *what was already tried and rejected*, *what must stay true*, and it
-carries that knowledge with the code when the code moves.
+A zero-config MCP server that gives AI coding agents persistent, verifiable
+memory of a codebase — the decisions behind it, what was already tried and
+rejected, and what must never break — anchored to the code and carried with it
+as the code moves.
 
-## Install
+[![tests](https://img.shields.io/badge/tests-159%20passing-3fb950?style=flat-square)](#testing)
+[![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)](#install)
+[![mcp](https://img.shields.io/badge/protocol-MCP-d2a8ff?style=flat-square)](#install)
+[![offline](https://img.shields.io/badge/LLM%20calls-none-58a6ff?style=flat-square)](#no-llm-in-the-loop)
+
+**[Quick start](#quick-start) · [Explorer](#the-knowledge-explorer) ·
+[Sharing](#sharing-knowledge) · [For agents](#guide-for-ai-agents) ·
+[How it works](#how-it-works)**
+
+</div>
+
+---
+
+> Git blame tells you *who* changed a line.
+> This tells an agent **why the code exists**, **what was already tried and
+> rejected**, and **what must stay true** — and it knows when its own knowledge
+> has gone stale.
+
+---
+
+## The problem
+
+Every session, an AI agent arrives with no memory. It reads files to
+re-derive what the last agent already knew. Then it re-proposes the fix that
+was rejected three months ago, because nothing in the repository records that
+it was tried.
+
+The expensive knowledge is never in the code:
+
+| The code says | It never says |
+|---|---|
+| `stdin=subprocess.DEVNULL` | *why* — that git inherits the MCP pipe and stalls every call for 20s |
+| `if touched:` | that `or None` here means "resolve everything" and costs minutes |
+| A coordinator class | that a Redis mutex was tried first and deadlocks on partition |
+
+This server stores that layer, keeps it attached to the code, and tells you
+when it can no longer vouch for it.
+
+---
+
+## Quick start
 
 ```bash
 pip install -e .
 ```
 
-Register it once with your MCP client. There is no second step: no admin panel,
+Register once with your MCP client — there is no second step. No admin panel,
 no port, no daemon, no per-repository setup.
 
-```json
-{
-  "mcpServers": {
-    "icn": { "command": "infinite-code-next" }
-  }
-}
-```
-
-Claude Code:
+<table>
+<tr><td><b>Claude Code</b></td><td>
 
 ```bash
 claude mcp add icn -- infinite-code-next
 ```
 
+</td></tr>
+<tr><td><b>Codex</b><br><sub>~/.codex/config.toml</sub></td><td>
+
+```toml
+[mcp_servers.icn]
+command = 'infinite-code-next'
+args = []
+```
+
+</td></tr>
+<tr><td><b>Any MCP client</b></td><td>
+
+```json
+{ "mcpServers": { "icn": { "command": "infinite-code-next" } } }
+```
+
+</td></tr>
+</table>
+
 The server works out which repository it is in from its working directory, and
-every response echoes the root it resolved so a wrong workspace is obvious
+every response echoes the root it resolved, so a wrong workspace is obvious
 immediately.
 
-## The workflow
-
-Two calls to become productive, one to leave the next agent smarter.
+### The loop
 
 ```
-workspace(action="open")
-investigate("I need to change subscription cancellation. What will I break?")
-   ... do the work ...
-record(summary="...", warnings=[...], invariants=[...], failed_attempts=[...])
+workspace(action="open")          →  a briefing: rules, prior failures, what is unverified
+investigate("what you're doing")  →  code + rationale + blast radius, budgeted
+        ... do the work ...
+record(summary=..., warnings=[...], failed_attempts=[...])
 ```
 
-## Tools
+Two calls to get productive. One to leave the next agent smarter.
 
-| Tool | Actions |
+---
+
+## The knowledge explorer
+
+Everything the server knows — repository, files, symbols, memories, and every
+edge between them — as one interactive graph.
+
+```bash
+./explore.sh          # macOS / Linux
+explore.bat           # Windows
+icn-explore           # if the package is on your PATH
+```
+
+```
+┌── FILTERS ────────┬─────────── GRAPH ────────────┬── INSPECTOR ────┐
+│ ☑ symbol     421  │                              │ memory  high    │
+│ ☑ memory      48  │        ╱─○──○─╲              │                 │
+│ ☑ file        39  │      ○──●══●───○             │ stdio servers   │
+│                   │       ╲  ║  ╱                │ must detach     │
+│ SEVERITY          │        ○─●─○                 │ subprocess      │
+│ ☑ high        18  │           ║                  │ stdin           │
+│ ☑ medium      17  │           ○                  │                 │
+│                   │                              │ CONNECTIONS(13) │
+│ ANCHOR STATUS     │  ● memory   ○ symbol         │ → ANCHORED_TO   │
+│ ☑ ACTIVE      48  │  ═ anchored ─ calls          │   run_git       │
+│ ☐ NEEDS_REVIEW 3  │                              │ → GUARDED_BY    │
+└───────────────────┴──────────────────────────────┴─────────────────┘
+```
+
+| | |
 |---|---|
-| `workspace` | `open`, `status`, `list`, `reindex`, `health`, `reconcile`, `archive`, `detach`, `forget_checkout`, `purge` |
-| `investigate` | search (default), `why`, `expand`, `verify` |
-| `record` | write one event, compiled into many anchored facts |
-| `memory` | `get`, `list`, `verify`, `correct`, `supersede`, `resolve`, `reanchor` |
-| `agit` | `status`, `diff`, `commit`, `log`, `branches`, `switch`, `restore`, `reset`, `show` |
+| **Filter** | by node type, memory severity, anchor status, or edge kind — counts update live |
+| **Search** | any node by name, path, or the text of its body |
+| **Inspect** | click a node for its full body, metadata, and every typed connection |
+| **Navigate** | click any connection to jump there — walk from a warning to the code it guards to the test that covers it |
+| **Zoom & pan** | scroll and drag; node size is call-degree, so load-bearing code looks load-bearing |
 
-### `workspace(action="open")`
+Self-contained: one HTML file with the data inlined. No CDN, no build step, no
+npm. Save it, email it, commit it — it still works.
 
-Returns an orientation **briefing**: the rules that govern this code, what has
-already been tried and rejected, what is currently unverified, and where
-knowledge is concentrated. Headlines and ids only, never bodies.
+```bash
+icn-explore --no-serve -o graph.html    # just write the file
+icn-explore --port 8080                 # pick the port
+icn-explore --include-deleted           # include tombstoned code
+```
+
+---
+
+## Sharing knowledge
+
+Hand another codebase's hard-won knowledge to someone else — or to another
+agent.
+
+```bash
+icn-explore export -o knowledge.md      # readable markdown, renders anywhere
+icn-explore export -o knowledge.icn     # bundle: markdown + graph
+icn-explore export -o graph.json        # raw graph
+```
+
+The markdown is the canonical shareable form, and it is **readable on its
+own** — in an editor, in a diff, on a wiki, in a pull request. A knowledge
+base nobody can read without the tool is a knowledge base nobody checks. A
+JSON block at the end makes the import lossless.
+
+```bash
+icn-explore import knowledge.icn        # bring it in
+icn-explore import ./team-knowledge/    # a whole directory of .md / .icn
+icn-explore import shared.md --preview  # look first, import nothing
+```
+
+**Import never overwrites.** Everything from outside is stored as
+`authority='imported'` with its origin attached, and anchored only where a
+matching symbol actually exists here. A memory about code you do not have is
+still worth keeping — but it must not claim to describe a span it never saw.
+
+---
+
+## Guide for AI agents
+
+Read this section before your first call.
+
+### 1. Open first — do not read files to orient yourself
+
+```python
+workspace(action="open")
+```
+
+Returns a **briefing**: the rules that govern this code, what has already been
+tried and rejected, what is currently unverified, and where knowledge is
+concentrated. Headlines and ids only — bodies stay out, `investigate()` is one
+call away.
 
 This exists because of a measured failure. Every session building this server
-began by reading files to re-derive knowledge that already existed - `open`
-reported symbol counts, which tells an agent nothing about what it is walking
-into. An agent cannot ask the right question before it knows what is on the
-shelf.
+began by reading files to re-derive knowledge that already existed. `open` used
+to report symbol counts, which tells you nothing about what you are walking
+into. **You cannot ask the right question before you know what is on the
+shelf.**
 
-### `investigate()`
+### 2. Investigate in plain language — not with grep
 
-One call fuses lexical search (FTS5), symbol lookup, code-graph traversal,
-memory-graph traversal, anchor status, git history and agit checkpoints, then
-returns compact capsules under a token budget instead of file dumps.
+```python
+investigate("I need to change refresh token rotation. What will I break?")
+```
 
-Ranking is a static, inspectable formula with per-intent weights. There is no
-trained reranker and no embedding model to download, because a fresh local
-install has no labeled relevance data to train one on.
+One call fuses lexical search, symbol lookup, code-graph traversal,
+memory-graph traversal, anchor status and git history, and returns compact
+capsules under a token budget. It searches **code and knowledge together**, so
+a warning finds you even when you never named the file it lives in.
 
-### `investigate(action="why", symbol=...)`
+| Argument | Use it for |
+|---|---|
+| `intent=` | `locate`, `understand`, `modify`, `debug`, `audit` — inferred if omitted |
+| `budget=` | approximate token ceiling (default 9000) |
+| `cross_repos=True` | follow contracts into other repositories |
+| `find_problems=` | targeted diagnostics over the narrowed subgraph |
 
-Reconstructs why a piece of code exists, as a causal chain rather than a list:
+### 3. Before deleting anything load-bearing, ask why
+
+```python
+investigate(action="why", symbol="RefreshCoordinator.acquire")
+```
 
 ```
 decision: Use refresh-token rotation
@@ -91,70 +231,102 @@ may reintroduce: Parallel refresh requests invalidate each other
 regression tests: test_parallel_refresh_regression
 ```
 
-The difference is shape, not retrieval quality. A flat list of five memories
-makes an agent reconstruct the story; a chain hands it over. Causal edges are
-always **asserted** by an agent via `record(caused_by=[...])`, never inferred
-from timestamps - "B was recorded after A" is not "A caused B", and a wrong
-causal chain reads as authoritative.
+A flat list of five memories makes you reconstruct the story. A chain hands it
+over.
 
-### `record()`
+### 4. Record what you learned — especially the failures
 
-You supply the semantics. The server resolves plain names like
-`RefreshCoordinator.acquire`, `auth.py`, or even `the refresh coordinator` to
-canonical symbols, anchors each memory to the code, derives the edges you did
-not mention (callers, tests, blast radius), and flags contradictions with what
-it already knows. One call typically writes 5 memories and 25+ edges.
+```python
+record(
+    kind="bug_fix",
+    summary="Serialize refresh requests per session",
+    reasoning="Parallel requests rotated the same token.",
+    invariants=["All refreshes for one session pass through RefreshCoordinator"],
+    warnings=["Do not bypass RefreshCoordinator for new refresh entry points"],
+    failed_attempts=["Redis mutex deadlocks during a network partition"],
+    symbols=["RefreshCoordinator.acquire"],
+    tests=["test_parallel_refresh_regression"],
+    caused_by=[previous_memory_id],
+)
+```
 
-`contracts_with=[...]` records cross-repository dependencies; the target is
-snapshotted at write time, so the contract stays readable even if that
-repository is archived or deleted. `caused_by=[...]` links this work into the
-causal chain above.
+**`failed_attempts` is the highest-value field in the whole system.** Nothing
+else in your toolchain records what was tried and rejected, and it is what
+future agents find most expensive to rediscover.
 
-No LLM and no API key are involved. The whole pipeline is deterministic.
+`record()` returns `primary_memory` — the id representing this event. Pass it
+as the next `caused_by`.
 
-### `agit`
+<details>
+<summary><b>Every field record() accepts</b></summary>
 
-Agent-only git history in `.agit/`, separate from the user's real `.git`.
-Checkpoint risky work, restore it, and never touch the user's history. Auto-
-initialises and adds itself to `.gitignore` on first use.
+| Field | Records |
+|---|---|
+| `invariants` | things that must remain true |
+| `warnings` | things a future agent must not do |
+| `failed_attempts` | what was tried and rejected, and why |
+| `decisions` | choices made, and the alternatives rejected |
+| `contracts` | assumptions other code relies on |
+| `security` | security-relevant facts |
+| `performance` | measured performance facts |
+| `bugs` | bugs this code has caused before |
+| `migrations` | migration steps or ordering constraints |
+| `conventions` | local conventions worth following |
+| `rationale` | why the code is shaped this way |
+| `tests` | tests that cover this — creates a `GUARDED_BY` edge |
+| `contracts_with` | cross-repository dependencies |
+| `caused_by` | memory ids this event follows from |
 
-## What makes it different: anchors that know when they are stale
+</details>
 
-A memory is not stored at `src/auth/oauth.ts:193`. Line numbers are a rendering
-detail. Each memory is attached to a **semantic anchor** holding the symbol
-path, an AST path, a content fingerprint (structure + identifiers) and a
-skeleton fingerprint (structure only), plus its surrounding context.
+### 5. Trust the labels
 
-When the code changes, a cascade tries to relocate the anchor, cheapest test
-first:
+Every memory carries an `anchor_status`. Anything other than `ACTIVE` has
+**not** been verified against the current code — treat it as a lead, not a
+fact.
+
+```python
+memory(action="verify", memory_id=..., reason="confirmed it still applies")
+memory(action="guard", memory_id=rule_id, body=test_memory_id)
+memory(action="supersede", memory_id=..., body="what is true now")
+```
+
+---
+
+## How it works
+
+### Anchors that know when they are stale
+
+A memory is not stored at `src/auth/oauth.ts:193`. Line numbers are a
+rendering detail. Each memory attaches to a **semantic anchor**: the symbol
+path, an AST path, a content fingerprint (structure + identifiers), a skeleton
+fingerprint (structure only), and its surrounding context.
+
+When code changes, a cascade relocates the anchor — cheapest test first:
 
 | Step | Test | Result |
-|---|---|---|
-| 1 | Same fingerprint, same place | `ACTIVE` 1.0 |
-| 2 | Same fingerprint elsewhere, confirmed by `git blame -C -M` | `ACTIVE` 0.9, moved |
-| 3a | Same place, skeleton identical (a rename) | `ACTIVE` 0.8 |
+|:--:|---|---|
+| 1 | Same fingerprint, same place | `ACTIVE` · 1.0 |
+| 2 | Same fingerprint elsewhere, confirmed by `git blame -C -M` | `ACTIVE` · 0.9, moved |
+| 3a | Same place, skeleton identical — a rename | `ACTIVE` · 0.8 |
 | 3b | Same place, structure changed | **`NEEDS_REVIEW`** |
 | 4 | Symbol gone, strong similarity match | `DRIFTED`, re-anchored |
-| 5 | Nothing clears the bar | `ORPHANED` - memory kept, never deleted |
+| 5 | Nothing clears the bar | `ORPHANED` — kept, never deleted |
 
 Two rules make this trustworthy:
 
 - **Verification fires on the edit that caused the drift**, not on a timer.
-- **The cascade can only lower trust, never raise it.** Once an anchor is
-  `DRIFTED` or `NEEDS_REVIEW`, only an explicit `memory(action="verify")`
-  returns it to `ACTIVE`. Otherwise the next pass would find its freshly
-  re-anchored fingerprint matching, report "unchanged", and quietly re-trust a
-  memory nobody ever confirmed.
+- **The cascade can only lower trust, never raise it.** Once `DRIFTED` or
+  `NEEDS_REVIEW`, only an explicit `memory(action="verify")` returns an anchor
+  to `ACTIVE` — otherwise the next pass would find its freshly re-anchored
+  fingerprint matching, report "unchanged", and quietly re-trust a memory
+  nobody ever confirmed.
 
-Every memory in `investigate()` output carries its `anchor_status`, and
-anything that is not `ACTIVE` comes with an explicit warning. A stale memory is
-never rendered as settled fact.
-
-## Problem detection
+### Problem detection
 
 `investigate()` narrows to a subgraph first, then asks targeted questions of
-it - never a workspace-wide scan. What separates these from a linter is that
-they are knowledge-aware: a linter sees that a function has no test; only this
+it — never a workspace-wide scan. What separates these from a linter is that
+they are **knowledge-aware**: a linter sees a function has no test; only this
 graph knows the function is governed by an invariant recorded after a
 production incident.
 
@@ -170,24 +342,28 @@ production incident.
 | `historical_implementation` | is active knowledge pointing at deleted code |
 | `unverifiable_contract` | is a cross-repo dependency currently uncheckable |
 | `unreviewed_caller` | did a caller appear after the memory was verified |
-| `migration_candidate` | did code plausibly move somewhere the cascade would not follow |
+| `migration_candidate` | did code plausibly move where the cascade would not follow |
 
-A failing detector never breaks the search: a diagnostic enhances the answer,
+A failing detector never breaks the search: a diagnostic enhances an answer,
 it is not a precondition for one.
 
-## Storage
+### No LLM in the loop
 
-Central, configurable, with one logical store per repository. The split is by
-what the data *is*: knowledge that must outlive the checkout goes central,
-state that only means something relative to this working tree stays in the repo.
+`record()` is fully deterministic — entity resolution, edge derivation and
+contradiction detection are graph operations, not model calls. **No API key,
+no network, no token cost.** Ranking is a static, inspectable formula with
+per-intent weights, because a fresh local install has no labeled relevance
+data to train a reranker on.
+
+### Storage
 
 ```
-%LOCALAPPDATA%\InfiniteCode\          (Windows)
-$XDG_DATA_HOME/infinite-code/         (Linux)
-~/Library/Application Support/InfiniteCode/  (macOS)
+%LOCALAPPDATA%\InfiniteCode\               (Windows)
+$XDG_DATA_HOME/infinite-code/              (Linux)
+~/Library/Application Support/InfiniteCode/ (macOS)
 
   catalog.db                repositories, aliases, checkouts, cross-repo edges
-  data/repos/<id>/repo.db   DURABLE   code graph, memories, anchors, events
+  data/repos/<id>/repo.db   DURABLE      code graph, memories, anchors, events
   cache/repos/<id>/         REBUILDABLE  safe to delete at any time
 
 <repo>/.agit/               agent git, gitignored
@@ -196,74 +372,92 @@ $XDG_DATA_HOME/infinite-code/         (Linux)
 
 Override the root with `INFINITE_CODE_HOME`.
 
-Repository identity is never the path and never the remote URL - both are
-mutable. It is derived from the root commit hash, an optional committed project
-id, and normalised remotes, so moving a clone or running `git remote set-url`
-reattaches to existing knowledge instead of starting a fresh memory universe.
-Three worktrees of one repository share one set of memories.
+Identity is never the path and never the remote URL — both are mutable. It is
+derived from the root commit, an optional committed project id, and normalised
+remotes, so moving a clone or running `git remote set-url` reattaches to
+existing knowledge. A **fork** shares upstream's root commit, so it is split
+explicitly rather than silently inheriting upstream's memories.
 
-## Nothing is ever destroyed
+### Nothing is ever destroyed
 
 - Deleted symbols become **tombstones** with their last known path and the
-  commit that removed them, so "this decision was implemented by something that
-  no longer exists" stays answerable.
+  commit that removed them.
 - Edges carry `valid_from_commit` / `valid_until_commit` and become
   `HISTORICAL` rather than disappearing.
-- A vanished checkout is `MISSING`, an unmounted drive is `OFFLINE`, and
-  neither deletes anything.
+- A vanished checkout is `MISSING`; an unmounted drive is `OFFLINE`. Neither
+  deletes anything.
 - Corrections version the previous text; supersession keeps both memories and
   the link between them.
-- An agent cannot rewrite a human-authored memory - it must supersede it,
+- An agent **cannot** rewrite a human-authored memory — it must supersede it,
   leaving the disagreement visible.
-- `purge` is the only destructive operation and requires `confirm=True`.
+- `purge` is the only destructive operation, and requires `confirm=True`.
 
 Lookups go through a resolver that never raises: "cannot currently resolve" is
-returned as data with whatever was last known.
+returned as data, with whatever was last known.
 
-## Concurrency
+---
 
-Several server processes per repository is the normal case - one per editor
-window, one per terminal. WAL mode, `BEGIN IMMEDIATE` with retry, short write
-transactions, and a heartbeat lease so exactly one process indexes at a time.
-The lease is reclaimable, because the holder can be killed at any moment and
-nobody runs cleanup.
+## Tools
 
-## Degradation
-
-Every optional capability degrades rather than blocking.
-
-| Missing | Behaviour |
+| Tool | Actions |
 |---|---|
-| Embeddings | Cascade step 5 skipped. Retrieval is FTS + symbol + graph. |
-| LLM / API key | Never needed. Compilation is deterministic. |
-| Git | Path-hash identity, marked `weak`. `agit` unavailable. |
-| Cold index | Immediate response, `index_state: "partial"`, background completion. |
+| `workspace` | `open` · `status` · `list` · `reindex` · `health` · `reconcile` · `archive` · `detach` · `forget_checkout` · `purge` |
+| `investigate` | search · `why` · `expand` · `verify` |
+| `record` | one event → many anchored facts |
+| `memory` | `get` · `list` · `verify` · `guard` · `correct` · `supersede` · `resolve` · `reanchor` |
+| `agit` | `status` · `diff` · `commit` · `log` · `branches` · `switch` · `restore` · `reset` · `show` |
 
-## Tests
+`agit` keeps agent checkpoints in `.agit/`, entirely separate from the user's
+`.git`. Checkpoint risky work, restore it, never touch their history.
+
+---
+
+## Testing
 
 ```bash
 python -m pytest
 ```
 
-Includes a live MCP test that spawns the real server over stdio and drives a
-full agent workflow through the wire protocol, and a dirty-worktree fixture
-harness that asserts cascade behaviour on **uncommitted** edits - reformat,
-rename, body change, cross-file move, delete, and weak migration. That regime
-is unvalidated by the published literature, which only ever measures post-hoc
-commit-history mining, so it is measured here directly.
+**159 tests**, including a live MCP suite that spawns the real server over
+stdio and drives a full agent workflow through the wire protocol, and a
+dirty-worktree harness that asserts cascade behaviour on **uncommitted** edits
+— reformat, rename, body change, cross-file move, delete, weak migration.
 
-The live test earns its keep. It found a bug that in-process testing cannot
-see: subprocess calls were inheriting the server's stdin, which *is* the MCP
-protocol pipe. Git blocked on it for its full 20-second timeout on every tool
-call, and could swallow protocol bytes. Fixing it took tool latency from 20s to
-0.2s.
+That regime is unvalidated by the published literature, which only ever
+measures post-hoc commit-history mining, so it is measured here directly.
+
+The live test earns its keep. It found a bug in-process testing cannot see:
+subprocess calls inherited the server's stdin, which *is* the MCP protocol
+pipe. Git blocked on it for its full 20-second timeout on every tool call and
+could swallow protocol bytes. Fixing it took tool latency from **20s to 0.2s**.
+
+### Measured on a real 4,621-file repository
+
+| | |
+|---|---|
+| Full index | 593s → 34,747 symbols, 58,857 edges, 43,038 call edges |
+| Warm open | **0.77s** |
+| Query | **1.48s** |
+
+---
 
 ## Design
 
 The reasoning behind each decision lives next to the code it governs: every
-module's docstring states what it does and, more importantly, which failure it
-exists to prevent. `anchors.py` explains why the cascade may only lower trust,
-`briefing.py` why `open` volunteers a summary, `causal.py` why causality is
-asserted and never inferred.
+module's docstring states what it does and, more importantly, **which failure
+it exists to prevent**. `anchors.py` explains why the cascade may only lower
+trust, `briefing.py` why `open` volunteers a summary, `causal.py` why
+causality is asserted and never inferred.
 
 Planning notes are kept locally and are not part of the shipped artifact.
+
+---
+
+<div align="center">
+
+**Built by [Ranit Bhowmick](https://ranitbhowmick.com)**
+
+<sub>If an agent had to read your codebase to understand it, that knowledge
+died with the session. This is the fix.</sub>
+
+</div>

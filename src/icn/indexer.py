@@ -44,7 +44,11 @@ DEFAULT_EXCLUDES = {
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Milliseconds, not seconds. Ordering questions ("did this caller
+    # appear after that memory was verified?") are decided by comparing
+    # these, and second precision made same-second events compare equal,
+    # so a genuinely late caller went unreported.
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def _excluded(rel: Path, extra: set[str]) -> bool:

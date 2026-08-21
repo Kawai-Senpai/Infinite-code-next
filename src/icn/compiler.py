@@ -66,7 +66,11 @@ NOISE_WORDS = re.compile(
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Milliseconds, not seconds. Ordering questions ("did this caller
+    # appear after that memory was verified?") are decided by comparing
+    # these, and second precision made same-second events compare equal,
+    # so a genuinely late caller went unreported.
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 # ------------------------------------------------------------ entity resolution
@@ -334,6 +338,34 @@ def _link_contracts(catalog: sqlite3.Connection, payload: dict[str, Any],
 
 
 
+
+
+def guard_memory(conn: sqlite3.Connection, memory_id: str, test_memory_id: str) -> dict[str, Any]:
+    """Record that an existing test covers an existing rule.
+
+    `record(tests=[...])` only guards rules created in the same call, so a rule
+    written before its test had no way to be marked covered - the
+    untested-invariant diagnostic kept reporting it, which trains people to
+    ignore the finding. This closes that loop after the fact.
+    """
+    rule = one(conn.execute("SELECT memory_id, kind FROM memories WHERE memory_id=?", (memory_id,)))
+    if rule is None:
+        return {"ok": False, "error": "unknown memory " + repr(memory_id)}
+    test = one(conn.execute("SELECT memory_id, kind, title FROM memories WHERE memory_id=?",
+                            (test_memory_id,)))
+    if test is None:
+        return {"ok": False, "error": "unknown memory " + repr(test_memory_id)}
+    if test["kind"] != "test_evidence":
+        return {"ok": False, "error": repr(test_memory_id) + " is a " + test["kind"]
+                                      + ", not test evidence"}
+    if memory_id == test_memory_id:
+        return {"ok": False, "error": "a memory cannot guard itself"}
+
+    with write_tx(conn):
+        _link(conn, memory_id, test_memory_id, "GUARDED_BY", "asserted", 0.9,
+              {"declared_by": "memory(action='guard')"})
+    return {"ok": True, "memory_id": memory_id, "guarded_by": test_memory_id,
+            "test": test["title"]}
 
 def _link_test_coverage(conn: sqlite3.Connection,
                         memories: list[dict[str, Any]]) -> int:

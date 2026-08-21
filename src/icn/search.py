@@ -86,7 +86,11 @@ STOPWORDS = {
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Milliseconds, not seconds. Ordering questions ("did this caller
+    # appear after that memory was verified?") are decided by comparing
+    # these, and second precision made same-second events compare equal,
+    # so a genuinely late caller went unreported.
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def infer_intent(query: str) -> str:
@@ -552,22 +556,34 @@ def detect_problems(conn: sqlite3.Connection, catalog: sqlite3.Connection,
     # A caller that appeared after the memory was last verified was never
     # considered by whoever wrote the warning.
     for row in rows(conn.execute(
-        f"SELECT DISTINCT s.symbol_path, s.last_seen_commit, m.title, m.memory_id,"
-        f" a.last_verified_commit FROM code_edges e"
+        # The question is "did this caller appear AFTER the memory was last
+        # verified", which is an ordering test. Comparing commit ids for
+        # inequality answers a different question - "were these stamped at the
+        # same commit" - and indexing only re-stamps files that changed, so on
+        # a real store it was true for almost every pair: measured at 10
+        # findings per investigation, crowding out every other diagnostic.
+        # code_edges.created_at is when the call edge first appeared.
+        # Compared against the memory's own last_verified_at, which only an
+        # explicit memory(action='verify') updates - never the automatic
+        # cascade. The anchor's timestamp cannot work here: ensure_indexed
+        # verifies anchors in the same pass that creates the call edge, so the
+        # two are always equal to the millisecond and the test can never fire.
+        f"SELECT DISTINCT s.symbol_path, m.title, m.memory_id, e.created_at,"
+        f" m.last_verified_at FROM code_edges e"
         f" JOIN symbols s ON s.symbol_id = e.from_id"
         f" JOIN anchors a ON a.symbol_id = e.to_id"
         f" JOIN memories m ON m.memory_id = a.memory_id"
         f" WHERE e.to_id IN ({placeholders}) AND e.kind='CALLS' AND e.status='ACTIVE'"
         f" AND s.status='ACTIVE' AND m.kind IN ('invariant','warning','contract')"
-        f" AND m.status='ACTIVE' AND s.last_seen_commit IS NOT NULL"
-        f" AND a.last_verified_commit IS NOT NULL AND s.last_seen_commit != a.last_verified_commit"
-        f" LIMIT 10",
+        f" AND m.status='ACTIVE' AND e.created_at IS NOT NULL"
+        f" AND m.last_verified_at IS NOT NULL AND e.created_at > m.last_verified_at"
+        f" LIMIT 6",
         tuple(symbol_ids),
     )):
         problems.append({
             "severity": "low", "kind": "unreviewed_caller",
-            "detail": f"{row['symbol_path']} calls code governed by '{row['title']}',"
-                      f" and changed at a different commit than the memory was verified at",
+            "detail": f"{row['symbol_path']} started calling code governed by"
+                      f" '{row['title']}' after that memory was last verified",
             "memory_id": row["memory_id"],
         })
 

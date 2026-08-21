@@ -2,6 +2,8 @@
 name = "infinite-code-next"
 version = "0.1.0"
 description = "Zero-config MCP server: a versioned semantic provenance layer for source code."
+authors = [{ name = "Ranit Bhowmick", email = "bhowmickranitking@duck.com" }]
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.0.0",
@@ -12,9 +14,13 @@ dependencies = [
 [project.scripts]
 infinite-code-next = "icn.__main__:main"
 icn = "icn.__main__:main"
+icn-explore = "icn.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://ranitbhowmick.com"
 
 [build-system]
 requires = ["setuptools>=68"]

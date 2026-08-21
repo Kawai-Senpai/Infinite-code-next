@@ -219,3 +219,67 @@ def test_detectors_are_bounded_to_the_given_subgraph(workspace, project):
     project.write("tokens.py", BYPASS_SOURCE)
     ws_mod.ensure_indexed(workspace)
     assert diagnostics.run_all(workspace.store, []) == []
+
+
+# ---------------------------------------------------------- unreviewed caller
+
+def test_a_caller_added_after_verification_is_reported(workspace, project):
+    """"Did a recently-added caller appear after the memory was last
+    verified?" - PLAN.md. This is an ordering question."""
+    project.write("guarded.py", "def enforce(x):\n    return x\n")
+    ws_mod.ensure_indexed(workspace)
+    rec(workspace, kind="decision", summary="enforcement is mandatory",
+        invariants=["enforce must run on every path"], symbols=["enforce"])
+
+    # A new caller appears afterwards.
+    project.write("late.py", "from guarded import enforce\n\n\n"
+                             "def late_path(x):\n    return enforce(x)\n")
+    ws_mod.ensure_indexed(workspace)
+
+    result = search_mod.investigate(workspace.store, workspace.catalog, workspace.root,
+                                    "enforce", intent="audit", commit=workspace.commit)
+    late = [p for p in result["problems"] if p["kind"] == "unreviewed_caller"]
+    assert late, "a caller added after verification must be reported"
+    assert any("late_path" in p["detail"] for p in late)
+
+
+def test_an_unchanged_repository_reports_no_unreviewed_callers(workspace, project):
+    """Comparing commit ids for inequality answered the wrong question.
+
+    Indexing only re-stamps files that changed, so unequal commits were the
+    normal state and the detector fired on nearly every governed symbol -
+    measured at 10 findings per investigation, crowding out everything else.
+    """
+    project.write("guarded.py", "def enforce(x):\n    return x\n")
+    project.write("caller.py", "from guarded import enforce\n\n\n"
+                               "def run(x):\n    return enforce(x)\n")
+    ws_mod.ensure_indexed(workspace)
+    rec(workspace, kind="decision", summary="enforcement is mandatory",
+        invariants=["enforce must run on every path"], symbols=["enforce"])
+
+    # Nothing changes; verification just runs again.
+    ws_mod.ensure_indexed(workspace)
+
+    result = search_mod.investigate(workspace.store, workspace.catalog, workspace.root,
+                                    "enforce", intent="audit", commit=workspace.commit)
+    noise = [p for p in result["problems"] if p["kind"] == "unreviewed_caller"]
+    assert not noise, f"a settled repository must be quiet, got {[p['detail'] for p in noise]}"
+
+
+def test_test_coverage_is_found_through_indirect_callers(workspace, project):
+    """A test almost never calls the governed function directly; it drives a
+    public entry point that calls it. A one-hop check reported such code as
+    untested."""
+    project.write("deep.py",
+                  "def inner(x):\n    return x\n\n\n"
+                  "def middle(x):\n    return inner(x)\n\n\n"
+                  "def entry(x):\n    return middle(x)\n")
+    project.write("tests/test_deep.py",
+                  "from deep import entry\n\n\ndef test_entry():\n    assert entry(1) == 1\n")
+    ws_mod.ensure_indexed(workspace)
+    rec(workspace, kind="decision", summary="inner must stay pure",
+        invariants=["inner must have no side effects"], symbols=["inner"])
+
+    findings = diagnostics.untested_callers(workspace.store, active_symbol_ids(workspace))
+    assert not any("inner" in f["detail"] for f in findings), \
+        "a test three hops away still covers the code"

@@ -385,6 +385,9 @@ def memory(
       correct     edit a memory in place. Previous text is versioned, not lost.
       supersede   replace a memory, keeping both and the link between them.
       resolve     mark a warning or bug as no longer live.
+      guard       record that an existing test covers an existing rule, when
+                  the two were written in separate calls. Pass the rule as
+                  memory_id and the test_evidence memory id as body.
       reanchor    re-run the anchoring cascade for one memory.
 
     Args:
@@ -432,6 +435,13 @@ def memory(
             return {"resolved_root": str(current.root),
                     **compiler.resolve_memory(current.store, current.catalog, current.repo_id,
                                               memory_id, reason, actor)}
+        if act == "guard":
+            if not memory_id or not body.strip():
+                return _fail("guard requires `memory_id` and `body` set to the"
+                             " test_evidence memory id", str(current.root))
+            return {"resolved_root": str(current.root),
+                    **compiler.guard_memory(current.store, memory_id, body.strip())}
+
         if act == "reanchor":
             ws_mod.ensure_indexed(current)
             return {"ok": True, "resolved_root": str(current.root),

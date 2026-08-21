@@ -384,6 +384,7 @@ def _apply_schema(conn: sqlite3.Connection, schema: str) -> None:
             _migrate(conn)
             _backfill_fts(conn)
             _repair_ref_commits(conn)
+            _backfill_test_coverage(conn)
             _set_version(conn)
             return
         except sqlite3.OperationalError as exc:
@@ -443,6 +444,64 @@ _REF_COLUMNS = (
     ("code_edges", ("valid_from_commit", "valid_until_commit")),
 )
 
+
+
+# Rule kinds a test can guard. Mirrors compiler._link_test_coverage; kept here
+# so the backfill does not import the compiler at schema time.
+_GUARDABLE = ("invariant", "warning", "contract", "security", "decision")
+
+
+def _backfill_test_coverage(conn: sqlite3.Connection) -> None:
+    """Create GUARDED_BY edges for events recorded before that linking existed.
+
+    Same failure mode as the FTS backfill: a feature added later leaves every
+    earlier row permanently wrong, and the symptom is silent. Here the
+    untested-invariant diagnostic kept reporting rules whose test was recorded
+    in the very same call - which trains people to ignore the finding.
+
+    Reconstructed from source_event, so it only ever links a rule to a test the
+    author actually recorded alongside it. Idempotent.
+    """
+    try:
+        pairs = conn.execute("""
+            SELECT r.memory_id AS rule_id, t.memory_id AS test_id
+            FROM memories r
+            JOIN memories t ON t.source_event = r.source_event
+            WHERE r.kind IN (?,?,?,?,?) AND t.kind = 'test_evidence'
+              AND r.status='ACTIVE' AND t.status='ACTIVE'
+              AND r.source_event IS NOT NULL
+              -- Imports share one synthetic event id, so joining on it would
+              -- claim every imported test covers every imported rule. Measured
+              -- on a 48-memory import: 264 false coverage claims, which is
+              -- worse than none because it silences the untested-rule check.
+              AND r.source_event NOT LIKE 'import:%' 
+              AND NOT EXISTS (
+                  SELECT 1 FROM memory_edges e
+                  WHERE e.from_id = r.memory_id AND e.to_id = t.memory_id
+                    AND e.kind = 'GUARDED_BY')
+            LIMIT 2000
+        """, _GUARDABLE).fetchall()
+    except sqlite3.OperationalError:
+        return
+    if not pairs:
+        return
+
+    from datetime import datetime, timezone
+    stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany(
+            "INSERT OR IGNORE INTO memory_edges (edge_id, from_id, to_id, kind, edge_class,"
+            " status, confidence, source, created_at)"
+            " VALUES (?,?,?,'GUARDED_BY','asserted','ACTIVE',0.9,'backfill',?)",
+            [("edge_bf" + rule[-8:] + test[-8:], rule, test, stamp) for rule, test in pairs],
+        )
+        conn.execute("COMMIT")
+    except sqlite3.OperationalError:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
 
 def _repair_ref_commits(conn: sqlite3.Connection) -> None:
     """Null out ref names stored where a commit id belongs.

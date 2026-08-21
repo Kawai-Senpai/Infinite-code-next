@@ -46,7 +46,11 @@ COMMIT_WINDOW = 20
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Milliseconds, not seconds. Ordering questions ("did this caller
+    # appear after that memory was verified?") are decided by comparing
+    # these, and second precision made same-second events compare equal,
+    # so a genuinely late caller went unreported.
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def create_anchor(conn: sqlite3.Connection, memory_id: str, symbol: dict[str, Any] | None,

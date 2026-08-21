@@ -114,6 +114,43 @@ def bypassed_wrappers(conn: sqlite3.Connection, symbol_ids: list[str]) -> list[d
     return findings[:4]
 
 
+# How far to look for a test. A test almost never calls the governed function
+# directly - it drives a public entry point that calls it. Measured on this
+# codebase, `Indexer.resolve_calls` is covered by two tests, both two hops
+# away, and a one-hop check reported it untested.
+TEST_REACH_HOPS = 3
+
+
+def _test_reaches(conn: sqlite3.Connection, symbol_id: str,
+                  hops: int = TEST_REACH_HOPS) -> bool:
+    """Is this symbol reachable from any test, within `hops` calls?
+
+    Breadth-first over reversed CALLS edges, bounded in both depth and breadth
+    so a hot symbol with hundreds of callers cannot turn one diagnostic into a
+    graph walk.
+    """
+    seen = {symbol_id}
+    frontier = [symbol_id]
+    for _ in range(max(1, hops)):
+        if not frontier:
+            return False
+        batch = frontier[:60]
+        placeholders = ",".join("?" for _ in batch)
+        callers = rows(conn.execute(
+            "SELECT s.symbol_id, s.name, s.symbol_path, s.last_known_path"
+            " FROM code_edges e JOIN symbols s ON s.symbol_id = e.from_id"
+            " WHERE e.to_id IN (" + placeholders + ") AND e.kind='CALLS'"
+            " AND e.status='ACTIVE' AND s.status='ACTIVE' LIMIT 200", tuple(batch)))
+        frontier = []
+        for caller in callers:
+            if _is_test(caller):
+                return True
+            if caller["symbol_id"] not in seen:
+                seen.add(caller["symbol_id"])
+                frontier.append(caller["symbol_id"])
+    return False
+
+
 def untested_callers(conn: sqlite3.Connection, symbol_ids: list[str]) -> list[dict[str, Any]]:
     """Code governed by a memory, with no test anywhere in its caller set.
 
@@ -137,12 +174,7 @@ def untested_callers(conn: sqlite3.Connection, symbol_ids: list[str]) -> list[di
     for row in governed:
         if _is_test(row):
             continue
-        callers = rows(conn.execute(
-            "SELECT s.name, s.symbol_path, s.last_known_path FROM code_edges e"
-            " JOIN symbols s ON s.symbol_id = e.from_id"
-            " WHERE e.to_id=? AND e.kind='CALLS' AND e.status='ACTIVE' AND s.status='ACTIVE'"
-            " LIMIT 30", (row["symbol_id"],)))
-        has_test = any(_is_test(c) for c in callers)
+        has_test = _test_reaches(conn, row["symbol_id"])
         guarded_by = rows(conn.execute(
             "SELECT 1 FROM memory_edges WHERE from_id=? AND kind='GUARDED_BY'"
             " AND status='ACTIVE' LIMIT 1", (row["memory_id"],)))
