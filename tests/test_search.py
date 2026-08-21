@@ -6,6 +6,7 @@ from conftest import record_baseline
 
 from icn import search as search_mod
 from icn import workspace as ws_mod
+from icn.db import rows
 
 
 def run(ws, query, **kwargs):
@@ -234,3 +235,101 @@ def test_every_memory_is_searchable_by_its_own_words(workspace):
         "SELECT COUNT(*) AS n FROM fts_memories f JOIN memories m"
         " ON m.memory_id = f.memory_id WHERE m.status='ACTIVE'"))["n"]
     assert indexed == total, f"{total - indexed} active memories are invisible to search"
+
+
+def test_a_typo_still_finds_the_memory(workspace):
+    """Exact-and-prefix matching alone answers nothing for a misspelling, and
+    an empty result reads as "this codebase knows nothing about that"."""
+    from icn import compiler
+
+    compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "decision", "summary": "subprocess handling",
+         "warnings": ["Never call subprocess.run without detaching stdin"],
+         "symbols": ["refresh_session"]})
+
+    result = run(workspace, "subproces stdin")
+    texts = [m.get("text", "") for c in result["capsules"] for m in c["memory"]]
+    assert any("detaching stdin" in t for t in texts), "a one-letter typo must not lose the memory"
+
+
+def test_hyphenation_does_not_hide_a_memory(workspace):
+    """FTS5's unicode61 tokenizer splits on hyphens, so `reanchor` and
+    `re-anchor` never matched each other."""
+    from icn import compiler
+
+    compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "decision", "summary": "cascade trust",
+         "invariants": ["The re-anchor cascade may only lower trust"],
+         "symbols": ["refresh_session"]})
+
+    for query in ("re-anchor cascade", "reanchor cascade"):
+        texts = [m.get("text", "") for c in run(workspace, query)["capsules"]
+                 for m in c["memory"]]
+        assert any("lower trust" in t for t in texts), f"{query!r} found nothing"
+
+
+def test_fuzzy_results_clear_the_quoting_floor(workspace):
+    """The fallback found the right memories and the capsule then demoted all
+    of them, which reads to a user as "found nothing"."""
+    from icn import compiler
+    from icn import search as search_mod
+
+    compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "decision", "summary": "cascade trust",
+         "invariants": ["The re-anchor cascade may only lower trust"],
+         "symbols": ["refresh_session"]})
+
+    scores = search_mod._fuzzy_memories(workspace.store, ["reanchor"])
+    assert scores, "expected fuzzy hits"
+    assert max(scores.values()) == 1.0, "fuzzy relevance must be normalised onto 0..1"
+
+
+def test_frequently_opened_memories_rank_higher(workspace):
+    """Usage is evidence: a memory agents keep opening has proven itself in a
+    way an authored severity cannot."""
+    from icn import compiler
+    from icn import search as search_mod
+
+    quiet = compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "decision", "summary": "rarely needed",
+         "decisions": ["Something nobody looks up"], "symbols": ["refresh_session"]})
+    popular = compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "decision", "summary": "constantly needed",
+         "decisions": ["Something everyone looks up"], "symbols": ["refresh_session"]})
+
+    hot = popular["primary_memory"]
+    for _ in range(6):
+        compiler.get_memory(workspace.store, hot)
+
+    rows_by_id = {m["memory_id"]: m for m in rows(workspace.store.execute(
+        "SELECT * FROM memories WHERE status='ACTIVE'"))}
+    assert search_mod.usage_boost(rows_by_id[hot]) > 0
+    assert search_mod.usage_boost(rows_by_id[quiet["primary_memory"]]) == 0
+
+
+def test_the_usage_boost_cannot_dominate_severity(workspace):
+    """Frequency is evidence, not authority. Unbounded, it would pin whatever
+    was popular last month above a critical warning recorded yesterday."""
+    from icn import search as search_mod
+
+    absurd = {"access_count": 100000, "surfaced_count": 100000,
+              "last_accessed_at": None}
+    assert search_mod.usage_boost(absurd) <= 0.5
+
+
+def test_usage_tracking_never_breaks_a_search(workspace, monkeypatch):
+    """A ranking signal must not be able to fail the thing it ranks."""
+    import sqlite3
+    from icn import search as search_mod
+
+    def explode(*args, **kwargs):
+        raise sqlite3.OperationalError("simulated")
+
+    monkeypatch.setattr(search_mod, "write_tx", explode)
+    search_mod.note_surfaced(workspace.store, ["mem_whatever"])
+    search_mod.note_accessed(workspace.store, "mem_whatever")

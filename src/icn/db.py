@@ -25,13 +25,18 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Columns added after a schema version shipped. Migration is first-class
 # (PLAN.md section 11): additive, idempotent, and never destructive.
 ADDED_COLUMNS: list[tuple[str, str, str]] = [
     ("symbols", "calls_raw", "TEXT"),
     ("symbols", "token_signature", "TEXT"),
+    # Usage signal. A memory that agents keep opening has proven itself in a
+    # way no authored severity can; one nobody has ever opened has not.
+    ("memories", "access_count", "INTEGER DEFAULT 0"),
+    ("memories", "last_accessed_at", "TEXT"),
+    ("memories", "surfaced_count", "INTEGER DEFAULT 0"),
 ]
 
 BUSY_TIMEOUT_MS = 15000

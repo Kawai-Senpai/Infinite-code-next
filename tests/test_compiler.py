@@ -155,3 +155,78 @@ def test_listing_reports_the_worst_anchor_not_the_best(workspace, project):
     assert listed
     assert any(m["anchor_status"] == "NEEDS_REVIEW" for m in listed)
     assert listed[0]["anchor_status"] != "ACTIVE", "worst anchors must sort first"
+
+
+def test_a_memory_carries_the_context_it_was_recorded_in(workspace):
+    """Measured before this: median body was 150 characters and 35 of 48 were
+    under 200 - a headline, not knowledge. "settle must be idempotent" tells a
+    future agent nothing about the incident that made it one."""
+    result = compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "bug_fix",
+         "summary": "Serialised refresh so concurrent requests stop invalidating each other",
+         "reasoning": "Two parallel requests each rotated the token, so the second "
+                      "invalidated the first and logged the user out.",
+         "invariants": ["Every refresh must pass through RefreshCoordinator.acquire"],
+         "symbols": ["refresh_session"]})
+
+    invariant = next(m for m in result["memories_created"] if m["kind"] == "invariant")
+    body = one(workspace.store.execute(
+        "SELECT body FROM memories WHERE memory_id=?", (invariant["memory_id"],)))["body"]
+
+    assert "RefreshCoordinator.acquire" in body, "the claim itself must survive"
+    assert "logged the user out" in body, "the reasoning must travel with it"
+    assert "refresh_session" in body, "a reader must know what it applies to"
+    assert len(body) > 250, f"still a headline at {len(body)} chars"
+
+
+def test_context_is_not_repeated_back_at_the_reader(workspace):
+    """Agents phrase a warning and its summary similarly; echoing the summary
+    under a claim that already states it is noise."""
+    result = compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "decision", "summary": "Rotate the refresh token on every use",
+         "decisions": ["Rotate the refresh token on every use"],
+         "symbols": ["refresh_session"]})
+
+    decision = next(m for m in result["memories_created"] if m["kind"] == "decision")
+    body = one(workspace.store.execute(
+        "SELECT body FROM memories WHERE memory_id=?", (decision["memory_id"],)))["body"]
+    assert body.count("Rotate the refresh token on every use") == 1
+
+
+def test_a_thin_write_is_told_so_while_the_context_is_still_available(workspace):
+    """The compiler cannot write the knowledge - only the agent knows why it
+    did what it did. It can say the entry will be useless later, while the
+    caller can still fix it. Nobody comes back to enrich a memory."""
+    thin = compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "bug_fix", "summary": "fixed it",
+         "invariants": ["settle must be idempotent"]})
+
+    quality = thin["quality"]
+    assert quality["sufficient"] is False
+    assert quality["notes"]
+    joined = " ".join(quality["notes"])
+    assert "reasoning" in joined
+    assert "failed_attempts" in joined, "a bug fix with no rejected approach should be queried"
+    assert thin["ok"] is True, "poor quality must never block the write"
+
+
+def test_a_rich_write_passes_without_nagging(workspace):
+    rich = compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "bug_fix",
+         "summary": "Serialised refresh so concurrent requests stop invalidating each other",
+         "reasoning": "Two parallel requests each rotated the token, so whichever "
+                      "finished second invalidated the first and logged the user out.",
+         "invariants": ["Every refresh for one session must pass through "
+                        "RefreshCoordinator.acquire, because two concurrent rotations "
+                        "invalidate each other and log the user out"],
+         "failed_attempts": ["A Redis mutex was rejected: it deadlocks when the network "
+                             "partitions mid-hold, and the TTL that would fix it exceeds "
+                             "the request budget"],
+         "symbols": ["refresh_session"]})
+
+    assert rich["quality"]["sufficient"] is True, rich["quality"]["notes"]
+    assert rich["quality"]["median_body_chars"] > 250

@@ -194,17 +194,25 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
              payload.get("client"), commit, payload.get("branch"), now()),
         )
 
+        # Every memory carries the context of the event that produced it, not
+        # just its own one-line claim. Measured before this: median body was
+        # 150 characters and 35 of 48 were under 200 - a headline, not
+        # knowledge. An invariant reading "settle must be idempotent" tells a
+        # future agent nothing about the incident that made it one.
+        context = _event_context(payload, summary, resolved)
+
         entries: list[tuple[str, str, str]] = []   # (memory kind, severity, body)
         for field, (memory_kind, severity) in FIELD_KINDS.items():
-            for body in _as_list(payload.get(field)):
-                entries.append((memory_kind, severity, body))
+            for claim in _as_list(payload.get(field)):
+                entries.append((memory_kind, severity, _compose(claim, context)))
 
         # The summary itself is a memory when the event describes a change.
         if summary and kind in EVENT_KIND_TO_MEMORY:
             memory_kind, severity = EVENT_KIND_TO_MEMORY[kind]
             reasoning = str(payload.get("reasoning") or "").strip()
             body = f"{summary}\n\n{reasoning}".strip() if reasoning else summary
-            entries.insert(0, (memory_kind, severity, body))
+            entries.insert(0, (memory_kind, severity,
+                               _compose(body, context, is_summary=True)))
 
         for memory_kind, severity, body in entries:
             memory_id = ids.new_id(ids.MEMORY)
@@ -256,7 +264,7 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
                                           {"title": title, "kind": memory_kind, "commit": commit})
             created_memories.append({"memory_id": memory_id, "kind": memory_kind,
                                      "severity": severity, "title": title,
-                                     "anchors": len(anchor_ids)})
+                                     "body": body, "anchors": len(anchor_ids)})
 
     _link_test_coverage(conn, created_memories)
     cross_links = _link_contracts(catalog, payload, resolved, created_memories, commit)
@@ -286,6 +294,7 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
         ],
         "unresolved_references": unresolved,
         "contradictions": contradictions,
+        "quality": _write_quality(payload, created_memories, resolved, unresolved),
     }
 
 
@@ -366,6 +375,130 @@ def guard_memory(conn: sqlite3.Connection, memory_id: str, test_memory_id: str) 
               {"declared_by": "memory(action='guard')"})
     return {"ok": True, "memory_id": memory_id, "guarded_by": test_memory_id,
             "test": test["title"]}
+
+# How much surrounding context a memory carries. Enough that it reads as a
+# self-contained note, capped so a capsule does not become a file dump.
+CONTEXT_CHARS = 900
+
+
+def _event_context(payload: dict[str, Any], summary: str,
+                   resolved: list[dict[str, Any]]) -> dict[str, Any]:
+    """The situation a memory was recorded in.
+
+    A claim without its circumstances is not knowledge. "Redis mutex could
+    deadlock" is a sentence; "we hit concurrent token invalidation, tried a
+    Redis mutex, and it deadlocks under partition" is something an agent can
+    act on a year later.
+    """
+    where: list[str] = []
+    for match in resolved:
+        row = match["row"]
+        label = row.get("symbol_path") or row.get("path")
+        if label and label not in where:
+            where.append(label)
+
+    return {
+        "occasion": summary,
+        "reasoning": str(payload.get("reasoning") or "").strip(),
+        "where": where[:6],
+        "changes": [c for c in _as_list(payload.get("changes")) if c][:4],
+    }
+
+
+def _compose(claim: str, context: dict[str, Any], is_summary: bool = False) -> str:
+    """Attach the event's context to one claim, without repeating it back."""
+    claim = (claim or "").strip()
+    if not claim:
+        return claim
+
+    parts = [claim]
+    if not is_summary:
+        occasion = context.get("occasion") or ""
+        # Skip the occasion when the claim already states it. Repeating the
+        # summary under itself is noise, and it happens often because agents
+        # phrase a warning and its summary similarly.
+        if occasion and occasion.lower() not in claim.lower():
+            parts.append("Recorded while: " + occasion)
+
+    reasoning = context.get("reasoning") or ""
+    if reasoning and reasoning.lower() not in claim.lower():
+        parts.append("Why: " + reasoning)
+
+    if context.get("changes"):
+        parts.append("Changed: " + "; ".join(context["changes"]))
+    if context.get("where"):
+        parts.append("Applies to: " + ", ".join(context["where"]))
+
+    body = "\n\n".join(parts)
+    return body if len(body) <= CONTEXT_CHARS else body[:CONTEXT_CHARS].rstrip() + "..."
+
+
+
+# A memory shorter than this is a label, not knowledge. Set from measurement:
+# before context composition the median body here was 150 characters, and
+# those entries read as headlines nobody could act on.
+THIN_CLAIM_CHARS = 120
+
+
+def _write_quality(payload: dict[str, Any], memories: list[dict[str, Any]],
+                   resolved: list[dict[str, Any]],
+                   unresolved: list[str]) -> dict[str, Any]:
+    """Tell the agent, at write time, whether what it stored is usable.
+
+    The compiler cannot write the knowledge for the caller - only the agent
+    knows why it did what it did. What it can do is notice that an entry will
+    be useless to whoever reads it next, and say so while the context is still
+    in the caller's head. Afterwards is too late; nobody comes back to enrich
+    a memory they already wrote.
+
+    This never blocks a write. A thin memory still beats no memory.
+    """
+    notes: list[str] = []
+
+    thin = [m["title"] for m in memories
+            if len((m.get("body") or m.get("title") or "")) < THIN_CLAIM_CHARS]
+    if thin:
+        notes.append(
+            f"{len(thin)} of {len(memories)} entries are very short and may not be "
+            f"understandable on their own later. Add `reasoning` to give them the "
+            f"situation, or restate the claim with the failure it prevents. "
+            f"Shortest: {thin[0][:60]!r}")
+
+    if not str(payload.get("reasoning") or "").strip():
+        notes.append(
+            "No `reasoning` given, so every memory from this call stands alone "
+            "without the story behind it. One or two sentences here attaches "
+            "context to all of them at once.")
+
+    if not resolved:
+        notes.append(
+            "Nothing was anchored to code: this knowledge is repo-scoped and "
+            "will not surface when someone works on the relevant file. Pass "
+            "`symbols` or `files`.")
+
+    if unresolved:
+        notes.append(
+            f"Could not resolve {', '.join(repr(u) for u in unresolved[:3])}. "
+            f"Those memories are stored but not attached to anything.")
+
+    if not payload.get("failed_attempts") and payload.get("kind") in ("bug_fix", "incident"):
+        notes.append(
+            "No `failed_attempts` recorded. If anything was tried first and "
+            "rejected, that is the single most expensive thing for a future "
+            "agent to rediscover.")
+
+    return {
+        "sufficient": not notes,
+        "notes": notes,
+        "median_body_chars": _median([len(m.get("body") or "") for m in memories]),
+    }
+
+
+def _median(values: list[int]) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
 
 def _link_test_coverage(conn: sqlite3.Connection,
                         memories: list[dict[str, Any]]) -> int:
@@ -681,6 +814,12 @@ def get_memory(conn: sqlite3.Connection, memory_id: str) -> dict[str, Any] | Non
     memory = one(conn.execute("SELECT * FROM memories WHERE memory_id=?", (memory_id,)))
     if memory is None:
         return None
+
+    # Opening a memory in full is the strongest usage signal there is: it
+    # means an agent chose this one out of everything it was shown.
+    from .search import note_accessed
+    note_accessed(conn, memory_id)
+
     memory["anchors"] = rows(conn.execute(
         "SELECT anchor_id, target_kind, symbol_path, file_path, status, anchor_confidence,"
         " last_verified_commit, reanchor_history FROM anchors WHERE memory_id=?", (memory_id,)

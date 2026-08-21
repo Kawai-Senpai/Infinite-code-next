@@ -19,8 +19,10 @@ fact when its anchor says otherwise.
 
 from __future__ import annotations
 
+import math
 import re
 import sqlite3
+from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -102,7 +104,11 @@ def infer_intent(query: str) -> str:
 
 
 def _terms(query: str) -> list[str]:
-    words = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", query or "")
+    # Hyphens are kept: `re-anchor` must survive as one term so _variants()
+    # can also try `reanchor`. Splitting here dropped the `re` as too short and
+    # searched for bare `anchor`, which matches far too much.
+    words = re.findall(r"[A-Za-z_][A-Za-z0-9_-]*[A-Za-z0-9_]|[A-Za-z_][A-Za-z0-9_]{2,}",
+                       query or "")
     out: list[str] = []
     for word in words:
         if word.lower() in STOPWORDS:
@@ -124,8 +130,157 @@ def _terms(query: str) -> list[str]:
 
 
 def _fts_query(terms: list[str]) -> str:
-    return " OR ".join(f'"{t}"*' for t in terms) if terms else ""
+    """One MATCH expression covering every spelling of every term."""
+    forms: list[str] = []
+    for term in terms:
+        for variant in _variants(term):
+            if variant not in forms:
+                forms.append(variant)
+    return " OR ".join(f'"{t}"*' for t in forms) if forms else ""
 
+
+
+def _variants(term: str) -> list[str]:
+    """Forms of one term that should match the same text.
+
+    `reanchor` and `re-anchor` are the same word to a reader, but FTS5's
+    unicode61 tokenizer splits on the hyphen, so neither query finds the other.
+    Splitting camelCase and dropping separators covers the cases that actually
+    come up in code: reAnchor, re_anchor, re-anchor, reanchor.
+    """
+    out = [term]
+    squashed = re.sub(r"[-_]", "", term)
+    if squashed and squashed != term:
+        out.append(squashed)
+    for piece in re.split(r"[-_]", term):
+        if len(piece) > 2 and piece != term:
+            out.append(piece)
+
+    # The reverse direction: a query of `reanchor` must reach text that says
+    # `re-anchor`. FTS cannot express "ignore separators", so split on common
+    # prefixes and search the remainder, which the tokenizer does index as its
+    # own token.
+    if "-" not in term and "_" not in term and len(term) > 6:
+        for prefix in ("re", "un", "de", "pre", "non", "sub", "auto", "multi"):
+            if term.lower().startswith(prefix) and len(term) - len(prefix) > 3:
+                rest = term[len(prefix):]
+                if rest not in out:
+                    out.append(rest)
+                break
+    return out
+
+
+def _fuzzy_memories(conn: sqlite3.Connection, terms: list[str],
+                    limit: int = 20) -> dict[str, float]:
+    """Approximate match, for when exact and prefix search both come up empty.
+
+    Deliberately a fallback rather than a default: FTS5 ranking is better than
+    anything computed here when it has hits at all, and running fuzzy matching
+    over every query would let loose matches outrank exact ones. Scored below
+    any real FTS hit so it can only fill an empty result, never displace one.
+    """
+    if not terms:
+        return {}
+    needles = [t.lower() for t in terms if len(t) > 3]
+    if not needles:
+        return {}
+
+    scored: dict[str, float] = {}
+    for row in rows(conn.execute(
+        "SELECT memory_id, title, body FROM memories WHERE status='ACTIVE' LIMIT 4000"
+    )):
+        haystack = ((row["title"] or "") + " " + (row["body"] or "")).lower()
+        squashed = re.sub(r"[-_\s]", "", haystack)
+        best = 0.0
+        for needle in needles:
+            if needle in haystack:
+                best = max(best, 0.5)
+                continue
+            if re.sub(r"[-_\s]", "", needle) in squashed:
+                best = max(best, 0.42)     # matched only across a separator
+                continue
+            for word in set(re.findall(r"[a-z][a-z0-9]{3,}", haystack)):
+                if abs(len(word) - len(needle)) > 3:
+                    continue
+                score = SequenceMatcher(None, needle, word).ratio()
+                if score >= 0.82:
+                    best = max(best, score * 0.4)
+        if best:
+            scored[row["memory_id"]] = best
+
+    # Normalise onto the same 0..1 scale FTS relevance uses. Raw similarity
+    # ratios sit around 0.4, which lands every fuzzy hit below MEMORY_FLOOR -
+    # so the fallback found the right memories and the capsule then demoted
+    # all of them, which reads to a user as "found nothing".
+    top = sorted(scored.items(), key=lambda kv: -kv[1])[:limit]
+    if not top:
+        return {}
+    best = top[0][1] or 1.0
+    return {mid: min(1.0, score / best) for mid, score in top}
+
+
+# Usage signal. Two different events, weighted differently on purpose:
+#   surfaced  - the memory appeared in a result. Cheap, and mostly says the
+#               retrieval matched, not that the memory was useful.
+#   accessed  - an agent opened it in full. That is a real vote.
+# A memory nobody has ever opened, however severe its author thought it was,
+# has not yet proven itself; one agents keep returning to has.
+USAGE_HALF_LIFE_DAYS = 45.0
+
+
+def note_surfaced(conn: sqlite3.Connection, memory_ids: list[str]) -> None:
+    """Record that these memories appeared in a result. Never raises: a
+    ranking signal must not be able to fail a search."""
+    if not memory_ids:
+        return
+    try:
+        with write_tx(conn):
+            conn.executemany(
+                "UPDATE memories SET surfaced_count = COALESCE(surfaced_count, 0) + 1"
+                " WHERE memory_id = ?", [(m,) for m in set(memory_ids)])
+    except sqlite3.Error:
+        pass
+
+
+def note_accessed(conn: sqlite3.Connection, memory_id: str) -> None:
+    """Record that an agent opened this memory in full."""
+    try:
+        with write_tx(conn):
+            conn.execute(
+                "UPDATE memories SET access_count = COALESCE(access_count, 0) + 1,"
+                " last_accessed_at = ? WHERE memory_id = ?", (now(), memory_id))
+    except sqlite3.Error:
+        pass
+
+
+def usage_boost(memory: dict[str, Any]) -> float:
+    """How much a memory's track record should lift it, in 0..~0.5.
+
+    Deliberately bounded and sub-linear. Frequency is evidence, not authority:
+    letting it grow without limit would pin whatever was popular last month to
+    the top of every result and bury a critical warning recorded yesterday.
+    Recency decays it, so a memory that mattered once and never again fades.
+    """
+    opened = memory.get("access_count") or 0
+    surfaced = memory.get("surfaced_count") or 0
+    if not opened and not surfaced:
+        return 0.0
+
+    # Opens are worth far more than impressions; a memory can be surfaced by
+    # a loose lexical match without anyone finding it useful.
+    raw = math.log1p(opened * 4 + surfaced * 0.35)
+
+    decay = 1.0
+    stamp = memory.get("last_accessed_at")
+    if stamp:
+        try:
+            when = datetime.fromisoformat(str(stamp))
+            days = max(0.0, (datetime.now(timezone.utc) - when).total_seconds() / 86400)
+            decay = 0.5 ** (days / USAGE_HALF_LIFE_DAYS)
+        except (ValueError, TypeError):
+            decay = 1.0
+
+    return min(0.5, raw * 0.18 * decay)
 
 # ------------------------------------------------------------------- retrieval
 
@@ -178,9 +333,11 @@ def _seed_memories(conn: sqlite3.Connection, terms: list[str]) -> dict[str, floa
             " WHERE fts_memories MATCH ? ORDER BY score LIMIT 60", (_fts_query(terms),)
         ))
     except sqlite3.OperationalError:
-        return {}
+        hits = []
     if not hits:
-        return {}
+        # Nothing matched exactly. A typo or an unfamiliar spelling should
+        # still find the memory rather than returning an empty answer.
+        return _fuzzy_memories(conn, terms)
     best = min(h["score"] for h in hits)
     worst = max(h["score"] for h in hits)
     span = (worst - best) or 1.0
@@ -356,7 +513,8 @@ def _memory_score(memory: dict[str, Any], relevance: dict[str, float] | None,
     weight = 1.4 if intent in ("modify", "debug") else 0.8
 
     stale = STALE_PENALTY.get(memory.get("anchor_status") or anchor_mod.ACTIVE, 0.0)
-    return max(floor, lexical) * 1.6 + severity * weight - stale * 0.5
+    return (max(floor, lexical) * 1.6 + severity * weight
+            + usage_boost(memory) - stale * 0.5)
 
 def _capsule(conn: sqlite3.Connection, catalog: sqlite3.Connection, symbol: dict[str, Any],
              memories: list[dict[str, Any]], intent: str,
@@ -749,6 +907,9 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
         symbol["symbol_id"]
         for _, symbol, _, _ in scored[:max(len(capsules), 8)]
     ]
+    # Record what this answer actually showed, so ranking learns from use.
+    note_surfaced(conn, [m["memory_id"] for c in capsules for m in c["memory"]])
+
     problems = detect_problems(conn, catalog, top_ids) if find_problems else []
 
     unanchored = rows(conn.execute(

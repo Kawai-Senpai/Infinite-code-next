@@ -211,7 +211,12 @@ def test_the_page_cannot_be_broken_by_content(workspace, tmp_path):
     page = explorer.render(graph_of(workspace))
     payload = page.split('id="data" type="application/json">', 1)[1].split("</script>", 1)[0]
     assert json.loads(payload), "an embedded </script> must not truncate the data block"
-    assert "window.__pwned" not in page.split("__DATA__")[0]
+
+    # The payload may legitimately contain the text - what must never happen is
+    # it escaping the data block and becoming executable markup.
+    assert "</script>" not in payload, "a body must not close the data block"
+    before_data = page.split('id="data" type="application/json">', 1)[0]
+    assert "window.__pwned" not in before_data, "content must not reach the document body"
 
 
 def test_the_page_offers_every_export_the_cli_does(workspace):

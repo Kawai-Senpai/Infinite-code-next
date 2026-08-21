@@ -299,16 +299,39 @@ def record(
 
     Use kind='checkpoint' at the end of a task to distil the session.
 
+    WRITE LIKE THE NEXT AGENT HAS NO CONTEXT, because it does not. Every entry
+    should survive being read alone, months later, by someone who was not here.
+
+        Thin, nearly useless:  "settle must be idempotent"
+        Actually useful:       "settle() must be idempotent: a retried webhook
+                                must not double-charge. We learned this from
+                                the Feb duplicate-charge incident, where the
+                                payment provider retried after a 502 that had
+                                already succeeded. The guard is the
+                                idempotency_key column, unique per invoice."
+
+    The second one costs you a few extra seconds now and saves the next agent
+    an afternoon. State the failure it prevents, the evidence it rests on, and
+    the mechanism that enforces it - not just the rule.
+
     Args:
-        summary: one line on what happened. Required.
+        summary: what happened, in one full sentence. Required.
         kind: bug_fix | decision | refactor | investigation | checkpoint | incident | note.
-        reasoning: why, in a sentence or two.
+        reasoning: why this happened and why it was done this way. Two or three
+            sentences. This is attached to every memory the call produces, so
+            it is the cheapest way to make all of them self-contained.
         files: file paths this touches.
         symbols: symbol names this touches, e.g. RefreshCoordinator.acquire.
         changes: what actually changed.
-        invariants: things that must remain true.
-        warnings: things a future agent must not do.
-        failed_attempts: what was tried and rejected, and why.
+        invariants: things that must remain true, and what breaks if they are
+            not. "X must hold, because otherwise Y" beats "X must hold".
+        warnings: things a future agent must not do, and the symptom it causes.
+            A warning nobody can recognise in the wild will not be heeded.
+        failed_attempts: what was tried, why it was rejected, and how the
+            failure showed itself. This is the highest-value field in the
+            system - nothing else in your toolchain records it, and it is what
+            stops the next agent spending a day on a dead end you already
+            walked down.
         decisions: choices made and the alternatives rejected.
         contracts: assumptions other code or repos rely on.
         performance: performance-relevant facts.

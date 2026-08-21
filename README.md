@@ -7,7 +7,7 @@ memory of a codebase — the decisions behind it, what was already tried and
 rejected, and what must never break — anchored to the code and carried with it
 as the code moves.
 
-[![tests](https://img.shields.io/badge/tests-159_passing-34d399?style=for-the-badge&labelColor=1c2340)](#testing)
+[![tests](https://img.shields.io/badge/tests-172_passing-34d399?style=for-the-badge&labelColor=1c2340)](#testing)
 [![python](https://img.shields.io/badge/python-3.10+-4d7cfe?style=for-the-badge&labelColor=1c2340)](#quick-start)
 [![mcp](https://img.shields.io/badge/protocol-MCP-8b5cf6?style=for-the-badge&labelColor=1c2340)](#quick-start)
 [![no llm](https://img.shields.io/badge/LLM_calls-none-fbbf24?style=for-the-badge&labelColor=1c2340)](#no-llm-in-the-loop)
@@ -114,10 +114,30 @@ icn-explore           # if the package is on your PATH
 <img src="assets/explorer.png" alt="The knowledge explorer: filters on the left, force-directed graph in the centre, node inspector on the right" width="900">
 </div>
 
-Above: the export menu open over the graph. Selecting a node instead lights up
-its neighbourhood — the files it is anchored to, the test that guards it
-(green, dashed), the symbols it impacts (amber, dashed) — while everything else
-fades back.
+Above: the export menu open over the full graph.
+
+<table>
+<tr>
+<td width="50%"><img src="assets/graph-focus.png" alt="One memory selected, its neighbourhood lit and everything else faded"></td>
+<td width="50%"><img src="assets/graph-knowledge.png" alt="Structure filtered away, leaving only memories and the tests that guard them"></td>
+</tr>
+<tr>
+<td><b>Select a node</b> and its neighbourhood lights up — the files it is
+anchored to (violet), the test that guards it (green, dashed), the symbols it
+impacts (amber, dashed). Everything else fades back.</td>
+<td><b>Filter structure away</b> and you are left with the knowledge layer
+alone: 48 memories and the tests covering them. This view is what no other
+tool in your stack can draw.</td>
+</tr>
+<tr>
+<td colspan="2"><img src="assets/graph-search.png" alt="Search narrowing 573 nodes to 79"></td>
+</tr>
+<tr>
+<td colspan="2"><b>Search narrows live</b> — 573 nodes down to 79 for
+<code>anchor</code>, across code and knowledge at once. Export "copy visible"
+then turns whatever is left on screen into a shareable subset.</td>
+</tr>
+</table>
 
 | | |
 |---|---|
@@ -363,6 +383,28 @@ no network, no token cost.** Ranking is a static, inspectable formula with
 per-intent weights, because a fresh local install has no labeled relevance
 data to train a reranker on.
 
+### Search that tolerates how people type
+
+Exact and prefix matching runs first; when it finds nothing, an approximate
+pass takes over, so `subproces` still finds the subprocess warning. Hyphenation
+is bridged in both directions — `reanchor` finds text saying `re-anchor` and
+vice versa — because FTS5's tokenizer splits on hyphens and neither spelling
+would otherwise reach the other.
+
+The fallback is deliberately a fallback: FTS ranking beats anything computed
+locally when it has hits at all, so running fuzzy matching by default would let
+loose matches outrank exact ones.
+
+### Ranking learns from use
+
+Every memory tracks how often it was surfaced and how often an agent opened it
+in full. Opening is weighted far higher — being shown only means the query
+matched, while being opened means an agent chose it out of everything it saw.
+
+The boost is bounded at 0.5 and decays with a 45-day half-life. Frequency is
+evidence, not authority: unbounded, it would pin last month's popular memory
+above a critical warning recorded yesterday.
+
 ### Storage
 
 ```
@@ -477,7 +519,7 @@ published page must stay a single self-contained file.
 python -m pytest
 ```
 
-**159 tests**, including a live MCP suite that spawns the real server over
+**172 tests**, including a live MCP suite that spawns the real server over
 stdio and drives a full agent workflow through the wire protocol, and a
 dirty-worktree harness that asserts cascade behaviour on **uncommitted** edits
 — reformat, rename, body change, cross-file move, delete, weak migration.

@@ -68,6 +68,6 @@
     <text x="328" y="221">file</text>
     <circle cx="386" cy="216" r="4.5" fill="#34d399"/>
     <text x="398" y="221">symbol</text>
-    <text x="212" y="252" fill="#6b7499">MCP · zero config · no LLM calls · 159 tests</text>
+    <text x="212" y="252" fill="#6b7499">MCP · zero config · no LLM calls · 172 tests</text>
   </g>
 </svg>
