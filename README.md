@@ -7,12 +7,12 @@ memory of a codebase — the decisions behind it, what was already tried and
 rejected, and what must never break — anchored to the code and carried with it
 as the code moves.
 
-[![tests](https://img.shields.io/badge/tests-172_passing-34d399?style=for-the-badge&labelColor=1c2340)](#testing)
+[![tests](https://img.shields.io/badge/tests-177_passing-34d399?style=for-the-badge&labelColor=1c2340)](#testing)
 [![python](https://img.shields.io/badge/python-3.10+-4d7cfe?style=for-the-badge&labelColor=1c2340)](#quick-start)
 [![mcp](https://img.shields.io/badge/protocol-MCP-8b5cf6?style=for-the-badge&labelColor=1c2340)](#quick-start)
 [![no llm](https://img.shields.io/badge/LLM_calls-none-fbbf24?style=for-the-badge&labelColor=1c2340)](#no-llm-in-the-loop)
 
-**[Quick start](#quick-start) · [Explorer](#the-knowledge-explorer) ·
+**[Quick start](#quick-start) · [Agent setup](AGENT_SETUP.md) · [Explorer](#the-knowledge-explorer) ·
 [Sharing](#sharing-knowledge) · [For agents](#guide-for-ai-agents) ·
 [How it works](#how-it-works) · [Brand](#brand)**
 
@@ -85,6 +85,17 @@ args = []
 The server works out which repository it is in from its working directory, and
 every response echoes the root it resolved, so a wrong workspace is obvious
 immediately.
+
+Verify the complete client setup, including a real stdio handshake, tool
+discovery, repository open, and parser/index health:
+
+```bash
+icn doctor --client codex --root /path/to/repository
+```
+
+If the client was already running when ICN was installed or configured,
+restart it after the doctor reports `READY` so its deferred tool catalogue is
+refreshed.
 
 ### The loop
 
@@ -230,6 +241,55 @@ shelf.**
 ```python
 investigate("I need to change refresh token rotation. What will I break?")
 ```
+
+For one bounded investigation across several repositories, pass their roots
+explicitly. This does not require pre-existing contract edges:
+
+```python
+investigate(
+    query="change the trip-notification event contract",
+    roots=["/work/accounting-service", "/work/be-nf-service", "/work/be-service"],
+    intent="modify",
+)
+```
+
+`cross_repos=True` remains the provenance-aware mode that follows recorded
+contracts. `roots=[...]` is the explicit search scope for repositories that
+have not yet had those contracts recorded.
+
+### Recommended global agent instruction
+
+Installing an MCP server does not guarantee an agent will proactively use it.
+Add the following short instruction to the agent's global instruction file.
+Keep it short: the MCP tool descriptions teach the detailed workflow after the
+first call.
+
+#### Codex (`~/.codex/AGENTS.md`)
+
+```markdown
+## Infinite Code Next (ICN)
+- For any task involving an existing codebase, use ICN. At the beginning of a session and whenever you switch repositories, discover deferred tools if necessary and call `mcp__icn__workspace(action="open", root=<repo>)`.
+- Before investigating, diagnosing, designing, or modifying code, call `mcp__icn__investigate(query=<task>, intent=<intent>, root=<repo>)`. Treat memories whose anchor status is not `ACTIVE` as unverified leads.
+- After verified findings or changes, call `mcp__icn__record` with the decision, failure prevented, affected files/symbols, invariants, warnings, failed attempts, contracts, and tests. Skip investigation and recording only for purely mechanical actions such as correcting a typo or running an explicitly requested command.
+- If `mcp__icn__*` is not visible, search the available/deferred tool catalogue and load it. If it still cannot be loaded, explicitly report that ICN is unavailable and continue with the best evidence. Never silently skip ICN or claim it was used when it was not.
+```
+
+#### Claude Code (`~/.claude/CLAUDE.md`)
+
+```markdown
+## Infinite Code Next (ICN)
+- For any task involving an existing codebase, use ICN. At the beginning of a session and whenever you switch repositories, ensure the `icn` MCP server and its tools are loaded and call `workspace(action="open", root=<repo>)`.
+- Before investigating, diagnosing, designing, or modifying code, call `investigate(query=<task>, intent=<intent>, root=<repo>)`. Treat memories whose anchor status is not `ACTIVE` as unverified leads.
+- After verified findings or changes, call `record` with the decision, failure prevented, affected files/symbols, invariants, warnings, failed attempts, contracts, and tests. Skip investigation and recording only for purely mechanical actions such as correcting a typo or running an explicitly requested command.
+- If ICN is not loaded, try to reconnect or load the configured `icn` MCP server. If it remains unavailable, explicitly report that fact and continue with the best evidence. Never silently skip ICN or claim it was used when it was not.
+```
+
+For repository-local enforcement, place the same block in that repository's
+`AGENTS.md` or `CLAUDE.md`. Global instructions are preferable when ICN should
+be used across every repository.
+
+See [Agent setup and required instructions](AGENT_SETUP.md) for the full
+installation, verification, and copy-paste setup process.
 
 One call fuses lexical search, symbol lookup, code-graph traversal,
 memory-graph traversal, anchor status and git history, and returns compact
@@ -519,7 +579,7 @@ published page must stay a single self-contained file.
 python -m pytest
 ```
 
-**172 tests**, including a live MCP suite that spawns the real server over
+**177 tests**, including a live MCP suite that spawns the real server over
 stdio and drives a full agent workflow through the wire protocol, and a
 dirty-worktree harness that asserts cascade behaviour on **uncommitted** edits
 — reformat, rename, body change, cross-file move, delete, weak migration.

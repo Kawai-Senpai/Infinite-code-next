@@ -44,6 +44,23 @@ def resolve_root(explicit: str | None = None) -> Path:
     return Path.cwd().resolve()
 
 
+def named_sibling_roots(root: Path, query: str) -> list[Path]:
+    """Return sibling Git repositories explicitly named in a query."""
+    lowered = (query or "").lower()
+    found: list[Path] = []
+    try:
+        siblings = root.parent.iterdir()
+    except OSError:
+        return found
+    for sibling in siblings:
+        if sibling == root or not sibling.is_dir() or not (sibling / ".git").exists():
+            continue
+        name = sibling.name.lower()
+        if name in lowered or str(sibling).lower() in lowered:
+            found.append(sibling.resolve())
+    return found
+
+
 @dataclass
 class Workspace:
     root: Path
@@ -176,13 +193,19 @@ def ensure_indexed(ws: Workspace, force_full: bool = False,
         lease.release()
 
     verification = anchor_mod.verify_repo(ws.store, ws.root, ws.commit)
-    return {
+    result = {
         "indexed": True,
         "index_state": "partial" if report.get("truncated") else "ready",
         **report,
         "anchors": verification,
         **indexer_mod.index_state(ws.store),
     }
+    if result.get("files_active", 0) and not result.get("symbols_active", 0):
+        result["parser_warning"] = (
+            "Source files were indexed but no symbols were parsed. Check the Python, "
+            "tree-sitter, and tree-sitter-language-pack compatibility with `icn doctor`."
+        )
+    return result
 
 
 def status(ws: Workspace) -> dict[str, Any]:

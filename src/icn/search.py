@@ -324,6 +324,28 @@ def _seed_symbols(conn: sqlite3.Connection, terms: list[str]) -> dict[str, dict[
     return seeds
 
 
+def _boost_explicit_paths(conn: sqlite3.Connection, query: str,
+                          seeds: dict[str, dict[str, Any]]) -> None:
+    """Give exact filenames and path fragments precedence over generic nouns."""
+    candidates = re.findall(
+        r"(?:[A-Za-z]:[\\/])?[^\s,;:'\"()]+[\\/][^\s,;:'\"()]+|"
+        r"\b[A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|cs|md|toml|yaml|yml|json)\b",
+        query or "",
+    )
+    for raw in candidates:
+        needle = raw.replace("\\", "/").lower().strip("./")
+        basename = needle.rsplit("/", 1)[-1]
+        for row in rows(conn.execute(
+            "SELECT symbol_id, last_known_path FROM symbols WHERE status='ACTIVE' "
+            "AND (LOWER(REPLACE(last_known_path, '\\', '/')) LIKE ? "
+            "OR LOWER(REPLACE(last_known_path, '\\', '/')) LIKE ?) LIMIT 80",
+            (f"%{needle}%", f"%/{basename}"),
+        )):
+            seed = seeds.setdefault(row["symbol_id"], {"lex": 0.0, "sym": 0.0})
+            seed["lex"] = 1.0
+            seed["sym"] = 1.0
+
+
 def _seed_memories(conn: sqlite3.Connection, terms: list[str]) -> dict[str, float]:
     if not terms:
         return {}
@@ -814,6 +836,7 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
     terms = _terms(query)
 
     seeds = _seed_symbols(conn, terms)
+    _boost_explicit_paths(conn, query, seeds)
     memory_hits = _seed_memories(conn, terms)
 
     # Memories that matched textually pull their anchored symbols in with them,

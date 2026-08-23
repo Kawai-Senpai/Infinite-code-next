@@ -16,6 +16,7 @@ once instead of quietly poisoning the store.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -172,6 +173,7 @@ def investigate(
     query: str = "",
     intent: str | None = None,
     root: str | None = None,
+    roots: list[str] | None = None,
     depth: int = 2,
     budget: int = 9000,
     find_problems: bool = True,
@@ -197,7 +199,8 @@ def investigate(
     Args:
         query: what you are trying to do, in plain language.
         intent: locate | understand | modify | debug | audit. Inferred if omitted.
-        root: repository path. Defaults to the server's working directory.
+        root: primary repository path. Defaults to the server's working directory.
+        roots: explicit repository paths for one bounded multi-repository search.
         depth: graph expansion hops from the seed set.
         budget: approximate token ceiling for the returned capsules.
         find_problems: run targeted checks over the narrowed subgraph.
@@ -209,6 +212,56 @@ def investigate(
         focus: what to drill into, for expand.
         symbol: the symbol to explain, for action="why".
     """
+    requested_roots = [value for value in (roots or []) if str(value).strip()]
+    if requested_roots and (action or "search").lower().strip() != "search":
+        return _fail("roots is supported only for investigate action='search'", root)
+    if requested_roots:
+        ordered = [root, *requested_roots] if root else requested_roots
+        unique: list[str] = []
+        seen: set[str] = set()
+        for value in ordered:
+            resolved = str(Path(value).expanduser().resolve())
+            if resolved.lower() not in seen:
+                seen.add(resolved.lower())
+                unique.append(resolved)
+        per_repo_budget = max(500, budget // max(1, len(unique)))
+        repository_results: list[dict[str, Any]] = []
+        for repository_root in unique:
+            current = ws_mod.open_workspace(repository_root)
+            try:
+                index_report = ws_mod.ensure_indexed(current)
+                result = search_mod.investigate(
+                    current.store, current.catalog, current.root, query,
+                    intent=intent, depth=depth, budget=per_repo_budget,
+                    find_problems=find_problems, commit=current.commit,
+                    cross_repos=cross_repos, repo_id=current.repo_id,
+                )
+                repository_results.append({
+                    "root": str(current.root), "repo_id": current.repo_id,
+                    "index_state": index_report.get("index_state", "ready"), **result,
+                })
+            finally:
+                current.close()
+        capsules = [
+            {"repository_root": item["root"], "repository_id": item["repo_id"], **capsule}
+            for item in repository_results for capsule in item.get("capsules", [])
+        ]
+        capsules.sort(key=lambda value: -float(value.get("score", 0)))
+        problems = [
+            {"repository_root": item["root"], **problem}
+            for item in repository_results for problem in item.get("problems", [])
+        ]
+        return {
+            "ok": True,
+            "multi_root": True,
+            "resolved_roots": unique,
+            "query": query,
+            "repositories": repository_results,
+            "capsules": capsules[:12],
+            "problems": problems,
+            "budget": {"limit": budget, "per_repository": per_repo_budget},
+        }
+
     current = ws_mod.open_workspace(root)
     try:
         act = (action or "search").lower().strip()
@@ -260,6 +313,13 @@ def investigate(
         result["ok"] = True
         result["resolved_root"] = str(current.root)
         result["index_state"] = index_report.get("index_state", "ready")
+        scope = ws_mod.named_sibling_roots(current.root, query)
+        if scope:
+            result["scope_warning"] = (
+                "The query names sibling repositories outside this investigation scope. "
+                "Pass roots=[...] to search them explicitly."
+            )
+            result["suggested_roots"] = [str(path) for path in scope]
         return result
     finally:
         current.close()
