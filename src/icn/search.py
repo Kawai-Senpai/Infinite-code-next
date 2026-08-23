@@ -84,6 +84,8 @@ STOPWORDS = {
     "can", "should", "would", "there", "then", "with", "from", "into", "have", "has",
     "will", "just", "also", "some", "any", "all", "not", "but", "when", "who", "here",
     "make", "made", "use", "used", "using", "now", "new", "old", "way", "like", "going",
+    "based", "observed", "failure", "failures", "must", "show", "hide", "expose", "better",
+    "initial", "harden", "fix", "fixed", "issue", "issues",
 }
 
 

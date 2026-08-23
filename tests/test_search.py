@@ -270,6 +270,13 @@ def test_hyphenation_does_not_hide_a_memory(workspace):
         assert any("lower trust" in t for t in texts), f"{query!r} found nothing"
 
 
+def test_long_requests_do_not_spend_term_budget_on_instruction_words():
+    terms = [term.lower() for term in search_mod._terms(
+        "Harden ICN based on observed failures and fix explorer repository symbols conflicts")]
+    assert "repository" in terms and "symbols" in terms and "conflicts" in terms
+    assert not {"harden", "based", "observed", "failures", "fix"} & set(terms)
+
+
 def test_fuzzy_results_clear_the_quoting_floor(workspace):
     """The fallback found the right memories and the capsule then demoted all
     of them, which reads to a user as "found nothing"."""

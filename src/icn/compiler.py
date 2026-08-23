@@ -294,6 +294,12 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
         ],
         "unresolved_references": unresolved,
         "contradictions": contradictions,
+        "trust": {
+            "authority": payload.get("authority", "agent"),
+            "verified": payload.get("authority") == "human",
+            "note": ("Human-supplied assertion." if payload.get("authority") == "human" else
+                     "Agent-supplied claim; anchoring verifies code location, not semantic truth."),
+        },
         "quality": _write_quality(payload, created_memories, resolved, unresolved),
     }
 
@@ -689,8 +695,16 @@ def _detect_contradictions(conn: sqlite3.Connection, memory_id: str, kind: str, 
             continue
         _link(conn, memory_id, other["memory_id"], "CONTRADICTS", "inferred", round(overlap, 3),
               {"reason": "similar subject, opposite polarity"})
+        shared = sorted(new_tokens & other_tokens)
         found.append({"memory_id": other["memory_id"], "title": other["title"],
                       "overlap": round(overlap, 3),
+                      "new_claim": body.split("\n", 1)[0],
+                      "existing_claim": (other["body"] or "").split("\n", 1)[0],
+                      "shared_terms": shared[:12],
+                      "new_polarity": "negative" if new_negated else "positive",
+                      "existing_polarity": ("negative" if NEGATION.search(other["body"] or "")
+                                            else "positive"),
+                      "existing_authority": other["authority"],
                       "note": "flagged for review, nothing was overwritten"})
     return found
 

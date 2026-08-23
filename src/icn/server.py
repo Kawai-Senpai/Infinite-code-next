@@ -278,6 +278,10 @@ def investigate(
         if act == "why":
             if not symbol.strip():
                 return _fail("why requires `symbol`", str(current.root))
+            # `open_workspace` opens the store but deliberately does not index
+            # it. `why` must still resolve methods when it is the first call
+            # after an agent switches repositories.
+            ws_mod.ensure_indexed(current)
             from . import compiler as _compiler
             match = _compiler.resolve_reference(current.store, symbol)
             if match is None or match["kind"] != "symbol":
@@ -313,6 +317,20 @@ def investigate(
         result["ok"] = True
         result["resolved_root"] = str(current.root)
         result["index_state"] = index_report.get("index_state", "ready")
+        known = catalog_mod.list_repositories(current.catalog)
+        result["repository_scope"] = {
+            "selected": {"repo_id": current.repo_id, "root": str(current.root)},
+            "alternatives": [
+                {"repo_id": repo["repo_id"], "name": repo["name"],
+                 "checkouts": [checkout["path"] for checkout in repo["checkouts"]]}
+                for repo in known if repo["repo_id"] != current.repo_id
+            ],
+            "note": "Results come only from the selected repository unless roots=[...] is passed.",
+        }
+        result["validation_boundary"] = (
+            "Static indexing and stored memories are leads, not runtime proof. Verify semantic "
+            "claims with direct source inspection plus focused tests or live execution."
+        )
         scope = ws_mod.named_sibling_roots(current.root, query)
         if scope:
             result["scope_warning"] = (

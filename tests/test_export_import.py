@@ -198,6 +198,30 @@ def test_the_explorer_page_is_self_contained(workspace, tmp_path):
     assert json.loads(payload)["stats"]["nodes"] > 0
 
 
+def test_explorer_hides_symbols_before_its_first_layout(workspace):
+    record_baseline(workspace)
+    page = explorer.render(graph_of(workspace))
+
+    assert "v => v === 'symbol'" in page
+    assert "if (!defaultOff(v)) set.add(v)" in page
+
+
+def test_explorer_renders_repository_switcher_metadata(workspace):
+    record_baseline(workspace)
+    graph = graph_of(workspace)
+    graph["repositories"] = [
+        {"repo_id": graph["repo_id"], "name": graph["repo_name"],
+         "memories": 4, "href": "current.html"},
+        {"repo_id": "repo_other", "name": "other-service",
+         "memories": 7, "href": "other.html"},
+    ]
+    page = explorer.render(graph)
+
+    assert 'id="repo-picker"' in page
+    payload = page.split('id="data" type="application/json">', 1)[1].split("</script>", 1)[0]
+    assert len(json.loads(payload)["repositories"]) == 2
+
+
 def test_the_page_cannot_be_broken_by_content(workspace, tmp_path):
     """A memory body is arbitrary text; it must not be able to close a tag."""
     from icn import compiler

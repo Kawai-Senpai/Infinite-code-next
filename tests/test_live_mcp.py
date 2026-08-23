@@ -49,6 +49,11 @@ def live(tmp_path_factory):
     with McpStdioClient(repo, {"INFINITE_CODE_HOME": str(home), "PYTHONPATH": SRC}) as client:
         captured["tools"] = client.list_tools()
 
+        # A first-call `why` must index before it resolves symbols; it cannot
+        # rely on a previous workspace/open call having populated the store.
+        captured["why_without_workspace_open"] = client.call("investigate", {
+            "action": "why", "symbol": "RefreshCoordinator.acquire"})
+
         captured["opened"] = client.call("workspace", {"action": "open"})
         captured["status"] = client.call("workspace", {"action": "status"})
         captured["recorded"] = client.call("record", {
@@ -148,10 +153,11 @@ def test_every_tool_documents_itself(live):
         assert "properties" in tool["inputSchema"]
 
 
-def test_workspace_opens_and_indexes_on_first_call(live):
+def test_workspace_opens_and_indexes_after_a_first_call_why(live):
     opened = live["opened"]
     assert opened["ok"] is True
-    assert opened["first_seen"] is True
+    # The first-call `why` above opened and indexed the workspace itself.
+    assert opened["first_seen"] is False
     assert opened["identity"]["vcs"] == "git"
     assert opened["identity"]["strength"] == "strong"
     assert opened["index"]["symbols_active"] >= 5
@@ -172,6 +178,12 @@ def test_record_compiles_one_event_into_many_facts(live):
     assert recorded["edges_created"] > 5
     assert recorded["unresolved_references"] == []
     assert recorded["entities_resolved"][0]["resolved_to"] == "RefreshCoordinator.acquire"
+
+
+def test_why_resolves_symbols_without_a_prior_workspace_open(live):
+    result = live["why_without_workspace_open"]
+    assert result["ok"] is True
+    assert result["symbol"] == "RefreshCoordinator.acquire"
 
 
 def test_investigate_returns_the_knowledge_that_matters(live):

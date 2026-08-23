@@ -82,10 +82,21 @@ def test_contradiction_is_flagged_not_resolved(workspace):
          "symbols": ["RefreshCoordinator.acquire"]},
     )
     assert second["contradictions"], "expected the conflicting invariant to be flagged"
+    conflict = second["contradictions"][0]
+    assert conflict["new_claim"] and conflict["existing_claim"]
+    assert conflict["new_polarity"] != conflict["existing_polarity"]
+    assert conflict["shared_terms"]
     # Both survive. Nothing was overwritten.
     active = rows(workspace.store.execute(
         "SELECT * FROM memories WHERE kind='invariant' AND status='ACTIVE'"))
     assert len(active) >= 2
+
+
+def test_record_marks_agent_semantics_as_unverified(workspace):
+    result = record_baseline(workspace)
+    assert result["trust"]["authority"] == "agent"
+    assert result["trust"]["verified"] is False
+    assert "semantic truth" in result["trust"]["note"]
 
 
 def test_agent_cannot_rewrite_a_human_memory(workspace):

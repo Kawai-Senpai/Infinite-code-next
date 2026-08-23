@@ -19,7 +19,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import explorer, export
+from . import catalog as catalog_mod
+from . import db, explorer, export, paths
 from . import workspace as ws_mod
 
 
@@ -35,6 +36,7 @@ def cmd_explore(args: argparse.Namespace) -> int:
     try:
         graph = export.build_graph(ws.store, ws.catalog, ws.repo_id,
                                    include_deleted=args.include_deleted)
+        repositories = catalog_mod.list_repositories(ws.catalog)
     finally:
         ws.close()
 
@@ -45,7 +47,31 @@ def cmd_explore(args: argparse.Namespace) -> int:
         return 1
 
     target = Path(args.out) if args.out else Path(tempfile.gettempdir()) / "icn-explorer.html"
+    available = [repo for repo in repositories if repo["store_available"]]
+    links = [
+        {"repo_id": repo["repo_id"], "name": repo["name"], "memories": repo["memories"],
+         "href": (target.name if repo["repo_id"] == graph["repo_id"] else
+                  f"{target.stem}-{repo['repo_id']}{target.suffix}")}
+        for repo in available
+    ]
+    graph["repositories"] = links
     explorer.write_html(graph, target)
+    catalog = catalog_mod.open_catalog()
+    try:
+        for repo in available:
+            if repo["repo_id"] == graph["repo_id"]:
+                continue
+            store = db.init_repo_store(paths.repo_db_path(repo["repo_id"]))
+            try:
+                other = export.build_graph(store, catalog, repo["repo_id"],
+                                           include_deleted=args.include_deleted)
+                other["repositories"] = links
+                explorer.write_html(other, target.with_name(
+                    f"{target.stem}-{repo['repo_id']}{target.suffix}"))
+            finally:
+                store.close()
+    finally:
+        catalog.close()
     print(f"  {graph['repo_name']}: {stats['nodes']} nodes, {stats['edges']} edges")
     print(f"  Wrote {target}")
     if args.no_serve:

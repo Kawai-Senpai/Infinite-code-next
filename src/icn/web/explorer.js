@@ -61,10 +61,10 @@ function tally(list, key) {
   for (const x of list) { const k = key(x); if (k) m.set(k, (m.get(k)||0)+1); }
   return [...m].sort((a,b) => b[1]-a[1]);
 }
-function chips(host, entries, set, mark) {
-  entries.forEach(([v]) => set.add(v));
+function chips(host, entries, set, mark, defaultOff = () => false) {
+  entries.forEach(([v]) => { if (!defaultOff(v)) set.add(v); });
   host.innerHTML = entries.map(([v,n]) => `
-    <div class="row" data-v="${v}">${mark(v)}
+    <div class="row ${defaultOff(v) ? 'off' : ''}" data-v="${v}">${mark(v)}
       <span class="name">${v.replace(/_/g,' ').toLowerCase()}</span>
       <span class="n">${n.toLocaleString()}</span></div>`).join('');
   host.querySelectorAll('.row').forEach(row => row.onclick = () => {
@@ -78,7 +78,7 @@ const dot = c => `<span class="dot" style="background:${c}"></span>`;
 const bar = s => `<span class="bar" style="background:${s.c};${s.dash?'opacity:.6':''}"></span>`;
 
 chips(document.getElementById('kinds'), tally(nodes, n => n.kind), S.kinds,
-      v => dot(KIND[v]?.c || '#8b96a8'));
+      v => dot(KIND[v]?.c || '#8b96a8'), v => v === 'symbol');
 chips(document.getElementById('sevs'),
       tally(nodes.filter(n => n.kind==='memory'), n => n.detail?.severity), S.sevs,
       v => dot(SEV[v] || '#7d8797'));
@@ -271,6 +271,19 @@ function draw() {
 /* ---------------------------------------------------------------- inspector */
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const repositories = GRAPH.repositories || [];
+if (repositories.length > 1) {
+  const picker = document.getElementById('repo-picker'), select = document.getElementById('repo');
+  picker.hidden = false;
+  for (const repository of repositories) {
+    const option = document.createElement('option');
+    option.value = repository.href;
+    option.textContent = `${repository.name || repository.repo_id} (${repository.memories || 0})`;
+    option.selected = repository.repo_id === GRAPH.repo_id;
+    select.appendChild(option);
+  }
+  select.onchange = () => { if (select.value) location.href = select.value; };
+}
 const REL_LABEL = { ANCHORED_TO:'anchored to', APPLIES_TO:'applies to',
   GUARDED_BY:'guarded by', IMPACTS:'impacts', CALLS:'calls', DEFINES:'defines',
   CONTAINS:'contains', CAUSED:'caused', LED_TO:'led to', ESTABLISHED:'established',
@@ -332,6 +345,8 @@ function inspect(n) {
     ${bodyBelowTitle(n, d) ? `<div class="quote">${esc(bodyBelowTitle(n, d))}</div>` : ''}
     ${stale ? `<div class="quote warn">
         Not verified against the current code. Treat this as a lead, not a fact.</div>` : ''}
+    ${n.kind === 'memory' && d.authority === 'agent' ? `<div class="quote warn">
+        Agent-supplied claim. Its anchor verifies location, not semantic correctness.</div>` : ''}
     <dl class="meta">
       ${Object.entries(d).filter(([k,v]) => k!=='body' && k!=='path' && v!=null && v!=='')
         .map(([k,v]) => `<dt>${esc(k.replace(/_/g,' '))}</dt><dd>${esc(v)}</dd>`).join('')}
