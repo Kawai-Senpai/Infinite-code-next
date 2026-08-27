@@ -41,6 +41,7 @@ The MCP registration makes ICN callable. This instruction makes agents proactive
 - For any task involving an existing codebase, use ICN. At the beginning of a session and whenever you switch repositories, discover deferred tools if necessary and call `mcp__icn__workspace(action="open", root=<repo>)`.
 - Before investigating, diagnosing, designing, or modifying code, call `mcp__icn__investigate(query=<task>, intent=<intent>, root=<repo>)`. Treat memories whose anchor status is not `ACTIVE` as unverified leads.
 - After verified findings or changes, call `mcp__icn__record` with the decision, failure prevented, affected files/symbols, invariants, warnings, failed attempts, contracts, and tests. Skip investigation and recording only for purely mechanical actions such as correcting a typo or running an explicitly requested command.
+- Checkpoint your own work with `mcp__icn__agit(action="commit", message=...)` before risky edits or broad refactors, and roll back with `mcp__icn__agit(action="restore", paths=[...])`. It commits to `.agit/`, never the user's `.git`, so it is not a substitute for asking before a real commit.
 - If `mcp__icn__*` is not visible, search the available/deferred tool catalogue and load it. If it still cannot be loaded, explicitly report that ICN is unavailable and continue with the best evidence. Never silently skip ICN or claim it was used when it was not.
 ```
 
@@ -51,6 +52,7 @@ The MCP registration makes ICN callable. This instruction makes agents proactive
 - For any task involving an existing codebase, use ICN. At the beginning of a session and whenever you switch repositories, ensure the `icn` MCP server and its tools are loaded and call `workspace(action="open", root=<repo>)`.
 - Before investigating, diagnosing, designing, or modifying code, call `investigate(query=<task>, intent=<intent>, root=<repo>)`. Treat memories whose anchor status is not `ACTIVE` as unverified leads.
 - After verified findings or changes, call `record` with the decision, failure prevented, affected files/symbols, invariants, warnings, failed attempts, contracts, and tests. Skip investigation and recording only for purely mechanical actions such as correcting a typo or running an explicitly requested command.
+- Checkpoint your own work with `agit(action="commit", message=...)` before risky edits or broad refactors, and roll back with `agit(action="restore", paths=[...])`. It commits to `.agit/`, never the user's `.git`, so it is not a substitute for asking before a real commit.
 - If ICN is not loaded, try to reconnect or load the configured `icn` MCP server. If it remains unavailable, explicitly report that fact and continue with the best evidence. Never silently skip ICN or claim it was used when it was not.
 ```
 
@@ -61,8 +63,9 @@ Use the same block in a repository-local `AGENTS.md` or `CLAUDE.md` when global 
 1. Open the current repository with `workspace(action="open")`.
 2. Investigate the task before broad file exploration or significant changes.
 3. Verify memories against current code, especially when their anchor status is not `ACTIVE`.
-4. Perform and test the work.
-5. Record durable decisions, warnings, failed attempts, contracts, and test evidence.
+4. Checkpoint with `agit(action="commit")` before risky edits or broad refactors; `agit(action="restore")` rolls back without touching the user's `.git`.
+5. Perform and test the work.
+6. Record durable decisions, warnings, failed attempts, contracts, and test evidence.
 
 For a bounded task spanning several repositories, pass explicit `roots=[...]` to `investigate`. Use `cross_repos=True` when following previously recorded contracts.
 
