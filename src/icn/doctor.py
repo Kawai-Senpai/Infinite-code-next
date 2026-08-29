@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 PROTOCOL_VERSION = "2025-06-18"
-EXPECTED_TOOLS = {"agit", "investigate", "memory", "record", "workspace"}
+EXPECTED_TOOLS = {"agit", "investigate", "memory", "paper", "record", "workspace"}
 
 
 def _read_response(proc: subprocess.Popen[str], request_id: int, timeout: float) -> dict[str, Any]:

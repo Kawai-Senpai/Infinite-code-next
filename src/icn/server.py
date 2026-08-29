@@ -1,4 +1,4 @@
-"""MCP surface: five tools.
+"""MCP surface: six tools.
 
 PLAN 2 section 10. Agents waste turns choosing between near-identical tools, so
 the surface is deliberately small and grouped by action:
@@ -9,17 +9,26 @@ the surface is deliberately small and grouped by action:
     record       write one event, compiled into many facts
     memory       get, list, correct, supersede, verify, reanchor, resolve
     agit         status, diff, commit, log, branches, switch, restore, reset, show
+    paper        search, fetch, read, grep, render, figures, download, list,
+                 forget, remember
 
 Every response carries the resolved root, so a wrong workspace is visible at
 once instead of quietly poisoning the store.
+
+paper() is annotated `-> Any` rather than `-> dict[str, Any]` like its five
+siblings, and that difference is load-bearing: FastMCP builds an output model
+from the return annotation and validates against it, so a dict annotation
+rejects the mixed [summary, Image, Image] list that action='render' returns.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.utilities.types import Image
 
 from . import agit as agit_mod
 from . import anchors as anchor_mod
@@ -27,6 +36,7 @@ from . import briefing as briefing_mod
 from . import catalog as catalog_mod
 from . import causal
 from . import compiler
+from . import papers as papers_mod
 from . import search as search_mod
 from . import workspace as ws_mod
 
@@ -56,6 +66,14 @@ chain.
 Memories carry an anchor_status. Anything other than ACTIVE has not been
 verified against the current code: treat it as a lead, not a fact, and call
 memory(action='verify') once you have confirmed it still applies.
+
+paper() is prior art on the same footing. Before building a non-trivial
+mechanism, search arXiv, then actually read the paper rather than its abstract:
+fetch() caches the full text, read() serves it by section or page range, grep()
+answers one question without loading the rest, and render() returns page images
+for the figures and tables the text layer drops. paper(action='remember') writes
+what a paper settled into this repository's memory graph, so the next agent
+asking why the code is shaped this way finds the citation instead of guessing.
 """
 
 mcp = FastMCP("infinite-code-next", instructions=INSTRUCTIONS)
@@ -63,6 +81,76 @@ mcp = FastMCP("infinite-code-next", instructions=INSTRUCTIONS)
 
 def _fail(error: str, root: str | None = None) -> dict[str, Any]:
     return {"ok": False, "error": error, "resolved_root": root}
+
+
+# What a paper can establish, mapped to the payload field record_event compiles
+# memories from. Memories come from these typed fields; an event carrying only
+# a summary produces nothing.
+_REMEMBER_FIELDS = {
+    "rationale": "rationale_notes",
+    "note": "rationale_notes",
+    "investigation": "rationale_notes",
+    "decision": "decisions",
+    "warning": "warnings",
+    "invariant": "invariants",
+    "convention": "conventions",
+    "performance": "performance",
+    "security": "security",
+    "failed_attempt": "failed_attempts",
+}
+
+
+def _text_is_empty(result: dict[str, Any]) -> bool:
+    """Did this read actually return anything to read?
+
+    The page markers read() emits are not content: "[page 1]\\n\\n[page 2]\\n"
+    is what a three-page scan looks like, and it is not an empty string.
+    """
+    if not isinstance(result, dict) or "text" not in result:
+        return False
+    stripped = re.sub(r"\[page \d+\]", "", result.get("text") or "")
+    return not stripped.strip()
+
+
+def _read_as_images(result: dict[str, Any], paper_id: str, url: str, path: str,
+                    pages: str, dpi: int, save_to: str) -> list[Any]:
+    """Answer a text read that came back empty with the pages themselves.
+
+    Only the pages the caller actually asked for, capped by the per-call render
+    limit: a 40-page scan cannot come back as 40 images, so the summary says
+    which pages these are and how to ask for the rest.
+    """
+    wanted = pages or result.get("selected_pages") or ""
+    if isinstance(wanted, list):
+        wanted = ",".join(str(n) for n in wanted)
+    if not wanted:
+        total = int(result.get("pages") or 1)
+        wanted = f"1-{min(total, papers_mod.MAX_RENDER_PAGES)}"
+
+    try:
+        rendered = papers_mod.render(paper_id=paper_id, url=url, path=path,
+                                     pages=wanted, dpi=dpi, save_to=save_to)
+    except papers_mod.PaperError as err:
+        return [{**result, "vision_error": str(err)}]
+
+    shown = [item["page"] for item in rendered["rendered"]]
+    images = [Image(data=item.pop("png"), format="png") for item in rendered["rendered"]]
+    summary = {
+        **{k: v for k, v in result.items() if k != "text"},
+        "mode": "rendered",
+        "served_as": "images",
+        "why": ("this paper has no extractable text layer, so the pages are "
+                "returned as images instead of as an empty string"),
+        "rendered_pages": shown,
+        "dpi": rendered.get("dpi", dpi),
+    }
+    remaining = int(result.get("pages") or 0) - max(shown or [0])
+    if remaining > 0:
+        summary["more"] = (
+            f"{remaining} further pages exist; ask again with "
+            f"pages='{max(shown) + 1}-{min(int(result['pages']), max(shown) + papers_mod.MAX_RENDER_PAGES)}'"
+        )
+    return [summary, *images]
 
 
 @mcp.tool()
@@ -614,6 +702,230 @@ def agit(
         return result
     finally:
         current.close()
+
+
+@mcp.tool()
+def paper(
+    action: str = "search",
+    query: str = "",
+    paper_id: str = "",
+    url: str = "",
+    path: str = "",
+    category: str = "",
+    max_results: int = 10,
+    sort: str = "relevance",
+    start: int = 0,
+    mode: str = "outline",
+    pages: str = "",
+    section: str = "",
+    pattern: str = "",
+    ignore_case: bool = True,
+    context: int = 320,
+    max_chars: int = 24000,
+    offset: int = 0,
+    dpi: int = 140,
+    dest: str = "",
+    filename: str = "",
+    save_to: str = "",
+    refresh: bool = False,
+    with_html: bool = False,
+    with_latex: bool = False,
+    vision: bool = True,
+    with_text: bool = False,
+    limit: int = 50,
+    note: str = "",
+    symbols: list[str] | None = None,
+    files: list[str] | None = None,
+    kind: str = "rationale",
+    root: str | None = None,
+) -> Any:
+    """Prior art you can actually read: arXiv search, full papers, page images.
+
+    The abstract is not the paper. Everything here is built to get past it: the
+    whole text, cached once and served in slices, plus rendered pages for the
+    figures and tables no text extractor recovers.
+
+    Sources are interchangeable. paper_id takes an arXiv id in any form
+    (2401.12345v2, arXiv:2401.12345, an abs or pdf URL); url takes any http(s)
+    PDF or a landing page that names one; path takes a local .pdf.
+
+    Actions:
+      search    query arXiv. Returns real metadata, abstracts truncated,
+                because a search is for choosing what to read.
+      fetch     download, extract, and cache one paper. Returns the outline and
+                page count so you know what to ask for next. Idempotent.
+      read      the cached text. mode='outline' (default) lists sections;
+                mode='full' is the entire paper; mode='latex' reads the
+                submission's original TeX, where section boundaries are
+                declared rather than guessed and formulas are intact;
+                mode='html' is arXiv's HTML rendering;
+                mode='abstract' if you only want the pointer. pages='7-12' or
+                section='4'/'method' narrow it. Long reads page via offset.
+                A paper with no text layer (a scan) comes back as page images
+                rather than as an empty string, so a read always answers.
+      grep      regex search inside the full text, with page-anchored context.
+                Answers one question without reading the other thirty pages.
+                Says so when the paper has no text layer, because zero hits
+                there means 'not searchable', not 'not present'.
+      render    rasterise pages to PNG and return them as images. This is how
+                you see a figure, a table, an architecture diagram, or a
+                scanned PDF whose text layer is empty. Max 8 pages per call.
+      figures   extract embedded raster figures at their own resolution.
+                Vector figures are not rasters; use render for those.
+      download  copy the PDF into any directory you name.
+      list      what is already cached.
+      forget    drop one paper from the cache.
+      remember  write what a paper settled into this repository's memory graph,
+                anchored to the symbols and files it informed, so the next
+                agent finds the citation instead of rediscovering it.
+
+    Args:
+        action: one of the actions above.
+        query: search text. Fielded arXiv syntax (ti:, au:, abs:, AND/OR) is
+            passed through untouched; plain text is wrapped in all:"...".
+        paper_id: an arXiv id, in any of the forms above.
+        url: any http(s) PDF URL, or a landing page that names one.
+        path: a local .pdf file.
+        category: arXiv categories to restrict to, e.g. "cs.DC cs.DB".
+        max_results: search hits to return, 1-100.
+        sort: relevance | recent | updated.
+        start: offset into the search results, for paging.
+        mode: for read - outline | full | latex | html | abstract.
+        pages: page selection like "3" or "7-12" or "1,4,9-11". Used by read,
+            render, and figures.
+        section: section number ("4", "4.2") or name ("method") for read.
+        pattern: regex for grep.
+        ignore_case: case-insensitive grep. Default true.
+        context: characters of context around each grep hit.
+        max_chars: cap on returned text per read call. 0 means no cap.
+        offset: character offset into a read, for continuing a long one.
+        dpi: render resolution, 50-400. Higher is sharper and much larger.
+        dest: directory to download the PDF into.
+        filename: override the generated filename for download.
+        save_to: directory for rendered pages or extracted figures.
+        refresh: re-download and re-extract even if cached.
+        with_html: on fetch, also pull arXiv's HTML rendering if it exists.
+        vision: on read, when the paper has no extractable text layer, return
+            the requested pages as images instead of an empty string. On by
+            default - a scanned paper is readable, just not as text. Set false
+            if you want the empty result rather than the pixels.
+        with_latex: on fetch, also pull the original TeX source. Pulled
+            automatically when the PDF extracts poorly, which is the same set
+            of old papers whose metadata the arXiv API tends to refuse.
+        with_text: on download, write the extracted text alongside the PDF.
+        limit: maximum rows for list.
+        note: for remember - what this paper settled, in your own words. This
+            is the memory's substance; without it only the citation is stored.
+        symbols: for remember - symbols this paper informed, so the memory
+            anchors to real code.
+        files: for remember - files this paper informed.
+        kind: for remember - rationale | decision | note | investigation.
+        root: repository path, for remember. Defaults to the working directory.
+    """
+    verb = (action or "search").lower().strip()
+
+    try:
+        if verb == "search":
+            return papers_mod.search(query=query, category=category, max_results=max_results,
+                                     sort=sort, start=start)
+
+        if verb == "fetch":
+            return papers_mod.fetch(paper_id=paper_id, url=url, path=path,
+                                    refresh=refresh, with_html=with_html,
+                                    with_latex=with_latex)
+
+        if verb == "read":
+            result = papers_mod.read(paper_id=paper_id, url=url, path=path, mode=mode,
+                                     pages=pages, section=section, max_chars=max_chars,
+                                     offset=offset)
+            # A scanned paper has no text to return. Handing back an empty
+            # string and a warning makes the caller do a second round trip to
+            # find out the paper is pixels; rendering the same pages it just
+            # asked for answers the original question instead. This is the
+            # whole point of a vision-capable reader having the PDF already.
+            if vision and _text_is_empty(result):
+                return _read_as_images(result, paper_id=paper_id, url=url, path=path,
+                                       pages=pages, dpi=dpi, save_to=save_to)
+            return result
+
+        if verb == "grep":
+            return papers_mod.grep(paper_id=paper_id, url=url, path=path, pattern=pattern,
+                                   ignore_case=ignore_case, context=context)
+
+        if verb == "render":
+            result = papers_mod.render(paper_id=paper_id, url=url, path=path,
+                                       pages=pages or "1", dpi=dpi, save_to=save_to)
+            images = [Image(data=item.pop("png"), format="png") for item in result["rendered"]]
+            # A mixed list is why this tool returns Any: the summary tells the
+            # caller which page each image is, and the images are the point.
+            return [result, *images]
+
+        if verb == "figures":
+            return papers_mod.figures(paper_id=paper_id, url=url, path=path, pages=pages,
+                                      save_to=save_to)
+
+        if verb == "download":
+            return papers_mod.download(paper_id=paper_id, url=url, path=path, dest=dest,
+                                       filename=filename, with_text=with_text)
+
+        if verb == "list":
+            return papers_mod.cached(limit=limit)
+
+        if verb == "forget":
+            return papers_mod.forget(paper_id=paper_id, url=url, path=path)
+
+        if verb == "remember":
+            if not note.strip():
+                return _fail("remember needs note: what this paper settled, in your own words. "
+                             "A citation with no claim attached helps nobody.")
+            field = _REMEMBER_FIELDS.get((kind or "rationale").lower())
+            if field is None:
+                return _fail(f"unknown kind {kind!r} for remember. Valid: "
+                             + ", ".join(sorted(_REMEMBER_FIELDS)))
+
+            meta = papers_mod.fetch(paper_id=paper_id, url=url, path=path)
+            cite = papers_mod.citation(meta)
+            source = meta.get("abs_url") or meta.get("source_url") or meta.get("source_path")
+            current = ws_mod.open_workspace(root)
+            try:
+                ws_mod.ensure_indexed(current)
+                # The claim goes in a typed field, not just the summary: the
+                # compiler builds memories from those fields, and an event whose
+                # kind is absent from EVENT_KIND_TO_MEMORY with every field
+                # empty compiles to nothing at all, silently.
+                payload = {
+                    "kind": "note",
+                    "summary": f"{note.strip()} [prior art: {cite}]",
+                    "reasoning": (
+                        f"Established from {cite}, read in full rather than from its abstract. "
+                        f"Source: {source}. Cached at {meta.get('cache_dir')} "
+                        f"({meta.get('pages')} pages)."
+                    ),
+                    "files": files or [], "symbols": symbols or [], "changes": [],
+                    "invariants": [], "warnings": [], "failed_attempts": [],
+                    "decisions": [], "contracts": [], "performance": [], "security": [],
+                    "conventions": [], "rationale_notes": [], "bugs": [], "migrations": [],
+                    "tests": [], "contracts_with": [], "caused_by": [], "authority": "agent",
+                }
+                payload[field] = [f"{note.strip()} (prior art: {cite}; {source})"]
+
+                result = compiler.record_event(current.store, current.catalog, current.repo_id,
+                                               current.root, current.commit, payload)
+                result["resolved_root"] = str(current.root)
+                result["citation"] = cite
+                result["recorded_as"] = {"memory_kind": kind, "payload_field": field}
+                if not result.get("memories_created"):
+                    result["warning"] = ("no memory was created; the note may have been empty "
+                                         "after trimming")
+                return result
+            finally:
+                current.close()
+
+        return _fail(f"unknown paper action {action!r}. Valid: search, fetch, read, grep, "
+                     "render, figures, download, list, forget, remember")
+
+    except papers_mod.PaperError as err:
+        return _fail(str(err))
 
 
 def main() -> None:
