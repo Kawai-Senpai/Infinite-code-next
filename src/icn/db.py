@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 8
 
 # Columns added after a schema version shipped. Migration is first-class
 # (PLAN.md section 11): additive, idempotent, and never destructive.
@@ -37,6 +37,21 @@ ADDED_COLUMNS: list[tuple[str, str, str]] = [
     ("memories", "access_count", "INTEGER DEFAULT 0"),
     ("memories", "last_accessed_at", "TEXT"),
     ("memories", "surfaced_count", "INTEGER DEFAULT 0"),
+    # Import resolution is a second pass, like call resolution, so the raw
+    # specs have to survive on the file row between the two.
+    ("files", "imports_raw", "TEXT"),
+    # Decorators are what make an entry point recognisable.
+    ("symbols", "decorators", "TEXT"),
+    # Which extractor version last wrote this file's rows. NULL means "before
+    # this column existed", which is older than any real version.
+    ("files", "extract_version", "INTEGER"),
+    # Which extractor version computed this anchor's fingerprints. Lets a
+    # change to the fingerprint ALGORITHM be told apart from a change to the
+    # code, so improving the extractor does not cost the store its trust.
+    ("anchors", "extract_version", "INTEGER"),
+    # Receiver name -> possible types, the evidence the receiver_typed call
+    # tier resolves through.
+    ("symbols", "receiver_types", "TEXT"),
 ]
 
 BUSY_TIMEOUT_MS = 15000
@@ -154,7 +169,9 @@ CREATE TABLE IF NOT EXISTS files (
     first_seen_commit TEXT,
     last_seen_commit  TEXT,
     deleted_at_commit TEXT,
-    indexed_at        TEXT
+    indexed_at        TEXT,
+    imports_raw       TEXT,
+    extract_version   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 
@@ -177,6 +194,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     next_fingerprint     TEXT,
     token_signature      TEXT,
     calls_raw            TEXT,
+    decorators           TEXT,
+    receiver_types       TEXT,
     status               TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE | DELETED
     last_known_path      TEXT,
     last_seen_commit     TEXT,
@@ -208,6 +227,45 @@ CREATE TABLE IF NOT EXISTS code_edges (
 CREATE INDEX IF NOT EXISTS idx_cedge_from ON code_edges(from_id);
 CREATE INDEX IF NOT EXISTS idx_cedge_to   ON code_edges(to_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cedge_uniq ON code_edges(from_id, to_id, kind);
+
+-- Call sites resolution refused to guess at. Without this table an ambiguous
+-- callee is indistinguishable from a callee nobody calls, so "no callers" reads
+-- as proof of none. Every row here is a caller some query cannot show you, which
+-- is what lets a result say lower-bound instead of quietly claiming exact.
+CREATE TABLE IF NOT EXISTS unresolved_calls (
+    from_id    TEXT NOT NULL,          -- the calling symbol
+    leaf       TEXT NOT NULL,          -- last dotted segment of the callee
+    callee_raw TEXT NOT NULL,          -- as written at the call site
+    reason     TEXT NOT NULL,          -- ambiguous | external
+    candidates INTEGER NOT NULL DEFAULT 0,
+    commit_id  TEXT,
+    PRIMARY KEY (from_id, callee_raw)
+);
+CREATE INDEX IF NOT EXISTS idx_unres_leaf ON unresolved_calls(leaf);
+CREATE INDEX IF NOT EXISTS idx_unres_from ON unresolved_calls(from_id);
+
+-- Where control enters this program: routes, MCP tool handlers, CLI commands,
+-- tests. A call graph with no entry points is a pile of edges - these are the
+-- roots that turn it into flows anyone can follow.
+CREATE TABLE IF NOT EXISTS entry_points (
+    symbol_id TEXT PRIMARY KEY,
+    kind      TEXT NOT NULL,          -- route | tool | cli | test | event
+    detail    TEXT,                   -- verb+path, tool name, command name
+    evidence  TEXT,                   -- what proved it: the decorator, the path
+    commit_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_entry_kind ON entry_points(kind);
+
+-- Structure-based functional areas over the call graph. Distinct from
+-- knowledge hotspots, which measure where memories cluster: an area can be
+-- large and important while carrying no recorded knowledge at all, and that
+-- gap is exactly what a newcomer needs pointed out.
+CREATE TABLE IF NOT EXISTS communities (
+    symbol_id    TEXT PRIMARY KEY,
+    community_id INTEGER NOT NULL,
+    computed_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_comm_id ON communities(community_id);
 
 -- ------------------------------------------------------------- memory graph
 -- The raw agent write, stored verbatim and never edited. Every derived fact
@@ -283,7 +341,8 @@ CREATE TABLE IF NOT EXISTS anchors (
     last_verified_commit TEXT,
     last_verified_at     TEXT,
     reanchor_history     TEXT,
-    created_at           TEXT NOT NULL
+    created_at           TEXT NOT NULL,
+    extract_version      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_anchor_mem    ON anchors(memory_id);
 CREATE INDEX IF NOT EXISTS idx_anchor_sym    ON anchors(symbol_id);

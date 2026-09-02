@@ -51,11 +51,41 @@ body {
 .brand h1 { margin:0; font-size:15px; font-weight:650; letter-spacing:-.015em; }
 .brand p { margin:4px 0 0; font-size:11.5px; color:var(--faint);
            font-variant-numeric:tabular-nums; }
+/* `hidden` is an attribute, and a class rule beats it - so the picker showed
+   as an empty dropdown whenever there was only one repository to pick. */
+.repo-picker[hidden] { display:none; }
 .repo-picker { display:block; margin-top:14px; }
 .repo-picker span { display:block; margin-bottom:5px; color:var(--faint); font-size:10px;
                     font-weight:700; letter-spacing:.1em; text-transform:uppercase; }
 .repo-picker select { width:100%; padding:8px 10px; border:1px solid var(--line);
                       border-radius:9px; background:var(--card-2); color:var(--text); }
+
+/* View scope. The default is not "everything": a repository of any size draws
+   as one unreadable ball, so the explorer opens on structure and lets the
+   reader walk into it. */
+.scopes { display:flex; gap:4px; margin:0 6px 8px; background:var(--card-2);
+          padding:3px; border-radius:10px; }
+.scopes button {
+  flex:1; padding:6px 4px; border:0; border-radius:8px; background:transparent;
+  color:var(--faint); font:inherit; font-size:11.5px; font-weight:600; cursor:pointer;
+}
+.scopes button:hover { color:var(--text); }
+.scopes button.on { background:var(--card); color:var(--text);
+                    box-shadow:0 1px 3px rgba(0,0,0,.35); }
+.scope-note { margin:0 8px 14px; color:var(--faint); font-size:11px; line-height:1.5; }
+
+#area-list { margin:0 6px 18px; display:flex; flex-direction:column; gap:3px; }
+.area-row {
+  display:flex; align-items:center; gap:8px; width:100%; padding:7px 9px;
+  border:0; border-radius:9px; background:transparent; color:var(--text);
+  font:inherit; font-size:12px; cursor:pointer; text-align:left;
+}
+.area-row:hover { background:var(--card-2); }
+.area-row.on { background:var(--card-2); box-shadow:inset 0 0 0 1px var(--line); }
+.area-row .swatch { width:9px; height:9px; border-radius:3px; flex:none; }
+.area-row .nm { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.area-row .n { color:var(--faint); font-variant-numeric:tabular-nums; font-size:11px; }
+.area-row .ep { color:#6ee7b7; font-size:10px; }
 
 .scroll { overflow-y:auto; padding:0 14px 20px; flex:1; min-height:0; }
 .scroll::-webkit-scrollbar { width:10px; }

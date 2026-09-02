@@ -198,12 +198,23 @@ def test_the_explorer_page_is_self_contained(workspace, tmp_path):
     assert json.loads(payload)["stats"]["nodes"] > 0
 
 
-def test_explorer_hides_symbols_before_its_first_layout(workspace):
+def test_explorer_does_not_open_on_the_whole_graph(workspace):
+    """The first view must be legible, not complete.
+
+    Drawing every node at once produces one unreadable ball - measured on this
+    repository at 252 nodes and 2,407 links in a single blob with three
+    quarters of the canvas empty. This used to be avoided by hiding symbols,
+    which also hid the code an opened area was about; the scope selector
+    replaces that, so the guarantee is now "opens scoped" rather than "opens
+    with symbols off".
+    """
     record_baseline(workspace)
     page = explorer.render(graph_of(workspace))
 
-    assert "v => v === 'symbol'" in page
-    assert "if (!defaultOff(v)) set.add(v)" in page
+    assert "scope:'areas'" in page, "the default scope must not be 'all'"
+    assert 'data-scope="areas"' in page and 'data-scope="focus"' in page
+    assert "if (!areaNodes.length) S.scope = 'all'" in page, \
+        "a store with no areas must still draw something"
 
 
 def test_explorer_renders_repository_switcher_metadata(workspace):

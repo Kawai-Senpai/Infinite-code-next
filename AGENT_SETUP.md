@@ -30,9 +30,26 @@ icn doctor --client codex --root /path/to/repository
 
 Do not consider setup complete until the final line says `READY`.
 
-## 2. Add the global agent instruction
+## 2. Install the skill and hook (Claude Code)
 
-The MCP registration makes ICN callable. This instruction makes agents proactively discover and use it.
+The MCP registration makes ICN callable. It does not make it called: the server can be registered, `doctor` can say `READY`, and the agent can still never touch it because nothing told it to.
+
+```bash
+icn install --root /path/to/repository
+```
+
+That writes two things into the project:
+
+- `.claude/skills/icn-workflow/SKILL.md` - the full workflow, loaded when the agent needs it.
+- a `SessionStart` hook in `.claude/settings.json` - one line so the agent knows the skill exists.
+
+It is idempotent, and it merges into an existing `settings.json` rather than replacing it. A `settings.json` it cannot parse is refused, not overwritten. Use `--no-hook` to write only the skill.
+
+Restart the client afterwards so both load.
+
+## 3. Add the global agent instruction
+
+Step 2 covers Claude Code per project. This covers every client, and is what you want if you would rather configure ICN once globally than per repository.
 
 ### Codex: `~/.codex/AGENTS.md`
 
@@ -58,14 +75,15 @@ The MCP registration makes ICN callable. This instruction makes agents proactive
 
 Use the same block in a repository-local `AGENTS.md` or `CLAUDE.md` when global configuration is not permitted.
 
-## 3. Expected agent workflow
+## 4. Expected agent workflow
 
 1. Open the current repository with `workspace(action="open")`.
 2. Investigate the task before broad file exploration or significant changes.
 3. Verify memories against current code, especially when their anchor status is not `ACTIVE`.
-4. Checkpoint with `agit(action="commit")` before risky edits or broad refactors; `agit(action="restore")` rolls back without touching the user's `.git`.
-5. Perform and test the work.
-6. Record durable decisions, warnings, failed attempts, contracts, and test evidence.
+4. Check the blast radius with `graph(action="impact", target=<symbol>)` before changing anything other code depends on. Read the result's `epistemic` field first: `lower-bound` means callers exist that the answer does not list, and `causes.ambiguous_call_sites` counts them. An empty result is not proof that nothing calls the symbol.
+5. Checkpoint with `agit(action="commit")` before risky edits or broad refactors; `agit(action="restore")` rolls back without touching the user's `.git`.
+6. Perform and test the work.
+7. Record durable decisions, warnings, failed attempts, contracts, and test evidence.
 
 For a bounded task spanning several repositories, pass explicit `roots=[...]` to `investigate`. Use `cross_repos=True` when following previously recorded contracts.
 

@@ -69,15 +69,35 @@ def build_graph(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id: 
             edges.append({"from": repo["repo_id"], "to": row["file_id"], "kind": "CONTAINS",
                           "edge_class": "deterministic", "status": "ACTIVE"})
 
+    # Structure the explorer cannot derive from nodes and edges alone. An area
+    # is a Louvain community over the call graph and an entry point is where
+    # control gets in; both are computed at index time, and without them the
+    # explorer can only draw one undifferentiated ball of symbols.
+    communities = {row["symbol_id"]: row["community_id"] for row in rows(
+        conn.execute("SELECT symbol_id, community_id FROM communities"))}
+    # Flat scalars, not a nested object: every consumer of a node's `detail`
+    # renders it as key/value pairs, and a nested one arrives as "[object
+    # Object]" on screen.
+    entry_points = {row["symbol_id"]: (row["kind"], row["detail"])
+                    for row in rows(conn.execute(
+                        "SELECT symbol_id, kind, detail FROM entry_points"))}
+
     for row in rows(conn.execute(
             "SELECT symbol_id, file_id, name, symbol_path, kind, lang, signature,"
             " line_start, line_end, last_known_path, status FROM symbols" + status_filter)):
+        detail = {"name": row["name"], "symbol_kind": row["kind"], "lang": row["lang"],
+                  "signature": row["signature"], "path": row["last_known_path"],
+                  "lines": f"{row['line_start']}-{row['line_end']}"}
+        if row["symbol_id"] in communities:
+            detail["area"] = communities[row["symbol_id"]]
+        entry = entry_points.get(row["symbol_id"])
+        if entry:
+            detail["entry_point"] = entry[0]
+            if entry[1]:
+                detail["entry_detail"] = entry[1]
         nodes.append({
             "id": row["symbol_id"], "kind": "symbol", "label": row["symbol_path"],
-            "status": row["status"],
-            "detail": {"name": row["name"], "symbol_kind": row["kind"], "lang": row["lang"],
-                       "signature": row["signature"], "path": row["last_known_path"],
-                       "lines": f"{row['line_start']}-{row['line_end']}"},
+            "status": row["status"], "detail": detail,
         })
         if row["file_id"]:
             edges.append({"from": row["file_id"], "to": row["symbol_id"], "kind": "DEFINES",
@@ -137,6 +157,7 @@ def build_graph(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id: 
         "exported_at": now(),
         "nodes": nodes,
         "edges": kept,
+        "areas": _areas(conn),
         "stats": _stats(nodes, kept),
     }
 
@@ -148,6 +169,24 @@ def _worst_anchor(anchors: list[dict[str, Any]]) -> str:
         if any(a["status"] == status for a in anchors):
             return status
     return "ACTIVE"
+
+
+def _areas(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Functional areas, named and sized, for the explorer's overview.
+
+    Guarded: a store indexed before communities existed simply has none, and
+    that is a missing section rather than a failed export.
+    """
+    try:
+        from .flows import describe_areas
+        return [
+            {"id": area["community_id"], "name": area["name"], "size": area["size"],
+             "test_share": area["test_share"], "files": area.get("files", []),
+             "entry_points": area.get("entry_point_count", 0)}
+            for area in describe_areas(conn, limit=60, include_tests=True)
+        ]
+    except sqlite3.Error:
+        return []
 
 
 def _stats(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> dict[str, Any]:

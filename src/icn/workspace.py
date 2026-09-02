@@ -192,6 +192,11 @@ def ensure_indexed(ws: Workspace, force_full: bool = False,
     finally:
         lease.release()
 
+    # Before the cascade, not after: an anchor whose fingerprint moved only
+    # because the extractor changed must be carried across first, or the
+    # cascade reads the algorithm change as a body change and downgrades an
+    # anchor pointing at code nobody touched.
+    rebase = anchor_mod.rebase_extractor_change(ws.store, ws.root)
     verification = anchor_mod.verify_repo(ws.store, ws.root, ws.commit)
     result = {
         "indexed": True,
@@ -200,6 +205,8 @@ def ensure_indexed(ws: Workspace, force_full: bool = False,
         "anchors": verification,
         **indexer_mod.index_state(ws.store),
     }
+    if rebase.get("rebased"):
+        result["anchor_rebase"] = rebase
     if result.get("files_active", 0) and not result.get("symbols_active", 0):
         result["parser_warning"] = (
             "Source files were indexed but no symbols were parsed. Check the Python, "

@@ -56,7 +56,14 @@ def now() -> str:
 def create_anchor(conn: sqlite3.Connection, memory_id: str, symbol: dict[str, Any] | None,
                   file_row: dict[str, Any] | None, commit: str | None,
                   target_kind: str = "symbol") -> str:
-    """Attach a memory to a code target, fingerprinted as of `commit`."""
+    """Attach a memory to a code target, fingerprinted as of `commit`.
+
+    The extractor version is stamped now, so a later algorithm change can tell
+    this anchor's fingerprints apart from ones it has already carried across.
+    Without the stamp every index rescans every anchor forever.
+    """
+    from . import parsing
+
     anchor_id = ids.new_id(ids.ANCHOR)
     if symbol is not None:
         conn.execute(
@@ -64,14 +71,15 @@ def create_anchor(conn: sqlite3.Connection, memory_id: str, symbol: dict[str, An
             " symbol_path, ast_path, range_start_byte, range_end_byte, line_start, line_end,"
             " content_fingerprint, skeleton_fingerprint, prev_fingerprint, next_fingerprint,"
             " commit_observed, anchor_confidence, status, last_verified_commit, last_verified_at,"
-            " reanchor_history, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1.0,?,?,?,?,?)",
+            " reanchor_history, created_at, extract_version)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1.0,?,?,?,?,?,?)",
             (anchor_id, memory_id, "symbol", symbol["symbol_id"], symbol["file_id"],
              symbol.get("last_known_path"), symbol["symbol_path"], symbol.get("ast_path"),
              symbol.get("start_byte"), symbol.get("end_byte"), symbol.get("line_start"),
              symbol.get("line_end"), symbol.get("content_fingerprint"),
              symbol.get("skeleton_fingerprint"), symbol.get("prev_fingerprint"),
-             symbol.get("next_fingerprint"), commit, ACTIVE, commit, now(), jdump([]), now()),
+             symbol.get("next_fingerprint"), commit, ACTIVE, commit, now(), jdump([]), now(),
+             parsing.EXTRACT_VERSION),
         )
     elif file_row is not None:
         conn.execute(
@@ -344,6 +352,181 @@ def _rename_evidence(root: Path, old_path: str | None, new_path: str | None) -> 
         root,
     )
     return code == 0 and old_path in out
+
+
+def rebase_extractor_change(conn: sqlite3.Connection, root: Path) -> dict[str, Any]:
+    """Carry anchors across a change to the FINGERPRINT ALGORITHM, not the code.
+
+    Anchoring compares a stored fingerprint against a recomputed one, so when
+    parsing.normalize itself changes, every anchor in the repository looks like
+    a body change. Measured on this repository the first time it happened: 936
+    of 2,100 anchors dropped from ACTIVE to NEEDS_REVIEW in one index, none of
+    them because a single line of code had changed.
+
+    That makes improving the extractor cost the accumulated trust of the whole
+    store, which in practice means the extractor stops being improved. This is
+    the mechanism that decouples the two.
+
+    The test is exact, not a heuristic: recompute the CURRENT source under the
+    PREVIOUS algorithm and compare it with what the anchor recorded. If they
+    match, the code the anchor points at is byte-for-byte what it was and only
+    the hash moved, so the new fingerprint is written and the status is left
+    alone. If they do not match, the code really did change and the cascade is
+    left to do its job.
+
+    This is the one place trust may be restored without an explicit
+    memory(action='verify'), and only in one direction: undoing a downgrade
+    this project's own algorithm change caused. It is not a re-verification,
+    and it never touches an anchor whose source has actually changed.
+    """
+    from . import parsing
+
+    pending = rows(conn.execute(
+        "SELECT * FROM anchors WHERE target_kind='symbol' AND status != ?"
+        " AND (extract_version IS NULL OR extract_version < ?)",
+        (SUPERSEDED, parsing.EXTRACT_VERSION)))
+    if not pending:
+        return {"considered": 0, "rebased": 0, "restored": 0}
+
+    sources: dict[str, bytes | None] = {}
+
+    def source_of(path: str | None) -> bytes | None:
+        if not path:
+            return None
+        if path not in sources:
+            try:
+                sources[path] = (root / path).read_bytes()
+            except OSError:
+                sources[path] = None
+        return sources[path]
+
+    rebased = restored = 0
+    with write_tx(conn):
+        for anchor in pending:
+            symbol = one(conn.execute(
+                "SELECT s.*, f.path AS file_path FROM symbols s"
+                " JOIN files f ON f.file_id = s.file_id"
+                " WHERE s.symbol_id=? AND s.status='ACTIVE'", (anchor["symbol_id"],)))
+            if not symbol:
+                continue
+            data = source_of(symbol["file_path"])
+            if data is None:
+                continue
+
+            legacy = _legacy_fingerprint(parsing, data, symbol)
+            if legacy is None:
+                continue
+
+            # The anchor's own fingerprint, or - if a previous index already
+            # rewrote it - the one it carried before that transition.
+            recorded = anchor.get("content_fingerprint")
+            previous, fell_from_active = _last_downgrade(anchor)
+            if legacy != recorded and legacy != previous:
+                continue                # the source genuinely changed
+
+            status = anchor["status"]
+            confidence = anchor["anchor_confidence"]
+            if (status != ACTIVE and fell_from_active and legacy == previous):
+                # This anchor was ACTIVE, and the only thing that happened to
+                # it since is an algorithm change over unchanged source. Undo
+                # exactly that, and nothing else.
+                status, confidence = ACTIVE, 1.0
+                restored += 1
+            rebased += 1
+
+            history = _record_transition(
+                anchor, "fingerprint_rebased",
+                {"reason": "extractor algorithm changed; source is unchanged",
+                 "restored_to": status if status != anchor["status"] else None})
+            conn.execute(
+                "UPDATE anchors SET content_fingerprint=?, skeleton_fingerprint=?,"
+                " prev_fingerprint=?, next_fingerprint=?, ast_path=?, status=?,"
+                " anchor_confidence=?, extract_version=?, reanchor_history=?"
+                " WHERE anchor_id=?",
+                (symbol["content_fingerprint"], symbol["skeleton_fingerprint"],
+                 symbol["prev_fingerprint"], symbol["next_fingerprint"],
+                 symbol["ast_path"], status, confidence, parsing.EXTRACT_VERSION,
+                 history, anchor["anchor_id"]))
+
+    return {"considered": len(pending), "rebased": rebased, "restored": restored}
+
+
+def _legacy_fingerprint(parsing, data: bytes, symbol: dict[str, Any]) -> str | None:
+    """The symbol's content fingerprint under the pre-v5 algorithm."""
+    parser = parsing.get_parser(symbol["lang"] or "")
+    if parser is None:
+        return None
+    try:
+        tree = parser.parse(data)
+    except Exception:
+        return None
+    node = _node_at(tree.root_node, symbol["start_byte"], symbol["end_byte"])
+    if node is None:
+        return None
+    return parsing._sha("".join(
+        parsing.normalize(node, data, True, include_operators=False)))
+
+
+def _node_at(root, start: int, end: int):
+    """The node occupying exactly this byte range, if one still does."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.start_byte == start and node.end_byte == end:
+            return node
+        if node.start_byte <= start and node.end_byte >= end:
+            stack.extend(node.named_children)
+    return None
+
+
+# Transitions that leave an anchor ACTIVE. Everything else either lowers trust
+# or - with an `_unverified` suffix - records that the cascade wanted to raise
+# it and was refused, which only happens when the anchor is already below
+# ACTIVE. Between them these reconstruct the status history that the anchor
+# row itself does not keep.
+_ACTIVE_TRANSITIONS = {"unchanged", "moved", "renamed_internals"}
+
+
+def _last_downgrade(anchor: dict[str, Any]) -> tuple[str | None, bool]:
+    """(fingerprint before the last real transition, was the anchor ACTIVE then).
+
+    The second half is what keeps this honest. Only a downgrade that started at
+    ACTIVE may be undone; an anchor already below ACTIVE for a real reason must
+    stay there, even though the algorithm change re-flagged it too.
+
+    Inferring that from the transition NAME alone does not work, and getting
+    this wrong re-trusted 376 memories nobody had ever confirmed. `_apply`
+    appends `_unverified` only when the cascade tried to RAISE trust and was
+    refused, so a NEEDS_REVIEW anchor hit by a second body change records a
+    bare `body_changed` exactly like a fall from ACTIVE. The status has to be
+    replayed from the transitions before it instead.
+    """
+    history = jload(anchor.get("reanchor_history"), []) or []
+    index = None
+    for position in range(len(history) - 1, -1, -1):
+        transition = history[position].get("transition") or ""
+        if transition in ("unchanged", "fingerprint_rebased"):
+            continue
+        index = position
+        break
+    if index is None:
+        return None, False
+
+    # Replay backwards to the most recent transition that settles the status.
+    was_active = True
+    for entry in reversed(history[:index]):
+        transition = entry.get("transition") or ""
+        if transition == "fingerprint_rebased":
+            continue
+        if transition.endswith("_unverified"):
+            was_active = False          # held down: it was already below ACTIVE
+            break
+        if transition in _ACTIVE_TRANSITIONS:
+            was_active = True
+            break
+        was_active = False              # a real downgrade, never verified back
+        break
+    return history[index].get("from_fingerprint"), was_active
 
 
 def verify_repo(conn: sqlite3.Connection, root: Path, commit: str | None,

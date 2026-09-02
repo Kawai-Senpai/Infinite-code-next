@@ -142,9 +142,9 @@ def live(tmp_path_factory):
     return captured
 
 
-def test_tool_surface_is_six_tools(live):
+def test_tool_surface_is_seven_tools(live):
     assert sorted(t["name"] for t in live["tools"]) == \
-        ["agit", "investigate", "memory", "paper", "record", "workspace"]
+        ["agit", "graph", "investigate", "memory", "paper", "record", "workspace"]
 
 
 def test_every_tool_documents_itself(live):

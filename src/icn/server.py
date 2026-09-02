@@ -1,4 +1,4 @@
-"""MCP surface: six tools.
+"""MCP surface: seven tools.
 
 PLAN 2 section 10. Agents waste turns choosing between near-identical tools, so
 the surface is deliberately small and grouped by action:
@@ -6,6 +6,8 @@ the surface is deliberately small and grouped by action:
     workspace    open, status, list, reindex, health, reconcile, archive,
                  detach, forget_checkout, purge
     investigate  search (default), expand, verify
+    graph        impact, trace, cycles, entrypoints, areas, triggers,
+                 coupling, hotspots, deadcode
     record       write one event, compiled into many facts
     memory       get, list, correct, supersede, verify, reanchor, resolve
     agit         status, diff, commit, log, branches, switch, restore, reset, show
@@ -36,6 +38,8 @@ from . import briefing as briefing_mod
 from . import catalog as catalog_mod
 from . import causal
 from . import compiler
+from . import graph as graph_mod
+from . import history as history_mod
 from . import papers as papers_mod
 from . import search as search_mod
 from . import workspace as ws_mod
@@ -56,6 +60,13 @@ Before changing or deleting something load-bearing, investigate(action='why',
 symbol=...) reconstructs why it exists - the decision, the bug that followed,
 the fix that was rejected, the invariant that resulted, and what removing it
 may reintroduce.
+
+graph() answers the structural question investigate() does not: what else moves
+if you touch this. action='impact' is the blast radius, 'trace' proves two
+symbols are actually connected, 'cycles' finds knots in the import graph. Read
+its `epistemic` field before its result: 'lower-bound' means callers exist that
+the answer provably does not list, and `causes` counts them. An absent caller
+is never by itself evidence of no caller.
 
 Finish with record(). One call becomes many anchored facts. The highest-value
 fields are failed_attempts and warnings: nothing else in your toolchain
@@ -163,6 +174,13 @@ def workspace(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """Open, inspect, and manage repositories known to this server.
+
+    WHEN TO USE: first call of any session, and again whenever you switch
+    repository. action='open' returns the briefing - the rules that govern this
+    code, what has already been tried and rejected, and what is unverified.
+    AFTER THIS: investigate() with what you are about to do. Do not start by
+    reading files; the briefing exists so you do not have to.
+
 
     Actions:
       open              resolve this directory to a repository, index what
@@ -272,6 +290,14 @@ def investigate(
     symbol: str = "",
 ) -> dict[str, Any]:
     """Get up to speed on code in one call: structure, rationale, risks.
+
+    WHEN TO USE: before investigating, diagnosing, designing or modifying
+    anything. Prefer it over grep: it searches code and knowledge together, so
+    it returns the reason a thing is shaped the way it is, not just where it is.
+    AFTER THIS: graph(action='impact') if you are about to change a symbol;
+    investigate(action='why', symbol=...) before deleting something
+    load-bearing; record() once you have verified something.
+
 
     Searches code and knowledge together - lexical, symbol, code graph, memory
     graph, anchor status and git history - and returns compact capsules under a
@@ -432,6 +458,171 @@ def investigate(
 
 
 @mcp.tool()
+def graph(
+    action: str = "impact",
+    target: str = "",
+    to: str = "",
+    direction: str = "upstream",
+    depth: int = 3,
+    file_hint: str | None = None,
+    to_file_hint: str | None = None,
+    include_tests: bool = True,
+    min_confidence: float = 0.0,
+    window: int = 500,
+    since: str = "",
+    root: str | None = None,
+) -> dict[str, Any]:
+    """Structural questions about the code graph: blast radius, paths, cycles.
+
+    WHEN TO USE: after investigate() has told you what a symbol is for, and you
+    need to know what changing it costs. investigate() answers "what is this and
+    why"; graph() answers "what else moves if I touch it".
+    AFTER THIS: investigate(action='why', symbol=...) on anything surprising in
+    the blast radius, then record() what you decided.
+
+    Actions:
+      impact  blast radius of one symbol. direction='upstream' is who depends on
+              it (who breaks if the contract changes); 'downstream' is what it
+              depends on.
+      trace   shortest directed call path from `target` to `to`. Use it to prove
+              two symbols are actually connected rather than assuming it.
+      cycles  directed cycles in the file import graph. Act on component_count,
+              not on the number of cycles: one removed import can dissolve a
+              whole component, so the cycle count swings wildly and the
+              component count is what a fix actually reduces. A deferred import
+              (inside a function, or a TypeScript `import type`) is excluded: it
+              cannot force an initialisation order, and it is the usual fix for
+              a cycle rather than a cause of one.
+      entrypoints
+              where control enters the program - routes, MCP tool handlers, CLI
+              commands, tests. Pass a kind in `target` to filter. Start here on
+              an unfamiliar codebase.
+      areas   functional areas from the call graph, not the directory layout, so
+              an area can span directories. Each carries test_share and the
+              entry points that reach it; an area nothing reaches is a library
+              or is dead.
+      triggers
+              which entry points can reach `target` - what a user can actually
+              do that runs this code. The complement of impact: not "what else
+              changes" but "what can set this off".
+      coupling
+              file pairs that keep changing together, from git history. The
+              rows worth reading are the ones with also_imports=false: those
+              are coupled by something no static analysis can see.
+      hotspots
+              where change and structural weight meet. Neither alone is
+              interesting; a file both heavily depended on and constantly
+              rewritten is where a change is most likely to break something
+              far away.
+      deadcode
+              symbols nothing in the graph reaches. CANDIDATES, never a
+              verdict - read `confidence` on every row and the boundaries
+              before acting on one.
+
+    READ THE ENVELOPE BEFORE THE RESULT. Every answer carries:
+      epistemic   'exact' or 'lower-bound'. 'lower-bound' means callers exist
+                  that this result provably does not list. An empty `affected`
+                  with epistemic='lower-bound' is NOT proof that nothing calls
+                  the symbol.
+      boundaries  one plain sentence per reason, for humans.
+      causes      the machine-readable why. Every field counts MISSING or
+                  UNPROVEN things, never sentences:
+                    ambiguous_call_sites - call sites naming this symbol that
+                        could not be attributed to a single definition. These
+                        are the callers you are not being shown.
+                    inferred_edges_traversed - edges resolved by import scope or
+                        by uniqueness of the name, not proven from the syntax.
+                        Counts edges walked, so it can exceed counts.inferred,
+                        which counts distinct symbols reached.
+                    external_call_sites - calls that left the indexed program.
+                        Not a defect: no in-graph node could have been reached.
+
+    Edges are tiered, and the tier is on every result. receiver_self (1.0) and
+    same_file (0.9) are read off the syntax; imported (0.8) and unique_global
+    (0.6) are judgements. Pass min_confidence=0.9 to walk only what was proven.
+
+    The three history actions carry their own envelope. It is always
+    'lower-bound': history only knows the commits it read, only knows committed
+    work, and knows nothing that a squash or a shallow clone removed. `history`
+    in the result says how much was actually read.
+
+    Args:
+        action: impact (default), trace, cycles, entrypoints, areas, triggers,
+            coupling, hotspots, deadcode.
+        target: symbol to analyse, the path source for trace, or - for
+            action='entrypoints' - a kind to filter by (route, tool, cli, test).
+            A bare name is fine; if it is ambiguous the candidates come back
+            for you to choose.
+        to: destination symbol, for trace.
+        direction: upstream or downstream, for impact.
+        depth: hops to walk. Clamped to 12.
+        file_hint: path fragment disambiguating `target`, e.g. 'search.py'.
+        to_file_hint: the same, for `to`.
+        include_tests: include test files in the blast radius. For
+            action='areas', rank mostly-test areas alongside the rest instead of
+            sorting them last. For action='deadcode', report unreferenced test
+            symbols too.
+        min_confidence: drop edges below this confidence before walking.
+        window: commits to read, for the history actions. Default 500, max 5000.
+        since: a git date ('3 months ago', '2026-01-01') bounding that window.
+        root: repository path. Defaults to the server's working directory.
+    """
+    action = (action or "impact").lower().strip()
+    known = ("impact", "trace", "cycles", "entrypoints", "areas", "triggers",
+             "coupling", "hotspots", "deadcode")
+    if action not in known:
+        return _fail(f"unknown action {action!r}; use one of {', '.join(known)}", root)
+    if action in ("impact", "trace", "triggers") and not target.strip():
+        return _fail(f"target is required for action={action!r}", root)
+    if action == "trace" and not to.strip():
+        return _fail("to is required for action='trace'", root)
+
+    current = ws_mod.open_workspace(root)
+    try:
+        index_report = ws_mod.ensure_indexed(current)
+        if action == "impact":
+            result = graph_mod.impact(
+                current.store, target, direction=direction, depth=depth,
+                file_hint=file_hint, include_tests=include_tests,
+                min_confidence=min_confidence)
+        elif action == "trace":
+            result = graph_mod.trace(
+                current.store, target, to, max_depth=depth,
+                file_hint=file_hint, target_file_hint=to_file_hint)
+        elif action == "entrypoints":
+            result = graph_mod.entry_points(current.store, kind=target.strip())
+        elif action == "areas":
+            result = graph_mod.areas(current.store, include_tests=include_tests)
+        elif action == "triggers":
+            result = graph_mod.reaching_entry_points(
+                current.store, target, file_hint=file_hint, depth=depth)
+        elif action == "coupling":
+            result = history_mod.change_coupling(
+                current.store, current.root, window=window, since=since or None)
+        elif action == "hotspots":
+            result = history_mod.hotspots(
+                current.store, current.root, window=window, since=since or None)
+        elif action == "deadcode":
+            result = history_mod.dead_code(
+                current.store, include_tests=include_tests)
+        else:
+            result = graph_mod.import_cycles(current.store)
+
+        result["ok"] = "error" not in result
+        result["action"] = action
+        result["resolved_root"] = str(current.root)
+        result["index_state"] = index_report.get("index_state", "ready")
+        result["validation_boundary"] = (
+            "Static resolution only. An edge is evidence, not proof that the call "
+            "happens at runtime; dynamic dispatch, reflection and framework wiring "
+            "are invisible here. Confirm with a focused test before relying on it."
+        )
+        return result
+    finally:
+        current.close()
+
+
+@mcp.tool()
 def record(
     summary: str,
     kind: str = "note",
@@ -457,6 +648,14 @@ def record(
     root: str | None = None,
 ) -> dict[str, Any]:
     """Write what you learned. One call becomes many durable, anchored facts.
+
+    WHEN TO USE: after any verified finding or change - not at the end of the
+    session, when the detail has already gone. Skip it only for purely
+    mechanical work such as fixing a typo.
+    AFTER THIS: nothing. This is the call that makes the next session cheaper,
+    and the fields that pay off most are failed_attempts and warnings, because
+    nothing else in the toolchain records what was tried and rejected.
+
 
     You supply the semantics; the server resolves names to real symbols,
     anchors each memory to the code, derives the edges you did not mention
@@ -567,6 +766,15 @@ def memory(
 ) -> dict[str, Any]:
     """Inspect and correct stored knowledge.
 
+    WHEN TO USE: when a memory surfaced with anchor_status other than ACTIVE and
+    you have just confirmed whether it still holds, or when something stored is
+    wrong. A memory that is merely out of date should be corrected or
+    superseded, never left to rot - an unverified fact costs the next agent
+    more than no fact at all.
+    AFTER THIS: continue the task. Use action='verify' the moment you have the
+    evidence, while you still have it.
+
+
     Actions:
       list        browse memories, filterable by kind, status, anchor_status.
       get         one memory with its anchors, edges and version history.
@@ -658,6 +866,14 @@ def agit(
 ) -> dict[str, Any]:
     """Agent-only git history in `.agit/`, separate from the user's real repo.
 
+    WHEN TO USE: action='commit' before any risky edit or broad refactor, so
+    there is something to roll back to. It writes to `.agit/`, never the user's
+    `.git`, so it cannot touch their history, staging or branches.
+    AFTER THIS: make the risky change. If it goes wrong,
+    agit(action='restore', paths=[...]) - which does rewrite real working-tree
+    files, so check agit(action='diff') first.
+
+
     Checkpoint risky work without touching `.git`. Auto-initialises on first
     use and adds itself to .gitignore. Per working tree, never central: a
     checkpoint only means anything against the tree it snapshotted.
@@ -740,6 +956,16 @@ def paper(
     root: str | None = None,
 ) -> Any:
     """Prior art you can actually read: arXiv search, full papers, page images.
+
+    WHEN TO USE: before building a non-trivial mechanism - caching, consensus,
+    retry and idempotency, ranking, scheduling, rate limiting, a wire format.
+    Anything where the naive version breaks at scale and a wrong choice costs a
+    rebuild rather than a typo.
+    AFTER THIS: read the paper rather than its abstract - read() by section,
+    grep() for one question, render() for figures the text layer drops - then
+    paper(action='remember') so the next agent finds the citation instead of
+    re-deriving the decision.
+
 
     The abstract is not the paper. Everything here is built to get past it: the
     whole text, cached once and served in slices, plus rendered pages for the

@@ -53,7 +53,109 @@ nodes.forEach(n => {
 });
 
 const S = { kinds:new Set(), sevs:new Set(), anchors:new Set(), rels:new Set(),
-            q:'', labels:true, sel:null, hover:null, zoom:1, px:0, py:0, focus:null };
+            q:'', labels:true, sel:null, hover:null, zoom:1, px:0, py:0, focus:null,
+            // Which part of the graph is on screen at all. 'all' draws every
+            // node, which on any real repository is one unreadable ball -
+            // measured here at 252 nodes and 2,407 links in a single blob with
+            // three quarters of the canvas empty. So it is no longer the
+            // default: the explorer opens on structure and expands on demand.
+            scope:'areas', area:null, seeds:new Set(), depth:1 };
+
+/* --------------------------------------------------------------------- areas
+   A functional area is a Louvain community over the call graph, computed at
+   index time. The overview draws one node per area rather than one per symbol,
+   which is the difference between a picture of the system and a picture of
+   every wire in it. */
+const AREAS = GRAPH.areas || [];
+const areaOf = new Map();
+for (const n of nodes) if (n.detail?.area !== undefined) areaOf.set(n.id, n.detail.area);
+
+const AREA_COLORS = ['#8b7cf6','#38bdf8','#34d399','#fbbf24','#f472b6','#fb923c',
+                     '#60a5fa','#a3e635','#f87171','#2dd4bf','#c084fc','#facc15'];
+const areaColor = id => AREA_COLORS[Math.abs(id|0) % AREA_COLORS.length];
+
+/** Symbols belonging to one area, plus the memories anchored to them. */
+function areaMembers(areaId) {
+  const set = new Set();
+  for (const n of nodes) if (areaOf.get(n.id) === areaId) set.add(n.id);
+  for (const e of edges) {
+    if (e.kind !== 'ANCHORED_TO' && e.kind !== 'APPLIES_TO') continue;
+    if (set.has(e.to)) set.add(e.from);
+  }
+  return set;
+}
+
+/* One node per area, and one link per pair of areas that call each other. This
+   is the overview: a few dozen nodes instead of a few thousand, so the shape of
+   the system is legible before anyone has clicked anything. */
+const areaNodes = [], areaEdges = [];
+(function buildOverview() {
+  if (!AREAS.length) return;
+  const byArea = new Map(AREAS.map(a => [a.id, a]));
+  for (const a of AREAS) {
+    areaNodes.push({
+      id: `area:${a.id}`, kind: 'area', areaId: a.id, label: a.name,
+      status: 'ACTIVE', deg: a.size,
+      r: 11 + Math.min(26, Math.sqrt(a.size) * 3.4),
+      detail: { size: a.size, test_share: a.test_share,
+                entry_points: a.entry_points, files: a.files },
+      x: 0, y: 0, vx: 0, vy: 0,
+    });
+  }
+  const pairs = new Map();
+  for (const e of edges) {
+    if (e.kind !== 'CALLS') continue;
+    const from = areaOf.get(e.from), to = areaOf.get(e.to);
+    if (from === undefined || to === undefined || from === to) continue;
+    if (!byArea.has(from) || !byArea.has(to)) continue;
+    const key = from < to ? `${from}|${to}` : `${to}|${from}`;
+    pairs.set(key, (pairs.get(key) || 0) + 1);
+  }
+  for (const [key, weight] of pairs) {
+    const [from, to] = key.split('|');
+    areaEdges.push({ from: `area:${from}`, to: `area:${to}`, kind: 'CALLS',
+                     edge_class: 'deterministic', status: 'ACTIVE', weight });
+  }
+  for (const n of areaNodes) byId.set(n.id, n);
+})();
+
+const overviewMode = () => S.scope === 'areas' && S.area === null && areaNodes.length > 0;
+
+/* A neighbourhood this size is still readable; past it the view is a hairball
+   again, just a smaller one. Seeds are never trimmed - the reader asked for
+   those explicitly. */
+const MAX_FOCUS = 70;
+let focusTrimmed = 0;
+
+/** BFS outward from the seeds, so a focus view grows by choice, not by default. */
+function reachable(seeds, depth) {
+  const seen = new Set(seeds);
+  let frontier = [...seeds];
+  focusTrimmed = 0;
+  for (let hop = 0; hop < depth; hop++) {
+    const next = [];
+    for (const id of frontier)
+      for (const e of adj.get(id) || []) {
+        const other = e.from === id ? e.to : e.from;
+        if (!seen.has(other)) { seen.add(other); next.push(other); }
+      }
+    if (seen.size > MAX_FOCUS) {
+      // Keep the neighbours that say most about the seed: code before
+      // knowledge, and the better-connected of each. The rest are counted and
+      // reported rather than silently dropped.
+      const keep = next
+        .map(id => byId.get(id))
+        .sort((a, b) => (a.kind === 'memory') - (b.kind === 'memory') || b.deg - a.deg)
+        .slice(0, Math.max(0, MAX_FOCUS - (seen.size - next.length)));
+      const kept = new Set(keep.map(n => n.id));
+      for (const id of next) if (!kept.has(id)) { seen.delete(id); focusTrimmed++; }
+      return seen;
+    }
+    frontier = next;
+    if (!frontier.length) break;
+  }
+  return seen;
+}
 
 /* ------------------------------------------------------------------ filters */
 function tally(list, key) {
@@ -77,8 +179,12 @@ function chips(host, entries, set, mark, defaultOff = () => false) {
 const dot = c => `<span class="dot" style="background:${c}"></span>`;
 const bar = s => `<span class="bar" style="background:${s.c};${s.dash?'opacity:.6':''}"></span>`;
 
+// Symbols are on. They used to default off, because drawing all of them at
+// once was what made the view a hairball - but the scope selector solves that
+// properly now, and hiding symbols left an opened area showing only the
+// memories attached to code the reader could not see.
 chips(document.getElementById('kinds'), tally(nodes, n => n.kind), S.kinds,
-      v => dot(KIND[v]?.c || '#8b96a8'), v => v === 'symbol');
+      v => dot(KIND[v]?.c || '#8b96a8'));
 chips(document.getElementById('sevs'),
       tally(nodes.filter(n => n.kind==='memory'), n => n.detail?.severity), S.sevs,
       v => dot(SEV[v] || '#7d8797'));
@@ -101,9 +207,29 @@ document.getElementById('legend').innerHTML =
 
 /* ------------------------------------------------------------------ visible */
 let vis = [], vedges = [];
+
+/** The node set the current scope allows on screen, before any filtering. */
+function inScope() {
+  if (S.scope === 'all') return null;                 // null means "no limit"
+  if (S.scope === 'areas') {
+    if (S.area === null) return null;                 // drawn as aggregates
+    return areaMembers(S.area);
+  }
+  if (!S.seeds.size) return new Set();
+  return reachable(S.seeds, S.depth);
+}
+
 function recompute() {
   const q = S.q;
+  if (overviewMode()) {
+    vis = q ? areaNodes.filter(n => n.label.toLowerCase().includes(q)) : areaNodes;
+    const ok = new Set(vis.map(n => n.id));
+    vedges = areaEdges.filter(e => ok.has(e.from) && ok.has(e.to));
+    return;
+  }
+  const allowed = inScope();
   vis = nodes.filter(n => {
+    if (allowed && !allowed.has(n.id)) return false;
     if (!S.kinds.has(n.kind)) return false;
     if (n.kind === 'memory') {
       if (n.detail?.severity && !S.sevs.has(n.detail.severity)) return false;
@@ -163,6 +289,7 @@ function resize() {
   ctx.setTransform(dpr,0,0,dpr,0,0);
 }
 function nodeColor(n) {
+  if (n.kind === 'area') return areaColor(n.areaId);
   if (n.kind === 'memory') {
     if (n.detail?.anchor_status && n.detail.anchor_status !== 'ACTIVE') return '#fb923c';
     return SEV[n.detail?.severity] || KIND.memory.c;
@@ -264,8 +391,11 @@ function draw() {
     }
   }
   ctx.restore();
+  // Say what is not on screen. A trimmed neighbourhood that looks complete is
+  // the same lie as a blast radius that looks exact.
   document.getElementById('count').textContent =
-    `${vis.length.toLocaleString()} shown · ${vedges.length.toLocaleString()} links`;
+    `${vis.length.toLocaleString()} shown · ${vedges.length.toLocaleString()} links`
+    + (S.scope === 'focus' && focusTrimmed ? ` · ${focusTrimmed} more not drawn` : '');
 }
 
 /* ---------------------------------------------------------------- inspector */
@@ -416,7 +546,20 @@ addEventListener('mousemove', ev => {
 });
 addEventListener('mouseup', ev => {
   cv.classList.remove('drag');
-  if (drag && !drag.moved && ev.target === cv) inspect(pick(ev));
+  if (drag && !drag.moved && ev.target === cv) {
+    const hit = pick(ev);
+    if (hit && hit.kind === 'area') {
+      // Drilling in beats inspecting: an area is a container, and what a
+      // reader wants from one is its contents.
+      S.area = hit.areaId; S.sel = null; applyScope();
+    } else if (hit && S.scope === 'focus' && !S.seeds.has(hit.id)) {
+      // Expand where you clicked. The view grows by choice rather than
+      // arriving complete and unreadable.
+      S.seeds.add(hit.id); inspect(hit); kick(.5);
+    } else {
+      inspect(hit);
+    }
+  }
   drag = null;
 });
 cv.addEventListener('wheel', ev => {
@@ -429,7 +572,13 @@ cv.addEventListener('wheel', ev => {
 }, {passive:false});
 
 const q = document.getElementById('q');
-q.oninput = () => { S.q = q.value.trim().toLowerCase(); kick(.3); };
+q.oninput = () => {
+  S.q = q.value.trim().toLowerCase();
+  // A search inside one area finds nothing when the match lives in another, so
+  // typing widens the scope rather than silently searching a slice.
+  if (S.q && S.scope === 'areas' && S.area !== null) { S.area = null; applyScope(); }
+  kick(.3);
+};
 addEventListener('keydown', ev => {
   if (ev.key === '/' && document.activeElement !== q) { ev.preventDefault(); q.focus(); }
   if (ev.key === 'Escape') { if (document.activeElement === q) { q.value=''; q.blur(); S.q=''; }
@@ -590,10 +739,87 @@ addEventListener('click', ev => {
   if (!exportMenu.hidden && !exportMenu.contains(ev.target)) closeMenu();
 });
 
+/* ------------------------------------------------------------ scope controls */
+const scopeNote = document.getElementById('scope-note');
+const areaList = document.getElementById('area-list');
+
+const SCOPE_NOTES = {
+  areas: 'Functional areas from the call graph, not the folder layout. Click one to open it.',
+  focus: 'One symbol and its neighbours. Click a node to expand it; nothing else is drawn.',
+  all:   'Every node at once. Honest, and on a large repository unreadable - that is why it is not the default.',
+};
+
+function renderAreaList() {
+  areaList.innerHTML = '';
+  if (S.scope !== 'areas' || !AREAS.length) return;
+  if (S.area !== null) {
+    const back = document.createElement('button');
+    back.className = 'area-row';
+    back.innerHTML = `<span class="nm">&larr; All areas</span>`;
+    back.onclick = () => { S.area = null; S.sel = null; applyScope(); };
+    areaList.appendChild(back);
+  }
+  for (const a of AREAS) {
+    const row = document.createElement('button');
+    row.className = 'area-row' + (S.area === a.id ? ' on' : '');
+    row.innerHTML =
+      `<span class="swatch" style="background:${areaColor(a.id)}"></span>` +
+      `<span class="nm">${esc(a.name)}</span>` +
+      (a.entry_points ? `<span class="ep">${a.entry_points} in</span>` : '') +
+      `<span class="n">${a.size}</span>`;
+    row.onclick = () => { S.area = a.id; applyScope(); };
+    areaList.appendChild(row);
+  }
+}
+
+/** Re-seed and re-fit whenever the visible set changes shape. */
+function applyScope() {
+  scopeNote.textContent = SCOPE_NOTES[S.scope] || '';
+  for (const b of document.querySelectorAll('#scopes button'))
+    b.classList.toggle('on', b.dataset.scope === S.scope);
+  renderAreaList();
+  seed(); settle(300); alpha = .08; settle(90); fit();
+}
+
+/** Somewhere to start. Focus with no seed is a blank stage and a dead end.
+ *
+ *  An entry point, not the most-connected symbol. "Where control enters" is
+ *  the question someone opening an unfamiliar repository actually has, and the
+ *  busiest symbol is the worst possible seed: its depth-1 neighbourhood is
+ *  itself a hairball, which is the thing this whole view exists to avoid.
+ */
+function defaultSeed() {
+  const entries = nodes.filter(n => n.detail?.entry_point &&
+                                    n.detail.entry_point !== 'test');
+  if (entries.length) {
+    entries.sort((a, b) => a.deg - b.deg || a.label.localeCompare(b.label));
+    return entries[Math.floor(entries.length / 2)];
+  }
+  const symbols = nodes.filter(n => n.kind === 'symbol').sort((a,b) => a.deg - b.deg);
+  return symbols.length ? symbols[Math.floor(symbols.length * .75)] : nodes[0];
+}
+
+for (const button of document.querySelectorAll('#scopes button')) {
+  button.onclick = () => {
+    S.scope = button.dataset.scope;
+    if (S.scope !== 'areas') S.area = null;
+    if (S.scope === 'focus' && !S.seeds.size) {
+      const start = S.sel || defaultSeed();
+      if (start) { S.seeds.add(start.id); inspect(start); }
+    }
+    applyScope();
+  };
+}
+
 /* --------------------------------------------------------------- lifecycle */
 function seed() {
-  nodes.forEach((n,i) => {
-    const a = i*2.399963, r = 46*Math.sqrt(i+1);
+  // Only what is on screen is laid out. Seeding every node spread a handful of
+  // visible ones across a phyllotaxis sized for thousands, which is where the
+  // empty canvas around the old hairball came from.
+  recompute();
+  const spread = 46 * Math.max(.55, Math.min(1.6, 26 / Math.sqrt(vis.length + 4)));
+  vis.forEach((n,i) => {
+    const a = i*2.399963, r = spread*Math.sqrt(i+1);
     n.x = Math.cos(a)*r; n.y = Math.sin(a)*r; n.vx = n.vy = 0;
   });
   alpha = 1;
@@ -621,6 +847,10 @@ if (!nodes.length) {
     `<div class="empty"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/>
      <path d="M9 12h6"/></svg><div>Nothing indexed yet.</div></div>`;
 } else {
-  resize(); seed(); settle(480); alpha = .05; settle(140); fit();
+  // Open on structure. Without areas to show - an old store, or a repository
+  // with no call edges - there is nothing to aggregate, so fall back to
+  // drawing everything rather than an empty stage.
+  if (!areaNodes.length) S.scope = 'all';
+  resize(); applyScope(); settle(180); fit();
   (function loop(){ draw(); requestAnimationFrame(loop); })();
 }
