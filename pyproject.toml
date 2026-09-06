@@ -18,6 +18,10 @@ icn-explore = "icn.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# Semantic search. Optional on purpose: without these ICN falls back to
+# lexical retrieval and works exactly as it did before. model2vec is a static
+# embedding model, so there is no torch and no GPU in this dependency tree.
+semantic = ["model2vec>=0.9", "numpy>=1.24"]
 
 [project.urls]
 Homepage = "https://ranitbhowmick.com"

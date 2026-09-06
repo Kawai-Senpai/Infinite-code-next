@@ -23,6 +23,8 @@ from typing import Any
 
 from . import anchors as anchor_mod
 from . import catalog as catalog_mod
+from . import embed as embed_mod
+from . import vectors as vectors_mod
 from . import crossrepo
 from . import indexer as indexer_mod
 from . import paths
@@ -86,6 +88,12 @@ class Workspace:
 
 
 def open_workspace(explicit_root: str | None = None) -> Workspace:
+    # Start fetching the embedding model now, on a background thread, so the
+    # download overlaps with indexing and with the agent reading the briefing
+    # rather than stalling the first question it asks. No-op after the first
+    # call, and when semantic search is switched off.
+    embed_mod.prewarm()
+
     root = resolve_root(explicit_root)
     catalog = catalog_mod.open_catalog()
     info = catalog_mod.open_workspace(catalog, root)
@@ -147,6 +155,47 @@ def _background_finish(repo_id: str, root: Path, commit: str | None, excludes: l
             _BACKGROUND.pop(repo_id, None)
 
 
+def _build_semantics_later(repo_id: str) -> None:
+    """Wait for the model to finish downloading, then encode the repository.
+
+    Without this, a first run would index the code before the 33MB model had
+    arrived, find no encoder, and leave the store with no vectors until the
+    next time something happened to change a file. Semantic search would look
+    broken on exactly the run where a user is deciding whether it works.
+
+    Opens its own connection: sqlite3 connections belong to the thread that
+    created them.
+    """
+    store = None
+    try:
+        embed_mod.prewarm(blocking=True)
+        encoder = embed_mod.load_encoder()
+        if encoder is None:
+            return
+        store = init_repo_store(paths.repo_db_path(repo_id))
+        vectors_mod.refresh(store, encoder)
+    except Exception:
+        # Same rule as the background indexer: an optional enhancement must
+        # never take the server down. Lexical search is unaffected.
+        pass
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _refresh_semantics(ws: Workspace) -> dict[str, Any]:
+    """Encode new or changed content, or arrange for it once the model lands."""
+    encoder = embed_mod.load_encoder()
+    if encoder is not None:
+        return vectors_mod.refresh(ws.store, encoder)
+
+    state = embed_mod.status()
+    if state["state"] == embed_mod.LOADING:
+        threading.Thread(target=_build_semantics_later, args=(ws.repo_id,),
+                         daemon=True, name="icn-embed-build").start()
+    return {"encoded": 0, "skipped": 0, **state}
+
+
 def ensure_indexed(ws: Workspace, force_full: bool = False,
                    budget: float = FIRST_INDEX_BUDGET) -> dict[str, Any]:
     """Bring the index up to date, then re-verify anchors.
@@ -198,11 +247,18 @@ def ensure_indexed(ws: Workspace, force_full: bool = False,
     # anchor pointing at code nobody touched.
     rebase = anchor_mod.rebase_extractor_change(ws.store, ws.root)
     verification = anchor_mod.verify_repo(ws.store, ws.root, ws.commit)
+
+    # Semantic vectors, refreshed in the same pass that refreshed the symbols
+    # they describe. Incremental by content hash, so an unchanged repository
+    # costs one query and encodes nothing.
+    semantic = _refresh_semantics(ws)
+
     result = {
         "indexed": True,
         "index_state": "partial" if report.get("truncated") else "ready",
         **report,
         "anchors": verification,
+        "semantic": semantic,
         **indexer_mod.index_state(ws.store),
     }
     if rebase.get("rebased"):
@@ -233,6 +289,10 @@ def status(ws: Workspace) -> dict[str, Any]:
         "branch": ws.info.get("branch"),
         "dirty": ws.info.get("dirty"),
         "index": indexer_mod.index_state(ws.store),
+        # Both halves: whether the model is loaded, and whether this store has
+        # been encoded with it. "loading" is not an error, and a user needs to
+        # be able to tell it apart from quietly broken.
+        "semantic": {**embed_mod.status(), **vectors_mod.stats(ws.store)},
         "anchors": anchor_mod.anchor_health(ws.store),
         "store": {
             "repo_db": str(paths.repo_db_path(ws.repo_id)),

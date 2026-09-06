@@ -31,7 +31,9 @@ from . import anchors as anchor_mod
 from . import causal
 from . import crossrepo
 from . import diagnostics
+from . import embed
 from . import ids
+from . import vectors
 from .db import jdump, jload, one, rows, write_tx
 from .identity import run_git
 from .resolver import describe_edge, resolve
@@ -39,13 +41,26 @@ from .resolver import describe_edge, resolve
 INTENTS = ("locate", "understand", "modify", "debug", "audit")
 
 # Per-intent fusion weights. Hand-tuned constants, not learned.
+# `sem` is deliberately below `lex` in every intent. Published CoIR results for
+# this model class put dense retrieval BELOW BM25 alone (39.1 vs 42.3) and the
+# hybrid above both (43.4): semantic similarity earns its place by recalling
+# what lexical search missed, not by outranking it. It is highest for
+# understand/debug, where a user describes a behaviour in their own words, and
+# lowest for locate, where they usually already know the identifier.
 INTENT_WEIGHTS: dict[str, dict[str, float]] = {
-    "locate":     {"lex": 1.0, "sym": 1.5, "graph": 0.3, "sev": 0.2, "time": 0.1, "test": 0.1, "mem": 0.3},
-    "understand": {"lex": 0.8, "sym": 1.0, "graph": 0.9, "sev": 0.6, "time": 0.3, "test": 0.3, "mem": 1.0},
-    "modify":     {"lex": 0.7, "sym": 1.0, "graph": 1.0, "sev": 1.4, "time": 0.5, "test": 0.8, "mem": 1.3},
-    "debug":      {"lex": 0.8, "sym": 0.9, "graph": 0.9, "sev": 1.0, "time": 1.0, "test": 0.6, "mem": 1.1},
-    "audit":      {"lex": 0.6, "sym": 0.7, "graph": 1.1, "sev": 1.2, "time": 0.4, "test": 1.0, "mem": 1.2},
+    "locate":     {"lex": 1.0, "sem": 0.30, "sym": 1.5, "graph": 0.3, "sev": 0.2, "time": 0.1, "test": 0.1, "mem": 0.3},
+    "understand": {"lex": 0.8, "sem": 0.55, "sym": 1.0, "graph": 0.9, "sev": 0.6, "time": 0.3, "test": 0.3, "mem": 1.0},
+    "modify":     {"lex": 0.7, "sem": 0.45, "sym": 1.0, "graph": 1.0, "sev": 1.4, "time": 0.5, "test": 0.8, "mem": 1.3},
+    "debug":      {"lex": 0.8, "sem": 0.55, "sym": 0.9, "graph": 0.9, "sev": 1.0, "time": 1.0, "test": 0.6, "mem": 1.1},
+    "audit":      {"lex": 0.6, "sem": 0.40, "sym": 0.7, "graph": 1.1, "sev": 1.2, "time": 0.4, "test": 1.0, "mem": 1.2},
 }
+
+# Reciprocal-rank constant for fusing lexical and semantic result lists. Rank
+# based rather than score based on purpose: bm25 and cosine live on
+# incompatible scales, and a static embedding model compresses cosine into a
+# narrow band (a strong match measures ~0.19, not ~0.9), so any threshold or
+# linear blend over raw similarity would be meaningless. Ranks are comparable.
+RRF_K = 10.0
 
 SEVERITY_SCORE = {"critical": 1.0, "high": 0.75, "medium": 0.45, "low": 0.2}
 
@@ -324,6 +339,77 @@ def _seed_symbols(conn: sqlite3.Connection, terms: list[str]) -> dict[str, dict[
             seeds.setdefault(row["symbol_id"], {"lex": 0.0, "sym": 0.0})
             seeds[row["symbol_id"]]["sym"] = max(seeds[row["symbol_id"]]["sym"], 0.5)
     return seeds
+
+
+def _rank_score(rank: int) -> float:
+    """Reciprocal rank on a 0..1 scale, best result at 1.0.
+
+    Keeps the semantic sub-score in the same range as `lex` and `sym`, so the
+    existing weights stay interpretable and nothing downstream needs
+    recalibrating.
+    """
+    return RRF_K / (RRF_K + rank)
+
+
+# How many semantic hits may introduce a symbol the lexical pass never found.
+# Kept small on purpose. Seeds feed graph expansion, so every new seed pulls in
+# its whole neighbourhood: a weak semantic match does not add one mediocre
+# result, it adds a cluster of them and crowds out the lexical answer. Measured
+# on this repository, seeding all 60 hits made results visibly worse on 2 of 4
+# queries. Hits beyond this rank still boost symbols lexical search already
+# found, where they cost nothing and break ties usefully.
+SEMANTIC_SEED_LIMIT = 12
+
+
+def _seed_semantic(conn: sqlite3.Connection, encoder: Any, query: str,
+                   seeds: dict[str, dict[str, Any]], limit: int = 60) -> int:
+    """Add meaning-based symbol seeds beside the lexical ones.
+
+    This is the half of retrieval that word matching cannot do: it finds
+    `verify_anchor` for "how do we notice stored knowledge went stale", where
+    the query and the code share no vocabulary at all. Symbols already found
+    lexically keep their `lex` untouched and simply gain a `sem` component, so
+    turning the encoder off reproduces the previous behaviour exactly.
+    """
+    if encoder is None or not (query or "").strip():
+        return 0
+    try:
+        hits = vectors.search(conn, encoder, query, vectors.SYMBOL, limit=limit)
+    except Exception:                # noqa: BLE001 - retrieval must not break on a bad vector store
+        return 0
+
+    added = 0
+    for rank, (symbol_id, _similarity) in enumerate(hits):
+        known = symbol_id in seeds
+        if not known and rank >= SEMANTIC_SEED_LIMIT:
+            continue                 # too weak to justify pulling in its subgraph
+        seed = seeds.setdefault(symbol_id, {"lex": 0.0, "sym": 0.0})
+        seed["sem"] = max(seed.get("sem", 0.0), _rank_score(rank))
+        added += 0 if known else 1
+    return added
+
+
+def _fuse_memory_hits(lexical: dict[str, float], semantic: list[tuple[str, float]],
+                      ) -> dict[str, float]:
+    """Reciprocal-rank fusion of the two memory rankings, renormalised to 0..1.
+
+    The output range is preserved on purpose. `MEMORY_FLOOR` was calibrated
+    against measured scores, and it gates whether a memory is quoted in full
+    or merely named. Returning fused scores on a different scale would move
+    every memory across that line at once and quietly blow the token budget,
+    so the best hit lands at 1.0 here exactly as it did before.
+    """
+    if not semantic:
+        return lexical
+
+    fused: dict[str, float] = {}
+    for rank, memory_id in enumerate(sorted(lexical, key=lambda m: -lexical[m])):
+        fused[memory_id] = fused.get(memory_id, 0.0) + _rank_score(rank)
+    for rank, (memory_id, _similarity) in enumerate(semantic):
+        fused[memory_id] = fused.get(memory_id, 0.0) + _rank_score(rank)
+
+    top = max(fused.values())
+    return {memory_id: score / top for memory_id, score in fused.items()}
 
 
 def _boost_explicit_paths(conn: sqlite3.Connection, query: str,
@@ -841,6 +927,19 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
     _boost_explicit_paths(conn, query, seeds)
     memory_hits = _seed_memories(conn, terms)
 
+    # Semantic recall, when a model is loaded. load_encoder() never blocks and
+    # never raises: while the model is still downloading it returns None and
+    # this whole block is skipped, leaving retrieval exactly as it was.
+    encoder = embed.load_encoder()
+    semantic_symbols = _seed_semantic(conn, encoder, query, seeds)
+    semantic_memories: list[tuple[str, float]] = []
+    if encoder is not None:
+        try:
+            semantic_memories = vectors.search(conn, encoder, query, vectors.MEMORY, limit=60)
+        except Exception:            # noqa: BLE001 - see _seed_semantic
+            semantic_memories = []
+        memory_hits = _fuse_memory_hits(memory_hits, semantic_memories)
+
     # Memories that matched textually pull their anchored symbols in with them,
     # so a warning can surface even when the query never names the code.
     if memory_hits:
@@ -889,6 +988,7 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
 
         score = (
             weights["lex"] * seed["lex"]
+            + weights.get("sem", 0.0) * seed.get("sem", 0.0)
             + weights["sym"] * seed["sym"]
             + weights["graph"] * proximity.get(symbol_id, 0.0)
             + weights["sev"] * severity
@@ -900,7 +1000,8 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
             - (0.4 if symbol["status"] != "ACTIVE" else 0.0)
         )
         breakdown = {
-            "lexical": round(seed["lex"], 3), "symbol": round(seed["sym"], 3),
+            "lexical": round(seed["lex"], 3), "semantic": round(seed.get("sem", 0.0), 3),
+            "symbol": round(seed["sym"], 3),
             "graph": round(proximity.get(symbol_id, 0.0), 3), "severity": round(severity, 3),
             "recency": round(recency, 3), "memory": round(memory_signal, 3),
             "specificity_discount": round(specificity.get(symbol_id, 0.0), 3),

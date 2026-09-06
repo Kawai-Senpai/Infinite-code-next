@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Columns added after a schema version shipped. Migration is first-class
 # (PLAN.md section 11): additive, idempotent, and never destructive.
@@ -407,6 +407,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
     memory_id UNINDEXED, title, body, kind,
     tokenize = "unicode61 remove_diacritics 2"
 );
+
+-- Semantic vectors, beside FTS for the same reason: retrieval joins against
+-- them on every query. Rebuildable from `symbols`/`memories`, so losing this
+-- table costs re-encoding time and nothing else.
+--
+-- content_hash is what makes indexing incremental: a symbol whose body did
+-- not change keeps its vector. encoder_id and dim are stored per row rather
+-- than globally so that switching models invalidates the old vectors instead
+-- of silently comparing 256d vectors against 1024d ones.
+CREATE TABLE IF NOT EXISTS embeddings (
+    scope        TEXT NOT NULL,          -- 'symbol' or 'memory'
+    item_id      TEXT NOT NULL,
+    encoder_id   TEXT NOT NULL,
+    dim          INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    vector       BLOB NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (scope, item_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_embeddings_encoder ON embeddings(encoder_id, scope);
 """
 
 

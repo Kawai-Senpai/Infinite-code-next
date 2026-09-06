@@ -17,6 +17,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
+# Semantic search is on by default for users, but a test suite must not
+# download a model or spend seconds encoding every throwaway repository. Tests
+# that exercise embeddings opt in explicitly by setting this themselves.
+os.environ.setdefault("ICN_EMBED_MODEL", "none")
+
+
 def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True)
 
