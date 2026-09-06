@@ -762,6 +762,7 @@ def memory(
     reason: str = "",
     actor: str = "agent",
     limit: int = 30,
+    offset: int = 0,
     root: str | None = None,
 ) -> dict[str, Any]:
     """Inspect and correct stored knowledge.
@@ -798,6 +799,8 @@ def memory(
         reason: why the change is being made. Recorded.
         actor: 'agent' or 'human'.
         limit: maximum rows for list.
+        offset: rows to skip for list. With `total` and `next_offset` in the
+            reply, this pages through a filter larger than one call can carry.
         root: repository path. Defaults to the server's working directory.
     """
     current = ws_mod.open_workspace(root)
@@ -805,9 +808,19 @@ def memory(
         act = (action or "list").lower().strip()
 
         if act == "list":
-            return {"ok": True, "resolved_root": str(current.root),
-                    "memories": compiler.list_memories(current.store, kind=kind, status=status,
-                                                       anchor_status=anchor_status, limit=limit)}
+            found = compiler.list_memories(current.store, kind=kind, status=status,
+                                           anchor_status=anchor_status, limit=limit,
+                                           offset=offset)
+            total = compiler.count_memories(current.store, kind=kind, status=status,
+                                            anchor_status=anchor_status)
+            page: dict[str, Any] = {"ok": True, "resolved_root": str(current.root),
+                                    "memories": found, "total": total,
+                                    "offset": max(0, offset), "count": len(found)}
+            # Only when there is more: an absent next_offset is the end of the
+            # listing, so a reader never has to compare numbers to know it.
+            if max(0, offset) + len(found) < total:
+                page["next_offset"] = max(0, offset) + len(found)
+            return page
         if not memory_id:
             return _fail(f"{act} requires memory_id", str(current.root))
 

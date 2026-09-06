@@ -529,6 +529,9 @@ def _last_downgrade(anchor: dict[str, Any]) -> tuple[str | None, bool]:
     return history[index].get("from_fingerprint"), was_active
 
 
+_CHANGED_DETAIL = 20
+
+
 def verify_repo(conn: sqlite3.Connection, root: Path, commit: str | None,
                 only_memory: str | None = None) -> dict[str, Any]:
     """Re-verify anchors. Called right after indexing, so drift is caught on the
@@ -548,7 +551,27 @@ def verify_repo(conn: sqlite3.Connection, root: Path, commit: str | None,
     for result in results:
         summary[result["status"]] = summary.get(result["status"], 0) + 1
     changed = [r for r in results if r["transition"] not in ("unchanged", "skipped")]
-    return {"checked": len(results), "by_status": summary, "changed": changed}
+
+    # A repository with thousands of anchors produced thousands of these
+    # records, and they travelled inside every workspace(action='open')
+    # response - hundreds of kilobytes of per-anchor detail that buried the
+    # briefing the call exists to deliver. The counts carry the signal; the
+    # individual rows are recoverable with memory(action='reanchor'), which
+    # is scoped to one memory and so is never truncated.
+    detail = changed if only_memory else changed[:_CHANGED_DETAIL]
+    report = {"checked": len(results), "by_status": summary, "changed": detail,
+              "changed_total": len(changed)}
+    if len(detail) < len(changed):
+        by_transition: dict[str, int] = {}
+        for entry in changed:
+            key = entry["transition"]
+            by_transition[key] = by_transition.get(key, 0) + 1
+        report["changed_by_transition"] = by_transition
+        report["changed_note"] = (
+            f"showing {len(detail)} of {len(changed)} changed anchors; page the rest with "
+            "memory(action='list', anchor_status='NEEDS_REVIEW', limit=..., offset=...), "
+            "or memory(action='reanchor', memory_id=...) for one memory's detail")
+    return report
 
 
 def anchor_health(conn: sqlite3.Connection) -> dict[str, Any]:

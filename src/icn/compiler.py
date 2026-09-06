@@ -864,7 +864,8 @@ _RANK_SQL = ("MAX(CASE a.status WHEN 'ACTIVE' THEN 0 WHEN 'DRIFTED' THEN 1"
 
 
 def list_memories(conn: sqlite3.Connection, kind: str | None = None, status: str | None = None,
-                  anchor_status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+                  anchor_status: str | None = None, limit: int = 50,
+                  offset: int = 0) -> list[dict[str, Any]]:
     sql = (f"SELECT m.memory_id, m.kind, m.title, m.severity, m.status, m.authority,"
            f" m.last_verified_commit, {_RANK_SQL} AS anchor_rank,"
            f" MIN(a.anchor_confidence) AS anchor_confidence, COUNT(a.anchor_id) AS anchor_count"
@@ -884,8 +885,12 @@ def list_memories(conn: sqlite3.Connection, kind: str | None = None, status: str
         sql += " HAVING anchor_rank = ?"
         args.append(rank)
     # Worst anchors first: the point of a listing is to surface what needs work.
-    sql += " ORDER BY anchor_rank DESC, m.created_at DESC LIMIT ?"
+    # memory_id breaks ties: without it two memories sharing a rank and a
+    # timestamp can swap places between queries, and a paged reader then sees
+    # one row twice and never sees another.
+    sql += " ORDER BY anchor_rank DESC, m.created_at DESC, m.memory_id DESC LIMIT ? OFFSET ?"
     args.append(max(1, min(limit, 500)))
+    args.append(max(0, offset))
 
     out = rows(conn.execute(sql, tuple(args)))
     for row in out:
@@ -894,3 +899,27 @@ def list_memories(conn: sqlite3.Connection, kind: str | None = None, status: str
         if row["anchor_confidence"] is not None:
             row["anchor_confidence"] = round(row["anchor_confidence"], 2)
     return out
+
+
+def count_memories(conn: sqlite3.Connection, kind: str | None = None, status: str | None = None,
+                   anchor_status: str | None = None) -> int:
+    """How many memories a list_memories() filter matches in total, so a caller
+    paging through them knows whether there is more behind the limit."""
+    sql = (f"SELECT COUNT(*) AS n FROM (SELECT m.memory_id, {_RANK_SQL} AS anchor_rank"
+           f" FROM memories m LEFT JOIN anchors a ON a.memory_id = m.memory_id WHERE 1=1")
+    args: list[Any] = []
+    if kind:
+        sql += " AND m.kind = ?"
+        args.append(kind)
+    if status:
+        sql += " AND m.status = ?"
+        args.append(status)
+    sql += " GROUP BY m.memory_id"
+    if anchor_status:
+        rank = _ANCHOR_RANK.get(anchor_status.upper())
+        if rank is None:
+            return 0
+        sql += " HAVING anchor_rank = ?"
+        args.append(rank)
+    sql += ")"
+    return int(conn.execute(sql, tuple(args)).fetchone()[0])
