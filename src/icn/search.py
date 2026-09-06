@@ -40,19 +40,29 @@ from .resolver import describe_edge, resolve
 
 INTENTS = ("locate", "understand", "modify", "debug", "audit")
 
-# Per-intent fusion weights. Hand-tuned constants, not learned.
+# Per-intent fusion weights.
 # `sem` is deliberately below `lex` in every intent. Published CoIR results for
 # this model class put dense retrieval BELOW BM25 alone (39.1 vs 42.3) and the
 # hybrid above both (43.4): semantic similarity earns its place by recalling
-# what lexical search missed, not by outranking it. It is highest for
-# understand/debug, where a user describes a behaviour in their own words, and
-# lowest for locate, where they usually already know the identifier.
+# what lexical search missed, not by outranking it.
+#
+# The sem/lex ratio is measured, not guessed. Grid search over 10 indexed
+# repositories and 1917 (memory title -> anchored symbol) pairs, macro-averaged
+# so a 6k-symbol repo cannot outvote a 900-symbol one, put the optimum at 0.70
+# for every value of the rank constant tried. The shipped configuration scores
+# +6.0% MRR over lexical-only (0.1058 -> 0.1121), R@10 0.192 -> 0.213 and
+# R@20 0.260 -> 0.282. The four prose intents below are set to 0.70 * lex.
+#
+# `locate` is the deliberate exception and stays low. Those queries name an
+# identifier the user already knows, where lexical search is close to exact and
+# semantics can only blur it. The tuning corpus is prose descriptions, so it
+# does not measure that case and is not evidence for raising it.
 INTENT_WEIGHTS: dict[str, dict[str, float]] = {
     "locate":     {"lex": 1.0, "sem": 0.30, "sym": 1.5, "graph": 0.3, "sev": 0.2, "time": 0.1, "test": 0.1, "mem": 0.3},
-    "understand": {"lex": 0.8, "sem": 0.55, "sym": 1.0, "graph": 0.9, "sev": 0.6, "time": 0.3, "test": 0.3, "mem": 1.0},
-    "modify":     {"lex": 0.7, "sem": 0.45, "sym": 1.0, "graph": 1.0, "sev": 1.4, "time": 0.5, "test": 0.8, "mem": 1.3},
-    "debug":      {"lex": 0.8, "sem": 0.55, "sym": 0.9, "graph": 0.9, "sev": 1.0, "time": 1.0, "test": 0.6, "mem": 1.1},
-    "audit":      {"lex": 0.6, "sem": 0.40, "sym": 0.7, "graph": 1.1, "sev": 1.2, "time": 0.4, "test": 1.0, "mem": 1.2},
+    "understand": {"lex": 0.8, "sem": 0.56, "sym": 1.0, "graph": 0.9, "sev": 0.6, "time": 0.3, "test": 0.3, "mem": 1.0},
+    "modify":     {"lex": 0.7, "sem": 0.49, "sym": 1.0, "graph": 1.0, "sev": 1.4, "time": 0.5, "test": 0.8, "mem": 1.3},
+    "debug":      {"lex": 0.8, "sem": 0.56, "sym": 0.9, "graph": 0.9, "sev": 1.0, "time": 1.0, "test": 0.6, "mem": 1.1},
+    "audit":      {"lex": 0.6, "sem": 0.42, "sym": 0.7, "graph": 1.1, "sev": 1.2, "time": 0.4, "test": 1.0, "mem": 1.2},
 }
 
 # Reciprocal-rank constant for fusing lexical and semantic result lists. Rank
@@ -60,6 +70,10 @@ INTENT_WEIGHTS: dict[str, dict[str, float]] = {
 # incompatible scales, and a static embedding model compresses cosine into a
 # narrow band (a strong match measures ~0.19, not ~0.9), so any threshold or
 # linear blend over raw similarity would be meaningless. Ranks are comparable.
+# Confirmed by the grid search described above: 5 and 10 tie to four decimals,
+# 20 and 60 are slightly worse. 10 is kept as the flatter of the two winners,
+# since a sharper decay weights the top few ranks more and is correspondingly
+# more sensitive to a single misranked hit.
 RRF_K = 10.0
 
 SEVERITY_SCORE = {"critical": 1.0, "high": 0.75, "medium": 0.45, "low": 0.2}
@@ -352,13 +366,18 @@ def _rank_score(rank: int) -> float:
 
 
 # How many semantic hits may introduce a symbol the lexical pass never found.
-# Kept small on purpose. Seeds feed graph expansion, so every new seed pulls in
-# its whole neighbourhood: a weak semantic match does not add one mediocre
-# result, it adds a cluster of them and crowds out the lexical answer. Measured
-# on this repository, seeding all 60 hits made results visibly worse on 2 of 4
-# queries. Hits beyond this rank still boost symbols lexical search already
-# found, where they cost nothing and break ties usefully.
-SEMANTIC_SEED_LIMIT = 12
+# Kept bounded on purpose. Seeds feed graph expansion, so every new seed pulls
+# in its whole neighbourhood: a weak semantic match does not add one mediocre
+# result, it adds a cluster of them and crowds out the lexical answer.
+#
+# The earlier value of 12 came from 4 queries on this repository alone. Across
+# 1917 pairs any cap of 20 or more beat 10, and 20, 40 and 60 sat within 0.0005
+# MRR of each other. 20 is chosen from that plateau rather than the nominal
+# argmax of 60: it ties for the best R@20 in the whole grid (0.282) while
+# pulling in a third of the neighbourhood expansion, so it is the cheapest
+# point that buys the gain. Hits beyond this rank still boost symbols lexical
+# search already found, where they cost nothing and break ties usefully.
+SEMANTIC_SEED_LIMIT = 20
 
 
 def _seed_semantic(conn: sqlite3.Connection, encoder: Any, query: str,
