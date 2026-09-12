@@ -13,6 +13,7 @@ from pathlib import Path
 
 from conftest import record_baseline
 
+from icn import imports as import_mod
 from icn import parsing, search as search_mod
 from icn import workspace as ws_mod
 from icn.db import init_repo_store, one, rows
@@ -192,9 +193,9 @@ def test_a_no_op_open_does_not_re_resolve_every_symbol(workspace, project, monke
     seen: list[object] = []
     real = Indexer.resolve_calls
 
-    def spy(self, symbol_ids, commit):
+    def spy(self, symbol_ids, commit, **kwargs):
         seen.append(symbol_ids)
-        return real(self, symbol_ids, commit)
+        return real(self, symbol_ids, commit, **kwargs)
 
     monkeypatch.setattr(Indexer, "resolve_calls", spy)
     report = ws_mod.ensure_indexed(workspace)
@@ -271,3 +272,228 @@ def test_repeated_verification_does_not_grow_anchor_history(workspace, project):
     for history in histories:
         unchanged = [e for e in history if e.get("transition") == "unchanged"]
         assert len(unchanged) <= 1, "consecutive no-ops must collapse into one"
+
+
+def test_symbol_texts_never_joins_the_fts_virtual_table(workspace):
+    """A LEFT JOIN onto fts_symbols is quadratic and ran inside the tool call.
+
+    fts_symbols is an FTS5 virtual table and FTS5 has no secondary index, so
+    joining it on symbol_id makes SQLite rescan the entire virtual table once
+    per symbol row. The plan said it outright:
+
+        SCAN f VIRTUAL TABLE INDEX 0: LEFT-JOIN
+
+    Measured on a real 17k-symbol store, that produced 512 rows in 12s and the
+    full set in ~300s, so workspace(open) on a cold repository blew past a 600s
+    client timeout. Bodies must be read in one linear pass instead.
+    """
+    from icn import vectors
+
+    record_baseline(workspace)
+
+    seen: list[str] = []
+    workspace.store.set_trace_callback(seen.append)
+    try:
+        list(vectors._symbol_texts(workspace.store))
+    finally:
+        workspace.store.set_trace_callback(None)
+
+    offending = []
+    for sql in seen:
+        if "fts_symbols" not in sql or not sql.strip().upper().startswith("SELECT"):
+            continue
+        plan = " | ".join(str(tuple(r)) for r in workspace.store.execute(
+            "EXPLAIN QUERY PLAN " + sql))
+        if "VIRTUAL TABLE" in plan and "JOIN" in plan:
+            offending.append(plan)
+
+    assert seen, "no SQL was captured; the trace callback did not fire"
+    assert not offending, f"fts_symbols is being joined, which is quadratic: {offending}"
+
+
+def test_one_batch_cannot_outrun_the_first_index_budget(repo, tmp_path, monkeypatch):
+    """The budget was consulted once every 40 files, so a batch ran unchecked.
+
+    whatsapp-ghost holds 25,641 symbols in 37 files: its first batch was the
+    whole repository, the 8s budget was never read in time, and the cold open
+    took 275s. The clock now gets read per file.
+    """
+    for n in range(60):
+        repo.write(f"mod{n}.py", f"""
+def f{n}():
+    return {n}
+""")
+    commit = repo.commit("many files")
+
+    real = Indexer.read_and_parse
+
+    def slow(self, abs_path):
+        time.sleep(0.02)
+        return real(self, abs_path)
+
+    monkeypatch.setattr(Indexer, "read_and_parse", slow)
+
+    conn = init_repo_store(tmp_path / "store.db")
+    try:
+        started = time.time()
+        report = Indexer(conn, repo.root, "repo_budget").full_index(
+            commit, budget_seconds=0.2)
+        elapsed = time.time() - started
+    finally:
+        conn.close()
+
+    assert report["truncated"], "a 0.2s budget over 1.2s of parsing must truncate"
+    assert report["files_indexed"] < 40, "the budget must bite inside the first batch"
+    assert elapsed < 0.6, f"budget overrun: {elapsed:.2f}s against a 0.2s budget"
+
+
+def test_a_truncated_first_index_defers_whole_repository_resolution(repo, tmp_path,
+                                                                    monkeypatch):
+    """Import and call resolution ran unbudgeted even on a truncated index.
+
+    Both are whole-repository passes, so on a big repository they cost more
+    than the walk that preceded them - and every edge they wrote was about to
+    be recomputed from nothing by the background full index.
+    """
+    repo.write("a.py", """
+from b import b
+
+
+def a():
+    return b()
+""")
+    repo.write("b.py", """
+def b():
+    return 1
+""")
+    commit = repo.commit("two files")
+
+    seen: list[object] = []
+    real = Indexer.resolve_calls
+
+    def spy(self, symbol_ids, commit, **kwargs):
+        seen.append(symbol_ids)
+        return real(self, symbol_ids, commit, **kwargs)
+
+    monkeypatch.setattr(Indexer, "resolve_calls", spy)
+
+    conn = init_repo_store(tmp_path / "store.db")
+    try:
+        report = Indexer(conn, repo.root, "repo_deferred").full_index(
+            commit, budget_seconds=0.0)
+        edges = one(conn.execute(
+            "SELECT COUNT(*) AS n FROM code_edges WHERE kind='CALLS'"))
+    finally:
+        conn.close()
+
+    assert report["truncated"], "budget_seconds=0 means no time at all, not no budget"
+    assert not seen, "a truncated index must not resolve the whole repository"
+    assert report["call_edges"] == 0
+    assert report["import_edges"]["deferred"] == "index truncated"
+    assert report["entry_points"]["deferred"] == "index truncated"
+    assert report["areas"]["deferred"] == "index truncated"
+    assert edges["n"] == 0
+
+
+def test_the_resolution_passes_stop_at_their_deadline(project, tmp_path):
+    """Resolution is resumable, so it is allowed to stop: it rewrites one
+    file's or one symbol's edges wholesale inside a transaction, never half."""
+    conn = init_repo_store(tmp_path / "store.db")
+    try:
+        idx = Indexer(conn, project.root, "repo_deadline")
+        report = idx.full_index(project.head())
+        assert not report["truncated"] and report["call_edges"] > 0
+
+        past = time.time() - 1
+        assert idx.resolve_calls(None, project.head(), deadline=past) == 0
+        assert idx.resolution_truncated
+
+        stopped = import_mod.resolve_file_imports(conn, None, project.head(),
+                                                  deadline=past)
+        assert stopped["truncated"] and stopped["files"] == 0
+
+        # And the edges the completed run wrote are still there: stopping
+        # early resolves fewer symbols, it does not delete what was resolved.
+        edges = one(conn.execute(
+            "SELECT COUNT(*) AS n FROM code_edges WHERE kind='CALLS'"))
+        assert edges["n"] > 0
+    finally:
+        conn.close()
+
+
+def test_a_partial_index_is_never_stamped_as_complete(project, monkeypatch):
+    """Only a complete run stamps last_indexed_commit, and the run that was
+    meant to complete it lives in a daemon thread that dies with the process.
+
+    The next open then saw a non-empty store, asked git what had changed since
+    "no commit at all", was told "nothing uncommitted", and stamped the
+    commit - freezing a symbol table with no call edges in place as if it were
+    whole. An unfinished index has to resume instead.
+    """
+    ws = ws_mod.open_workspace(str(project.root))
+    try:
+        monkeypatch.setattr(ws_mod, "_background_finish", lambda *a, **k: None)
+        real = Indexer.read_and_parse
+
+        def slow(self, abs_path):
+            time.sleep(0.06)
+            return real(self, abs_path)
+
+        monkeypatch.setattr(Indexer, "read_and_parse", slow)
+        first = ws_mod.ensure_indexed(ws, budget=0.05)
+        monkeypatch.setattr(Indexer, "read_and_parse", real)
+        ws_mod._BACKGROUND.pop(ws.repo_id, None)
+
+        assert first["truncated"] and first["index_state"] == "partial"
+        assert first["files_indexed"] >= 1, "the first file must still be stored"
+
+        second = ws_mod.ensure_indexed(ws)
+        assert second["index_state"] == "ready"
+        assert second["call_edges"] > 0, "the resumed run must resolve calls"
+        stamped = one(ws.catalog.execute(
+            "SELECT last_indexed_commit FROM repositories WHERE repo_id=?",
+            (ws.repo_id,)))
+        assert stamped["last_indexed_commit"] == ws.commit
+    finally:
+        ws.close()
+
+
+def test_a_budgeted_pass_hands_oversized_files_to_the_background_run(repo, tmp_path):
+    """One file can outlast the whole budget, however often the clock is read.
+
+    The budget can only be checked between files, and whatsapp-ghost's minified
+    vendor bundles take 8-12s of tree-sitter each against an 8s budget. A
+    budgeted pass therefore leaves them to the unbudgeted run, which is not a
+    skip: the run reports truncated, so the background index parses them in
+    full and the finished index is the same either way.
+    """
+    from icn.indexer import BUDGETED_FILE_BYTES
+
+    repo.write("small.py", """
+def small():
+    return 1
+""")
+    padding = "# pad" + chr(10)
+    repo.write("huge.py", "x = 1" + chr(10) + padding * (BUDGETED_FILE_BYTES // 6))
+    commit = repo.commit("one big file")
+    assert (repo.root / "huge.py").stat().st_size > BUDGETED_FILE_BYTES
+
+    def index(budget):
+        conn = init_repo_store(tmp_path / f"store-{budget}.db")
+        try:
+            report = Indexer(conn, repo.root, f"repo_{budget}").full_index(
+                commit, budget_seconds=budget)
+            paths_indexed = [r["path"] for r in rows(conn.execute(
+                "SELECT path FROM files WHERE status='ACTIVE'"))]
+        finally:
+            conn.close()
+        return report, paths_indexed
+
+    budgeted, indexed = index(30.0)
+    assert budgeted["deferred"] == 1
+    assert budgeted["truncated"], "a deferred file must leave the run unfinished"
+    assert "small.py" in indexed and "huge.py" not in indexed
+
+    unbudgeted, indexed = index(None)
+    assert unbudgeted["deferred"] == 0 and not unbudgeted["truncated"]
+    assert "huge.py" in indexed, "the unbudgeted run indexes everything"

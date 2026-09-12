@@ -23,6 +23,7 @@ ANCHOR = "anc"
 EVENT = "evt"
 EDGE = "edg"
 INVESTIGATION = "inv"
+FRAGMENT = "frg"
 
 
 def new_id(prefix: str) -> str:

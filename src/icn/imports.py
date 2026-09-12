@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import posixpath
 import sqlite3
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -276,15 +277,25 @@ def resolve_specifier(spec: dict[str, Any], lang: str, from_path: str,
 
 
 def resolve_file_imports(conn: sqlite3.Connection, file_ids: set[str] | None,
-                         commit: str | None) -> dict[str, int]:
+                         commit: str | None,
+                         deadline: float | None = None) -> dict[str, Any]:
     """Second pass: turn stored import specifiers into IMPORTS edges.
 
     Rewrites every IMPORTS edge out of each file it touches, so a removed
     import stops being reported and edges written by an older, statement-text
     scheme are replaced rather than accumulating alongside the real ones.
+
+    `deadline` is a wall-clock time (time.time()) after which the pass stops
+    between batches and reports `truncated`. A stopped pass resolves fewer
+    files; it never leaves one half-resolved, because a file's IMPORTS edges
+    are rewritten wholesale inside one transaction.
     """
     if file_ids is not None and not file_ids:
-        return {"resolved": 0, "external": 0, "files": 0}
+        return {"resolved": 0, "external": 0, "files": 0, "truncated": False}
+    if deadline is not None and time.time() > deadline:
+        # Before the queries, not after: building the file index and reading
+        # every specifier is itself the expensive part on a large repository.
+        return {"resolved": 0, "external": 0, "files": 0, "truncated": True}
 
     index = FileIndex(rows(conn.execute(
         "SELECT file_id, path FROM files WHERE status='ACTIVE'")))
@@ -305,8 +316,13 @@ def resolve_file_imports(conn: sqlite3.Connection, file_ids: set[str] | None,
                 f" AND imports_raw IS NOT NULL", tuple(part))))
 
     resolved = external = 0
+    truncated = False
     stamp = now()
     for start in range(0, len(targets), IMPORT_BATCH):
+        if deadline is not None and time.time() > deadline:
+            truncated = True
+            targets = targets[:start]
+            break
         with write_tx(conn):
             for row in targets[start:start + IMPORT_BATCH]:
                 specs = jload(row["imports_raw"], []) or []
@@ -363,4 +379,5 @@ def resolve_file_imports(conn: sqlite3.Connection, file_ids: set[str] | None,
                         else:
                             resolved += 1
 
-    return {"resolved": resolved, "external": external, "files": len(targets)}
+    return {"resolved": resolved, "external": external, "files": len(targets),
+            "truncated": truncated}

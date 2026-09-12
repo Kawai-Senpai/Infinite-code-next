@@ -47,9 +47,48 @@ It is idempotent, and it merges into an existing `settings.json` rather than rep
 
 Restart the client afterwards so both load.
 
-## 3. Add the global agent instruction
+## 3. Approve the read-only tools once
 
-Step 2 covers Claude Code per project. This covers every client, and is what you want if you would rather configure ICN once globally than per repository.
+ICN is designed to be called constantly: on every session start, before every
+investigation, and before every change. A client that prompts for approval on
+each of those calls defeats that design. The agent either waits on a human for
+every question it asks, or it learns to avoid the tool and falls back to
+grepping, which is the behaviour ICN exists to replace.
+
+Pre-approve the read-only tools. In Claude Code, `.claude/settings.json`:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "mcp__icn__workspace",
+      "mcp__icn__investigate",
+      "mcp__icn__graph",
+      "mcp__icn__memory",
+      "mcp__icn__paper",
+      "mcp__icn__record"
+    ]
+  }
+}
+```
+
+Other clients express the same idea differently. Codex uses trusted-tool
+configuration in `~/.codex/config.toml`; Cursor and Windsurf expose per-server
+auto-approval in their MCP settings panels. The rule is the same everywhere:
+approve the tools that only read, and leave anything that writes to your files
+prompting.
+
+`record` is on the list because it writes only to ICN's own knowledge store,
+never to your source. `agit` is deliberately **not** on the list: it commits to
+`.agit/`, so it changes files on disk and should stay behind a prompt.
+
+A rejected or unapproved call is not a slow call. It is a call that never ran,
+and it will sit in the prompt for as long as nobody answers it. If ICN appears
+to hang, check for a pending approval before suspecting the indexer.
+
+## 4. Add the global agent instruction
+
+Steps 2 and 3 cover Claude Code per project. This covers every client, and is what you want if you would rather configure ICN once globally than per repository.
 
 ### Codex: `~/.codex/AGENTS.md`
 
@@ -75,7 +114,7 @@ Step 2 covers Claude Code per project. This covers every client, and is what you
 
 Use the same block in a repository-local `AGENTS.md` or `CLAUDE.md` when global configuration is not permitted.
 
-## 4. Expected agent workflow
+## 5. Expected agent workflow
 
 1. Open the current repository with `workspace(action="open")`.
 2. Investigate the task before broad file exploration or significant changes.

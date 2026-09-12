@@ -290,6 +290,36 @@ For repository-local enforcement, place the same block in that repository's
 `AGENTS.md` or `CLAUDE.md`. Global instructions are preferable when ICN should
 be used across every repository.
 
+### Approve the read-only tools once
+
+An instruction that tells the agent to call ICN constantly only works if
+calling it is cheap. If the client prompts for approval on every call, the
+agent waits on a human to answer each question it asks, and it will drift back
+to grepping instead. Pre-approve the tools that only read:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "mcp__icn__workspace",
+      "mcp__icn__investigate",
+      "mcp__icn__graph",
+      "mcp__icn__memory",
+      "mcp__icn__paper",
+      "mcp__icn__record"
+    ]
+  }
+}
+```
+
+That is `.claude/settings.json` for Claude Code; Codex, Cursor and Windsurf
+each expose the same idea in their own MCP settings. `record` writes only to
+ICN's knowledge store, so it belongs on the list. `agit` does not: it commits
+to `.agit/` and should keep prompting.
+
+Note that an unapproved call is not a slow call, it is a call that has not run
+yet. If ICN seems to hang, look for a pending approval prompt first.
+
 See [Agent setup and required instructions](AGENT_SETUP.md) for the full
 installation, verification, and copy-paste setup process.
 

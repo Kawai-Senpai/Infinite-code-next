@@ -9,6 +9,10 @@ asserting that the feature cannot take the tool down with it.
 from __future__ import annotations
 
 import pathlib
+import sys
+import threading
+import time
+import types
 
 import pytest
 
@@ -294,3 +298,138 @@ def test_every_intent_weights_semantics_below_lexical():
     for intent, weights in INTENT_WEIGHTS.items():
         assert "sem" in weights, intent
         assert 0 < weights["sem"] < weights["lex"], intent
+
+
+# ------------------------------------------------------ loading it exactly once
+
+def test_a_model_is_only_ever_fetched_once(monkeypatch):
+    """The regression that made a cold start cost an hour.
+
+    The old guard asked whether the model had finished loading, so every call
+    arriving DURING the download fell through and started another one.
+    load_encoder() prewarms on every miss, so one open() plus five
+    investigate() calls meant six concurrent 33MB fetches, all contending on
+    the same Hugging Face blob lock.
+    """
+    import threading
+
+    monkeypatch.setenv(embed.ENV_VAR, "some-org/slow-model")
+    fetches = []
+    started = threading.Event()
+
+    def fake_load(name):
+        fetches.append(name)
+        started.set()
+        time.sleep(0.4)                      # stand-in for the download
+        with embed._lock:
+            embed._encoders[name] = FakeEncoder()
+            event = embed._events.get(name)
+        if event is not None:
+            event.set()
+
+    monkeypatch.setattr(embed, "_load", fake_load)
+
+    embed.prewarm()                          # workspace(action='open')
+    assert started.wait(2), "the first fetch never started"
+    for _ in range(5):                       # each investigate()
+        assert embed.load_encoder() is None  # still loading: stays lexical
+    embed.prewarm(blocking=True)             # the background vector build
+
+    assert len(fetches) == 1
+    assert embed.load_encoder() is not None
+
+
+def test_a_blocking_caller_waits_for_an_in_flight_load(monkeypatch):
+    """It must join the download in progress, not start a second one."""
+    import threading
+
+    monkeypatch.setenv(embed.ENV_VAR, "some-org/slow-model")
+    fetches = []
+
+    def fake_load(name):
+        fetches.append(name)
+        time.sleep(0.3)
+        with embed._lock:
+            embed._encoders[name] = FakeEncoder()
+            event = embed._events.get(name)
+        if event is not None:
+            event.set()
+
+    monkeypatch.setattr(embed, "_load", fake_load)
+
+    embed.prewarm()                          # non-blocking, on its own thread
+    embed.prewarm(blocking=True)             # must wait, not re-fetch
+
+    assert len(fetches) == 1
+    assert embed.load_encoder() is not None
+
+
+def test_an_already_cached_model_loads_without_the_network(monkeypatch):
+    """model2vec defaults to force_download=True, so a repo id re-fetches all
+    33MB on every load. A cached snapshot must be handed over as a local path
+    instead, which is what makes the download once-per-machine."""
+    seen = {}
+
+    monkeypatch.setenv(embed.ENV_VAR, "some-org/cached-model")
+    monkeypatch.setattr(embed, "_cached_snapshot", lambda name: "/hf/cache/snapshots/abc")
+
+    class FakeStatic:
+        dim = 8
+
+        @classmethod
+        def from_pretrained(cls, path):
+            seen["path"] = path
+            return cls()
+
+        def encode(self, texts):
+            import numpy as np
+            return np.ones((len(texts), self.dim), dtype="float32")
+
+    monkeypatch.setitem(sys.modules, "model2vec",
+                        types.SimpleNamespace(StaticModel=FakeStatic))
+
+    embed.prewarm(blocking=True)
+    encoder = embed.load_encoder()
+
+    assert seen["path"] == "/hf/cache/snapshots/abc"      # not the repo id
+    # The stored-vector contract: encoder_id is the model name, never the
+    # resolved path, or vectors.refresh re-encodes the whole repository.
+    assert encoder.encoder_id == "some-org/cached-model"
+
+
+def test_preload_leaves_no_native_dll_for_a_worker_thread(monkeypatch):
+    """The 1-hour freeze, as an invariant.
+
+    A native extension that first loads on a background thread can park in the
+    Windows loader holding the process-wide loader lock, and every later import
+    on any thread blocks behind it. No timeout, no error, nothing returns.
+
+    preload_native() exists to load all of them on the main thread first. The
+    bug was that it covered numpy (via model2vec) but not huggingface_hub's
+    hf_xet.pyd or safetensors' Rust extension, which import lazily at download
+    time - on the prewarm thread. So: after preloading, a real load on a worker
+    thread must import no further .pyd.
+    """
+    pytest.importorskip("model2vec")
+    # The module-wide fixture turns semantics off; this test needs a real model
+    # or prewarm() returns without importing anything and proves nothing.
+    monkeypatch.setenv(embed.ENV_VAR, embed.DEFAULT_MODEL)
+
+    embed.preload_native()
+    before = set(sys.modules)
+
+    new: list[str] = []
+
+    def worker():
+        embed.prewarm(blocking=True)
+        new.extend(
+            name for name in set(sys.modules) - before
+            if str(getattr(sys.modules[name], "__file__", "") or "").endswith((".pyd", ".dll"))
+        )
+
+    thread = threading.Thread(target=worker, name="icn-embed-prewarm")
+    thread.start()
+    thread.join(180)
+
+    assert not thread.is_alive(), "the load thread never finished"
+    assert new == [], f"native extensions still first-loading on a worker thread: {new}"

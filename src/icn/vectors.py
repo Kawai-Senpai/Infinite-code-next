@@ -77,13 +77,29 @@ def _symbol_texts(conn: sqlite3.Connection) -> Iterable[tuple[str, str]]:
     meaning from a long tail. The body is included but truncated: beyond a
     few hundred characters, mean pooling washes the distinctive parts out.
     """
+    # Two linear scans, never a join. fts_symbols is an FTS5 virtual table, and
+    # FTS5 supports no secondary index, so `LEFT JOIN fts_symbols ON symbol_id`
+    # makes SQLite rescan the whole virtual table once PER symbol row:
+    #
+    #     SCAN f VIRTUAL TABLE INDEX 0: LEFT-JOIN
+    #
+    # That is quadratic. Measured on a 17k-symbol store, the join produced 512
+    # rows in 12s and all of them in ~300s, and it ran inside the tool call, so
+    # open() on a cold repository exceeded a 600s client timeout. Reading the
+    # bodies in one pass instead is linear.
+    #
+    # The bodies are truncated as they are read, not afterwards: the column
+    # holds whole file bodies, and the point is to keep the map to roughly
+    # (symbols x 600 chars) rather than the size of the corpus.
+    bodies = {
+        row["symbol_id"]: (row["body"] or "")[:600]
+        for row in rows(conn.execute("SELECT symbol_id, body FROM fts_symbols"))
+    }
     for row in rows(conn.execute(
-            "SELECT s.symbol_id, s.symbol_path, s.name, s.kind, s.signature,"
-            " f.body AS body FROM symbols s"
-            " LEFT JOIN fts_symbols f ON f.symbol_id = s.symbol_id"
-            " WHERE s.status = 'ACTIVE'")):
+            "SELECT symbol_id, symbol_path, name, kind, signature FROM symbols"
+            " WHERE status = 'ACTIVE'")):
         parts = [row["symbol_path"] or "", row["name"] or "", row["kind"] or "",
-                 row["signature"] or "", (row["body"] or "")[:600]]
+                 row["signature"] or "", bodies.get(row["symbol_id"], "")]
         yield row["symbol_id"], "\n".join(p for p in parts if p)
 
 

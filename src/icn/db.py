@@ -427,6 +427,46 @@ CREATE TABLE IF NOT EXISTS embeddings (
     PRIMARY KEY (scope, item_id)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_embeddings_encoder ON embeddings(encoder_id, scope);
+
+-- Block-level clone candidates: regions smaller than a whole symbol, which the
+-- symbol table structurally cannot represent. Duplicated logic is very often
+-- embedded inside two otherwise unrelated functions, so whole-function
+-- fingerprints miss the common case entirely.
+--
+-- Derived data, not knowledge: rebuilt wholesale whenever a file is re-stored,
+-- never anchored, never carrying a memory. That is why the rows may be deleted
+-- and reinserted freely, and why file_id cascades on delete - the opposite of
+-- the symbols table, whose identity must survive an edit.
+--
+-- Three fingerprints per row rather than one, because clone tiers differ in
+-- permissiveness and each tier needs its own exact-match index:
+--   content   Type 1, identical text
+--   alpha     Type 2, identical structure with identifiers consistently renamed
+--   skeleton  Type 3 seed, identifiers erased entirely
+CREATE TABLE IF NOT EXISTS clone_fragments (
+    fragment_id  TEXT PRIMARY KEY,
+    file_id      TEXT NOT NULL REFERENCES files(file_id) ON DELETE CASCADE,
+    symbol_path  TEXT NOT NULL,
+    lang         TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    start_byte   INTEGER NOT NULL,
+    end_byte     INTEGER NOT NULL,
+    line_start   INTEGER NOT NULL,
+    line_end     INTEGER NOT NULL,
+    token_count  INTEGER NOT NULL,
+    content_fingerprint  TEXT NOT NULL,
+    alpha_fingerprint    TEXT NOT NULL,
+    skeleton_fingerprint TEXT NOT NULL,
+    token_signature      TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+-- Clone lookup groups by (language, fingerprint): never compare across
+-- languages, since two grammars can normalise unrelated code to the same
+-- token stream.
+CREATE INDEX IF NOT EXISTS idx_fragments_alpha ON clone_fragments(lang, alpha_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_fragments_content ON clone_fragments(lang, content_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_fragments_skeleton ON clone_fragments(lang, skeleton_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_fragments_file ON clone_fragments(file_id);
 """
 
 

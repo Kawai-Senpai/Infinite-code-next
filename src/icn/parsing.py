@@ -51,7 +51,11 @@ from typing import Any
 #   7  module-level calls owned by a `<module>` pseudo-symbol, and receiver
 #      type bindings recorded per symbol so a call through a local variable
 #      or a field can be resolved to a method
-EXTRACT_VERSION = 7
+#   8  block-level clone fragments (extract_fragments), with alpha, content and
+#      skeleton fingerprints per fragment. Symbol fingerprints are unchanged by
+#      this step, so no anchor moves; the bump exists to backfill the new
+#      clone_fragments rows for files whose content did not change.
+EXTRACT_VERSION = 8
 
 _PARSERS: dict[str, Any] = {}
 
@@ -383,6 +387,159 @@ IGNORED_ANONYMOUS = {
     "(", ")", "[", "]", "{", "}",
     ",", ";", ":", ".", "->", "=>", "::",
 }
+
+
+# Fields whose identifier child sits on the right of a dot. NiCad's consistent
+# renaming renumbers every identifier including the receiver, so `cache.get(k)`
+# and `db.get(u)` both become `V1.get(V2)`. That is correct Type-2 behaviour and
+# we keep it.
+#
+# Being on the right of a dot is NOT on its own a reason to preserve a name.
+# Only a CALLED attribute is preserved (see is_called): `.strip()` and `.match()`
+# are API surface, so collapsing them would make a read and a delete hash alike,
+# but `req.email` and `data.address` are data fields whose names vary freely
+# between callers. Preserving those was measured to break the commonest real
+# case this feature exists to catch - one validation block copied between two
+# modules that spell the same field differently.
+#
+# `attribute`  Python  a.b          -> b
+# `field`      Go, Java, JS, Rust   -> the selected field
+# `property`   JS/TS member exprs
+ATTRIBUTE_FIELDS = {"attribute", "field", "property"}
+
+# Leaf node types that NAME an attribute rather than bind a variable. These are
+# the second route to the same distinction: Python marks `.get` by its parent's
+# field name, while JS and Go give it a distinct leaf type outright. Both are
+# checked, because relying on either alone silently renames method names in
+# half the supported languages.
+ATTRIBUTE_TYPES = {
+    "property_identifier",   # JS/TS   o.attr
+    "field_identifier",      # Go, Rust  o.Attr
+}
+
+# Leaves that bind or reference a variable, and so get a placeholder.
+# `type_identifier` is deliberately absent: a type is API surface like an
+# attribute, and renaming it would make `List[int]` and `Dict[str]` collide.
+IDENTIFIER_TYPES = {
+    "identifier",
+    "word",                  # some grammars' generic identifier
+    "simple_identifier",     # Kotlin
+    "shorthand_property_identifier",
+}
+
+# Literal leaves, folded to their bare type so a changed constant does not
+# split a clone class: `timeout = 30` and `timeout = 60` are the same logic.
+# Matched by suffix as well as by name, because every grammar spells these
+# differently (integer / int_literal / decimal_integer_literal / ...).
+LITERAL_TYPES = {
+    "integer", "float", "number", "true", "false", "none", "null", "nil",
+    "string_content", "string_fragment", "interpreted_string_literal_content",
+    "raw_string_literal", "character", "boolean_literal",
+}
+
+LITERAL_SUFFIXES = ("_literal", "_literal_content")
+
+
+def _is_literal(node_type: str) -> bool:
+    return node_type in LITERAL_TYPES or node_type.endswith(LITERAL_SUFFIXES)
+
+
+def alpha_normalize(node, source: bytes) -> list[str]:
+    """Consistent renaming: each distinct identifier becomes V1, V2, ... in
+    first-appearance order, while identical names keep identical placeholders.
+
+    This is the middle tier of the three canonical forms, and the only one
+    trustworthy enough to drive a refactoring recommendation:
+
+        content   identifiers kept       `total` != `result`
+        alpha     identifiers renumbered `total` == `result`, `V1=V2` != `V1=V1`
+        skeleton  identifiers erased     `V1=V2` == `V1=V1`
+
+    Skeleton is deliberately permissive because the anchor cascade adjudicates
+    afterwards with token_similarity. Nothing adjudicates a clone report, so
+    alpha has to carry its own precision. Consistent renaming is what buys it:
+    a fragment that assigns a variable to itself and one that assigns from
+    another variable are structurally different programs, and skeleton cannot
+    tell them apart.
+
+    Attribute names survive (see ATTRIBUTE_FIELDS); literals are folded to
+    their node type so `timeout = 30` and `timeout = 60` are one clone, which
+    is what makes a "same logic, different constant" duplicate findable.
+    """
+    out: list[str] = []
+    names: dict[str, str] = {}
+
+    def placeholder(text: str) -> str:
+        slot = names.get(text)
+        if slot is None:
+            slot = f"V{len(names) + 1}"
+            names[text] = slot
+        return slot
+
+    def field_of(n) -> str | None:
+        parent = n.parent
+        if parent is None:
+            return None
+        for i in range(parent.child_count):
+            if parent.child(i) == n:
+                return parent.field_name_for_child(i)
+        return None
+
+    def is_called(n) -> bool:
+        """Is this attribute access the function of a call?
+
+        `req.email` and `data.address` are DATA fields and must be renamed, or
+        two copies of the same validation block stop matching just because one
+        struct spells the field differently. `.strip()` and `.match()` are
+        METHOD names and must be kept, or a read and a delete collapse into one
+        clone. The grammar separates them: a method's attribute node is the
+        `function` field of an enclosing call.
+        """
+        attr = n.parent
+        if attr is None:
+            return False
+        return field_of(attr) == "function"
+
+    def is_attribute(n) -> bool:
+        if n.type in ATTRIBUTE_TYPES:
+            return is_called(n)
+        return field_of(n) in ATTRIBUTE_FIELDS and is_called(n)
+
+    def skip(n) -> bool:
+        return n.type in COMMENT_TYPES or bool(getattr(n, "is_extra", False))
+
+    def emit_leaf(n) -> None:
+        if not n.is_named:
+            if n.type not in IGNORED_ANONYMOUS:
+                out.append("@" + n.type)
+            return
+        if _is_literal(n.type):
+            # The type alone. A changed constant is the commonest Type-2 edit
+            # and must not split a clone class.
+            out.append(n.type)
+        elif n.type in IDENTIFIER_TYPES and not is_attribute(n):
+            out.append(placeholder(_node_text(n, source)))
+        else:
+            out.append(f"{n.type}:{_node_text(n, source)}")
+
+    def walk(n) -> None:
+        if skip(n):
+            return
+        if not n.children:
+            emit_leaf(n)
+            return
+        out.append("(" + n.type)
+        for child in n.children:
+            if skip(child):
+                continue
+            if child.is_named:
+                walk(child)
+            elif child.type not in IGNORED_ANONYMOUS:
+                out.append("@" + child.type)
+        out.append(")")
+
+    walk(node)
+    return out
 
 
 def normalize(node, source: bytes, keep_identifiers: bool,
@@ -995,6 +1152,127 @@ def _symbols_from_tags(tree, source: bytes, lang: str) -> list[ParsedSymbol]:
     if module is not None:
         symbols.append(module)
     return symbols
+
+
+# Minimum size, in NORMALISED tokens, for a fragment to be worth storing.
+#
+# Not PMD CPD's 50-100. That guidance is in RAW lexical tokens and does not
+# transfer: normalize() emits structural markers (`(node_type`, `@operator`)
+# that inflate the count far above a lexer's. Measured over 2787 fragments in
+# src/icn, p50=91 and p90=405, and floors of 20 and 30 filter NOTHING - they
+# return identical counts. Real discrimination happens between 40 and 100:
+#
+#     floor 20 -> 2787      floor  60 -> 1863
+#     floor 30 -> 2787      floor 100 -> 1319
+#
+# 60 is the chosen start: it removes a third of the rows while keeping
+# fragments as small as the four-line validation block clone detection exists
+# to catch. Applied BEFORE insert, never at query time.
+MIN_FRAGMENT_TOKENS = 60
+
+# Bodies worth extracting as fragments in their own right. A clone is very
+# often a loop body or a guard block repeated inside two otherwise unrelated
+# functions, which whole-symbol fingerprints structurally cannot see: visit()
+# computes fingerprints only for declaration nodes and never decomposes a
+# function body. NiCad supports block granularity for exactly this reason.
+_FRAGMENT_NODES = {
+    "block", "statement_block", "compound_statement",
+    "if_statement", "else_clause", "elif_clause",
+    "for_statement", "while_statement", "do_statement",
+    "foreach_statement", "for_in_statement", "for_range_loop",
+    "try_statement", "catch_clause", "except_clause", "finally_clause",
+    "with_statement", "switch_statement", "match_statement",
+    "case_statement", "match_arm", "switch_case", "when_entry",
+}
+
+
+@dataclass
+class ParsedFragment:
+    """A syntactically meaningful region worth comparing against other code.
+
+    Deliberately not a symbol: it has no name, no identity across edits, and
+    no anchor. Fragments are derived data, rebuilt from scratch whenever their
+    file is re-stored, so nothing is lost by deleting and re-inserting them.
+    """
+    symbol_path: str
+    lang: str
+    kind: str
+    start_byte: int
+    end_byte: int
+    line_start: int
+    line_end: int
+    token_count: int
+    content_fingerprint: str
+    alpha_fingerprint: str
+    skeleton_fingerprint: str
+    token_signature: str
+
+
+def extract_fragments(source: bytes, lang: str,
+                      min_tokens: int = MIN_FRAGMENT_TOKENS) -> list[ParsedFragment]:
+    """Block-level clone candidates for one file.
+
+    Separate from parse_file rather than folded into it, because parse_file's
+    output feeds anchoring: every fingerprint it produces is load-bearing for
+    memories already stored against this code. Keeping fragment extraction on
+    its own path means the symbol fingerprints stay byte-identical and no
+    existing anchor moves.
+
+    Regions are nested by nature - a function body contains an if body contains
+    a loop body - and every level is a legitimate clone candidate at a
+    different granularity, so nesting is kept. Clustering, not extraction, is
+    where overlapping matches get merged into their maximal region.
+    """
+    parser = get_parser(lang)
+    if parser is None:
+        return []
+    try:
+        tree = parser.parse(source)
+    except Exception:
+        return []
+
+    fragments: list[ParsedFragment] = []
+    seen: set[tuple[int, int]] = set()
+
+    def walk(node, enclosing: str) -> None:
+        for child in _semantic_children(node):
+            name = _name_of(child, source)
+            owner = enclosing
+            if child.type in SYMBOL_NODES.get(lang, {}) and name:
+                owner = f"{enclosing}.{name}" if enclosing else name
+                _emit(child, owner, child.type)
+            elif child.type in _FRAGMENT_NODES:
+                _emit(child, owner, child.type)
+            walk(child, owner)
+
+    def _emit(node, owner: str, kind: str) -> None:
+        # A body that is its parent's only child spans the same bytes as the
+        # parent, so storing both would report a fragment as a clone of itself.
+        span = (node.start_byte, node.end_byte)
+        if span in seen:
+            return
+        content = normalize(node, source, keep_identifiers=True)
+        if len(content) < min_tokens:
+            return
+        seen.add(span)
+        fragments.append(ParsedFragment(
+            symbol_path=owner,
+            lang=lang,
+            kind=kind,
+            start_byte=node.start_byte,
+            end_byte=node.end_byte,
+            line_start=node.start_point[0] + 1,
+            line_end=node.end_point[0] + 1,
+            token_count=len(content),
+            content_fingerprint=_sha("".join(content)),
+            alpha_fingerprint=_sha("".join(alpha_normalize(node, source))),
+            skeleton_fingerprint=_sha("".join(
+                normalize(node, source, keep_identifiers=False))),
+            token_signature=token_signature(content),
+        ))
+
+    walk(tree.root_node, "")
+    return fragments
 
 
 def parse_file(path: Path, source: bytes, lang: str) -> list[ParsedSymbol]:

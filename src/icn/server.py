@@ -38,6 +38,7 @@ from . import briefing as briefing_mod
 from . import catalog as catalog_mod
 from . import causal
 from . import compiler
+from . import embed as embed_mod
 from . import graph as graph_mod
 from . import history as history_mod
 from . import papers as papers_mod
@@ -1168,4 +1169,8 @@ def paper(
 
 
 def main() -> None:
+    # Before mcp.run(), never after: loading numpy's native extensions once the
+    # stdio server owns the process wedges in the Windows loader and the first
+    # workspace(action='open') never returns. See embed.preload_native.
+    embed_mod.preload_native()
     mcp.run("stdio")

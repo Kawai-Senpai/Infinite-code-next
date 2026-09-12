@@ -7,6 +7,7 @@ dist/
 .venv/
 venv/
 .agit/
+.claude
 
 # Planning notes: exploratory thinking and the build plan. Kept locally,
 # not part of the shipped artifact.

@@ -28,10 +28,20 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import flows, ids, imports as import_resolution, parsing
+from .diagnostics import TEST_PATH
 from .db import jdump, jload, one, rows, write_tx
 from .identity import changed_files, run_git
 
 MAX_FILE_BYTES = 2_000_000
+
+# Largest file a budgeted pass will attempt. Nothing is dropped: a file over
+# this size is handed to the unbudgeted background run, which indexes it in
+# full. It exists because one file can outlast the whole budget - on
+# whatsapp-ghost, minified vendor bundles of 284 KB to 1.1 MB each took 8-12s
+# of tree-sitter apiece against an 8s budget, while ordinary source files parse
+# in milliseconds. The budget can only be checked between files, so without
+# this the first big file overruns it however often the clock is read.
+BUDGETED_FILE_BYTES = 128_000
 CALL_BATCH = 300
 
 # How much each call-resolution tier is worth, as (edge_class, confidence).
@@ -132,6 +142,24 @@ def walk_source_files(root: Path, extra_excludes: Iterable[str] = ()) -> list[Pa
     return list(iter_source_files(root, extra_excludes))
 
 
+def _defer_under_budget(path: Path) -> bool:
+    """Is this file too large to attempt while a budget is running?"""
+    try:
+        return path.stat().st_size > BUDGETED_FILE_BYTES
+    except OSError:
+        return False
+
+
+def _is_test_path(rel_path: str) -> bool:
+    """Whether a path is test code, for clone extraction.
+
+    Reuses diagnostics.TEST_PATH rather than restating the pattern: two copies
+    of this regex would drift, and one of them would then disagree with the
+    other about what counts as a test.
+    """
+    return bool(TEST_PATH.search(rel_path.lower()))
+
+
 class Indexer:
     def __init__(self, conn: sqlite3.Connection, root: Path, repo_id: str,
                  excludes: Iterable[str] = ()):
@@ -143,6 +171,10 @@ class Indexer:
         # Import resolution is a second pass too, so it needs its own touched
         # set: symbol ids and file ids are not interchangeable.
         self._touched_files: set[str] = set()
+        # Set by resolve_calls when it stopped at a deadline rather than
+        # finishing. Read by full_index, which must report a truncated run so
+        # the background pass re-resolves what was left.
+        self.resolution_truncated = False
 
     # ------------------------------------------------------------------ files
 
@@ -176,6 +208,16 @@ class Indexer:
             "digest": parsing.content_hash(data),
             "symbols": parsing.parse_file(abs_path, data, lang),
             "imports": parsing.file_import_specs(data, lang),
+            # Computed here, with the parse, so it lands outside the write
+            # transaction for the same reason parsing does: tree-sitter must
+            # never run while holding SQLite's write lock.
+            #
+            # Test files are skipped outright. Duplicated setup between tests
+            # is deliberate - a test that shares a fixture with the code under
+            # test stops being an independent check - so reporting it as a
+            # clone would train the agent to ignore the whole report.
+            "fragments": ([] if _is_test_path(rel_path)
+                          else parsing.extract_fragments(data, lang)),
         }
 
     def index_file(self, abs_path: Path, commit: str | None) -> dict[str, Any]:
@@ -244,11 +286,39 @@ class Indexer:
             )
 
         stats = self._sync_symbols(file_id, rel_path, symbols, commit)
+        self._sync_fragments(file_id, parsed.get("fragments") or [])
         self._touched_files.add(file_id)
         result = {"path": rel_path, "symbols": len(symbols), **stats}
         if backfilling:
             result["backfilled"] = True
         return result
+
+    # -------------------------------------------------------------- fragments
+
+    def _sync_fragments(self, file_id: str, fragments: list) -> int:
+        """Replace this file's clone fragments wholesale.
+
+        Delete-then-insert rather than the reconciliation _sync_symbols does,
+        because a fragment has no identity worth preserving: nothing anchors to
+        it, no memory references it, and it carries no history. Matching old
+        rows to new ones would buy nothing and cost a comparison per fragment
+        on every re-store.
+        """
+        self.conn.execute("DELETE FROM clone_fragments WHERE file_id=?", (file_id,))
+        if not fragments:
+            return 0
+        stamp = now()
+        self.conn.executemany(
+            "INSERT INTO clone_fragments (fragment_id, file_id, symbol_path, lang,"
+            " kind, start_byte, end_byte, line_start, line_end, token_count,"
+            " content_fingerprint, alpha_fingerprint, skeleton_fingerprint,"
+            " token_signature, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(ids.new_id(ids.FRAGMENT), file_id, f.symbol_path, f.lang, f.kind,
+              f.start_byte, f.end_byte, f.line_start, f.line_end, f.token_count,
+              f.content_fingerprint, f.alpha_fingerprint, f.skeleton_fingerprint,
+              f.token_signature, stamp) for f in fragments])
+        return len(fragments)
 
     # ---------------------------------------------------------------- symbols
 
@@ -518,7 +588,8 @@ class Indexer:
             return hit, "unique_global", 1
         return None, "ambiguous", len(candidates)
 
-    def resolve_calls(self, symbol_ids: set[str] | None, commit: str | None) -> int:
+    def resolve_calls(self, symbol_ids: set[str] | None, commit: str | None,
+                      deadline: float | None = None) -> int:
         """Second pass: turn recorded call names into tiered CALLS edges.
 
         This has to be a separate pass. Call targets are resolved by name, and
@@ -531,8 +602,20 @@ class Indexer:
         could not decide: an ambiguous or unknown callee lands in
         unresolved_calls so a later query can say how many callers it is
         provably not showing.
+
+        `deadline` is a wall-clock time (time.time()) after which the pass
+        stops between batches and sets `resolution_truncated`. It resolves
+        fewer symbols; it never leaves one half-resolved, because a symbol's
+        outgoing edges are rewritten wholesale inside one transaction.
         """
+        self.resolution_truncated = False
         if symbol_ids is not None and not symbol_ids:
+            return 0
+        if deadline is not None and time.time() > deadline:
+            # Reading every symbol row and building the resolution tables is
+            # itself minutes of work on a large repository, so the check comes
+            # before the query, not after it.
+            self.resolution_truncated = True
             return 0
         if symbol_ids is None:
             source_rows = rows(self.conn.execute(
@@ -563,6 +646,9 @@ class Indexer:
         created = 0
         stamp = now()
         for start in range(0, len(source_rows), CALL_BATCH):
+            if deadline is not None and time.time() > deadline:
+                self.resolution_truncated = True
+                break
             with write_tx(self.conn):
                 for row in source_rows[start:start + CALL_BATCH]:
                     # Re-resolving replaces this symbol's outgoing call facts
@@ -608,9 +694,16 @@ class Indexer:
 
     def full_index(self, commit: str | None, budget_seconds: float | None = None) -> dict[str, Any]:
         started = time.time()
+        # A deadline, not a duration: every pass below has to be able to ask
+        # "is there time left" without knowing when the run started. Only None
+        # means unbudgeted - budget_seconds=0 means "no time at all".
+        deadline = (started + budget_seconds) if budget_seconds is not None else None
         report = {"mode": "full", "files_seen": 0, "files_indexed": 0,
-                  "symbols": 0, "skipped": 0, "truncated": False}
+                  "symbols": 0, "skipped": 0, "deferred": 0, "truncated": False}
         seen_paths: set[str] = set()
+
+        def out_of_time() -> bool:
+            return deadline is not None and time.time() > deadline
 
         # Discovery is streamed and batched: one transaction per file on a
         # 4000-file repo is thousands of fsyncs, and the budget must cover
@@ -623,6 +716,22 @@ class Indexer:
             # Parse first, with no lock held.
             parsed_batch = []
             for path in batch:
+                # The clock is read per file, not per batch. Asking only
+                # between batches let one batch run unchecked for minutes:
+                # whatsapp-ghost holds 25,641 symbols in 37 files, so its very
+                # first batch was the entire repository and an 8s budget
+                # produced a 275s open.
+                if out_of_time():
+                    report["truncated"] = True
+                    break
+                if deadline is not None and _defer_under_budget(path):
+                    # Deferred, not skipped: the run is marked truncated, so
+                    # the background pass that follows indexes this file with
+                    # no budget at all. The final index is identical either
+                    # way; only the order of the work changes.
+                    report["deferred"] += 1
+                    report["truncated"] = True
+                    continue
                 parsed = self.read_and_parse(path)
                 if parsed is None or parsed.get("skipped"):
                     report["skipped"] += 1
@@ -631,7 +740,9 @@ class Indexer:
             batch.clear()
             if not parsed_batch:
                 return
-            # Then write, holding the lock only for the inserts.
+            # Then write, holding the lock only for the inserts. Everything
+            # parsed is stored even when the budget ran out mid-batch: the
+            # deadline stops new work, it never throws away work already done.
             with write_tx(self.conn):
                 for parsed in parsed_batch:
                     result = self.store_parsed(parsed, commit)
@@ -645,7 +756,7 @@ class Indexer:
             batch.append(abs_path)
             if len(batch) >= 40:
                 flush()
-                if budget_seconds and (time.time() - started) > budget_seconds:
+                if report["truncated"] or out_of_time():
                     report["truncated"] = True
                     break
         if not report["truncated"]:
@@ -655,27 +766,64 @@ class Indexer:
             with write_tx(self.conn):
                 report["files_tombstoned"] = self._tombstone_missing(seen_paths, commit)
 
+        if report["truncated"]:
+            # The passes below are whole-repository by nature, and on a large
+            # repository each costs more than the walk that precedes them. Over
+            # a symbol table that is knowingly incomplete they spend that cost
+            # on a result the background full index is about to recompute from
+            # nothing, which is how a budgeted first index still answered in
+            # 275s. Defer them; the caller sees index_state "partial" until the
+            # unbudgeted background run lands.
+            report["import_edges"] = {"resolved": 0, "external": 0, "files": 0,
+                                      "deferred": "index truncated"}
+            report["call_edges"] = 0
+            report["entry_points"] = {"deferred": "index truncated"}
+            report["areas"] = {"deferred": "index truncated"}
+            report["seconds"] = round(time.time() - started, 2)
+            return report
+
         # Second pass. Imports resolve first: tiered call resolution consults
         # the IMPORTS edges to prefer a callee this file can actually reach.
+        #
+        # Both stop at the same deadline the walk used, and stopping is safe to
+        # resume because each rewrites one file's or one symbol's edges
+        # wholesale: what was processed is complete, what was not is untouched,
+        # and the background run re-resolves the lot with no budget at all.
         report["import_edges"] = import_resolution.resolve_file_imports(
-            self.conn, None, commit)
-        report["call_edges"] = self.resolve_calls(None, commit)
+            self.conn, None, commit, deadline=deadline)
+        if report["import_edges"].get("truncated"):
+            report["truncated"] = True
+        report["call_edges"] = self.resolve_calls(None, commit, deadline=deadline)
+        if self.resolution_truncated:
+            report["truncated"] = True
 
         # Third pass. Entry points need every symbol present; communities need
         # every call edge, so both have to follow resolution rather than run
-        # alongside it.
-        report["entry_points"] = flows.detect_entry_points(self.conn, commit)
-        report["areas"] = flows.detect_communities(self.conn)
+        # alongside it - and neither is worth computing over a graph still
+        # missing edges.
+        if report["truncated"]:
+            report["entry_points"] = {"deferred": "index truncated"}
+            report["areas"] = {"deferred": "index truncated"}
+        else:
+            report["entry_points"] = flows.detect_entry_points(self.conn, commit)
+            report["areas"] = flows.detect_communities(self.conn)
 
         report["seconds"] = round(time.time() - started, 2)
         return report
 
-    def incremental_index(self, commit: str | None, since_commit: str | None) -> dict[str, Any]:
-        """Index only what git says changed, plus everything uncommitted."""
+    def incremental_index(self, commit: str | None, since_commit: str | None,
+                          budget_seconds: float | None = None) -> dict[str, Any]:
+        """Index only what git says changed, plus everything uncommitted.
+
+        `budget_seconds` bounds only the full-index fallback below. The
+        incremental path itself is bounded by the size of the edit, but the
+        fallback is a whole-repository walk and must not run unbudgeted in the
+        foreground just because git could not say what changed.
+        """
         started = time.time()
         paths_changed, complete = changed_files(self.root, since_commit)
         if not complete:
-            return self.full_index(commit)
+            return self.full_index(commit, budget_seconds=budget_seconds)
 
         report = {"mode": "incremental", "files_seen": len(paths_changed),
                   "files_indexed": 0, "symbols": 0, "skipped": 0, "files_tombstoned": 0}

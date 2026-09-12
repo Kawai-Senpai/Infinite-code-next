@@ -54,6 +54,17 @@ _encoders: dict[str, Any] = {}
 _started: set[str] = set()
 _errors: dict[str, str] = {}
 
+# One event per model, created by whichever caller wins the race to start the
+# load. Its presence in this dict IS the "a load is already in flight" flag,
+# and it is what a blocking caller waits on instead of starting a download of
+# its own. `_started` cannot serve that purpose: it stays set after the load
+# finishes, so it cannot distinguish in-flight from done.
+_events: dict[str, threading.Event] = {}
+
+# A blocking waiter is always a background thread, never a tool call, but it
+# must not outlive a fetch that has genuinely wedged.
+LOAD_WAIT_SECONDS = 300.0
+
 
 class Encoder(Protocol):
     """The whole contract. Swapping models is a config change, not a rewrite."""
@@ -108,8 +119,8 @@ def configured_model() -> str:
     return ALIASES.get(raw.lower(), raw)
 
 
-def _load(name: str) -> None:
-    """Import, download and construct. Runs on the prewarm thread."""
+def _configure_environment() -> None:
+    """Environment the model stack needs, set before anything imports it."""
     # Hugging Face caches by symlinking blobs into snapshot directories. On
     # Windows that needs developer mode or admin rights, and without them the
     # download dies with WinError 1314 partway through. Copying instead costs
@@ -121,10 +132,117 @@ def _load(name: str) -> None:
     # there would corrupt the protocol framing, not merely look untidy.
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+
+# Every module in the load path that carries a native extension, imported on
+# the main thread before any worker exists. See preload_native.
+#
+# `import model2vec` alone is not enough, and that gap is what cost the hour.
+# It pulls in numpy but NOT huggingface_hub, and huggingface_hub downloads
+# through hf_xet.pyd, a Rust extension that neither `import huggingface_hub`
+# nor `import huggingface_hub.file_download` loads: it arrives lazily, at the
+# moment the first real download runs, on the prewarm thread. safetensors is a
+# second Rust extension, loaded when the weights are actually read.
+#
+# Derived by measurement, not by guesswork: with this list preloaded, a cold
+# load on a background thread imports zero further .pyd files. Anything missing
+# here is a DLL that would load on a worker thread, which is the bug.
+_NATIVE_MODULES = (
+    "model2vec",                 # pulls numpy and its OpenBLAS DLL
+    "huggingface_hub",
+    "hf_xet",                    # Rust downloader
+    "safetensors", "safetensors.numpy",   # Rust weight reader
+    "yaml",                      # C extension (_yaml)
+    "sqlite3",
+    "brotli", "urllib3", "requests",      # transport, _brotli is native
+)
+
+
+def preload_native() -> None:
+    """Load the numpy/model2vec native extensions NOW, on the importing thread.
+
+    Deadlock, Windows, every cold MCP start, no timeout and no error: the tool
+    call simply never returns.
+
+    numpy's `_multiarray_umath` extension and the OpenBLAS DLL behind it do
+    real work in their DllMain-time initialisation. Loading them from a thread
+    while the stdio server owns the process's standard handles wedges inside
+    the Windows loader: the thread parks in an Executive wait and never
+    resumes. Measured on a bare FastMCP server whose only tool body was
+    `import numpy` - it hung indefinitely, and moving that same import to
+    module scope returned in 1.0s. So this is not an ICN bug, but ICN has to
+    dodge it.
+
+    ICN reaches that import lazily, from the prewarm thread, on the first
+    workspace(action='open'). That is precisely the deadlocking shape, and it
+    is why open() hung forever with semantic search on (never returning in
+    300s) yet finished in 2.0s with ICN_EMBED_MODEL=none.
+
+    Calling this at server import time - before mcp.run() takes over stdio and
+    before any worker thread exists - loads the DLLs on the main thread, where
+    the loader behaves. Every later import is then a sys.modules hit. Costs a
+    few hundred milliseconds of startup and never raises: if the model stack
+    is missing or broken, semantic search degrades to lexical exactly as it
+    did before, and _load records the real error.
+    """
+    _configure_environment()
+    try:
+        import model2vec  # noqa: F401  - imported for its side effect
+    except Exception:     # noqa: BLE001 - see module docstring
+        pass
+
+    for module in _NATIVE_MODULES:
+        try:
+            __import__(module)
+        except Exception:  # noqa: BLE001 - absent or broken; see module docstring
+            pass
+
+
+def _cached_snapshot(name: str) -> str | None:
+    """The model's directory in the shared Hugging Face cache, if already there.
+
+    model2vec's `StaticModel.from_pretrained` defaults to `force_download=True`
+    (0.9.0), so passing it a repo id re-fetches all 33MB on EVERY load and
+    ignores a cache that already holds the file. That is why the model appeared
+    to download again on every server start, and why a flaky or slow link
+    turned a load into an open-ended stall instead of a cache hit.
+
+    Handing it a local directory sidesteps the hub entirely: measured on this
+    machine, 0.19s from cache against 1.44s through the network path, and no
+    network dependency at all. Downloaded once per machine, reused for as long
+    as the cache lives.
+
+    Returns None when the model has genuinely never been fetched here, which is
+    the one case that does need the network.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(name, local_files_only=True)
+    except Exception:    # noqa: BLE001 - not cached, or no hub; fall back to the network
+        return None
+
+
+def _load(name: str) -> None:
+    """Import, download and construct. Runs on the prewarm thread.
+
+    The heavy native import is normally already done by preload_native at
+    server startup, so `from model2vec import ...` here is a sys.modules
+    lookup rather than a DLL load. See preload_native for why that matters.
+    """
+    _configure_environment()
+
     try:
         from model2vec import StaticModel
 
-        encoder: Any = _StaticEncoder(StaticModel.from_pretrained(name), name)
+        # A local snapshot path when the machine already has it, the repo id
+        # only on the genuine first fetch. See _cached_snapshot.
+        source = _cached_snapshot(name) or name
+
+        # encoder_id stays the model NAME, never the resolved path: it is what
+        # vectors.refresh compares against the stored encoder to decide whether
+        # existing vectors are still valid. A path here would differ from what
+        # earlier runs recorded and silently re-encode the whole repository.
+        encoder: Any = _StaticEncoder(StaticModel.from_pretrained(source), name)
         error = ""
     except Exception as exc:         # noqa: BLE001 - never raise, see module docstring
         encoder, error = None, f"{type(exc).__name__}: {exc}"[:300]
@@ -133,6 +251,13 @@ def _load(name: str) -> None:
         _encoders[name] = encoder
         if error:
             _errors[name] = error
+        event = _events.get(name)
+
+    # After the result is published, never before: a waiter that woke early
+    # would look up an encoder that is not in the dict yet and conclude the
+    # model was unavailable.
+    if event is not None:
+        event.set()
 
 
 def prewarm(model: str | None = None, blocking: bool = False) -> None:
@@ -141,18 +266,36 @@ def prewarm(model: str | None = None, blocking: bool = False) -> None:
     Called on workspace open so the 33MB fetch happens while the agent is
     reading the briefing, not in the middle of its first question. Returns
     immediately unless `blocking`, which only tests should need.
+
+    "Once per process" is load-bearing and was previously not enforced. The
+    guard tested `name in _encoders`, which is only true once the load has
+    FINISHED, so every call arriving while the model was still downloading
+    fell through and started another one. load_encoder() calls this on every
+    miss, so a cold start spawned a fresh 33MB download per investigate() -
+    all of them contending on the same huggingface_hub blob lock, each
+    re-fetching the same file. That is what turned a 2s cold start into an
+    hour under an agent, while a single manual call stayed fast.
     """
     name = model if model is not None else configured_model()
     if not name:
         return
 
     with _lock:
-        if name in _started:
-            already = name in _encoders
-        else:
+        if name in _encoders:      # already loaded, or failed and recorded
+            return
+        event = _events.get(name)
+        if event is None:
+            event = _events[name] = threading.Event()
             _started.add(name)
-            already = False
-    if already:
+            ours = True
+        else:
+            ours = False
+
+    if not ours:
+        # Someone is already fetching this model. Joining their download is
+        # the entire point; starting a second one is the bug above.
+        if blocking:
+            event.wait(LOAD_WAIT_SECONDS)
         return
 
     if blocking:
@@ -217,3 +360,8 @@ def reset_cache() -> None:
         _encoders.clear()
         _started.clear()
         _errors.clear()
+        # Any in-flight loader is released, so a test that switches models is
+        # never left waiting on an event nothing will ever set.
+        for event in _events.values():
+            event.set()
+        _events.clear()

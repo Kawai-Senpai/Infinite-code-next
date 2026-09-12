@@ -33,6 +33,8 @@ from .identity import read_repo_config
 from .lease import Lease
 
 FIRST_INDEX_BUDGET = 8.0     # seconds before we hand back a partial index
+ANCHOR_BUDGET = 5.0          # seconds of anchor sweeping before the rest goes background
+SEMANTIC_FOREGROUND_LIMIT = 512   # items encoded in a tool call before the rest goes background
 _BACKGROUND: dict[str, threading.Thread] = {}
 _LOCK = threading.Lock()
 
@@ -155,6 +157,52 @@ def _background_finish(repo_id: str, root: Path, commit: str | None, excludes: l
             _BACKGROUND.pop(repo_id, None)
 
 
+_ANCHOR_BG: dict[str, threading.Thread] = {}
+
+
+def _anchor_finish(repo_id: str, root: Path, commit: str | None) -> None:
+    """Finish a truncated anchor sweep without blocking the caller.
+
+    Runs unbudgeted: the point of the foreground budget is to answer quickly,
+    not to leave anchors permanently unswept. Opens its own connection because
+    sqlite3 connections belong to the thread that created them.
+    """
+    store = None
+    try:
+        store = init_repo_store(paths.repo_db_path(repo_id))
+        anchor_mod.rebase_extractor_change(store, root)
+        anchor_mod.verify_repo(store, root, commit)
+    except Exception:
+        # Same rule as the background indexer: this must never take the server
+        # down. The next open simply sweeps again.
+        pass
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except sqlite3.Error:
+                pass
+        with _LOCK:
+            _ANCHOR_BG.pop(repo_id, None)
+
+
+def _start_anchor_finish(ws: Workspace) -> None:
+    """Hand the rest of a truncated anchor sweep to a background thread."""
+    with _LOCK:
+        existing = _ANCHOR_BG.get(ws.repo_id)
+        if existing is not None and existing.is_alive():
+            return
+        thread = threading.Thread(
+            target=_anchor_finish, args=(ws.repo_id, ws.root, ws.commit),
+            daemon=True, name=f"icn-anchors-{ws.repo_id}",
+        )
+        _ANCHOR_BG[ws.repo_id] = thread
+    thread.start()
+
+
+_SEMANTIC_BG: dict[str, threading.Thread] = {}
+
+
 def _build_semantics_later(repo_id: str) -> None:
     """Wait for the model to finish downloading, then encode the repository.
 
@@ -181,18 +229,46 @@ def _build_semantics_later(repo_id: str) -> None:
     finally:
         if store is not None:
             store.close()
+        with _LOCK:
+            _SEMANTIC_BG.pop(repo_id, None)
+
+
+def _start_semantic_build(ws: Workspace) -> bool:
+    """Hand the rest of the encode to a background thread. Single-flight."""
+    with _LOCK:
+        existing = _SEMANTIC_BG.get(ws.repo_id)
+        if existing is not None and existing.is_alive():
+            return False
+        thread = threading.Thread(target=_build_semantics_later, args=(ws.repo_id,),
+                                  daemon=True, name=f"icn-embed-build-{ws.repo_id}")
+        _SEMANTIC_BG[ws.repo_id] = thread
+    thread.start()
+    return True
 
 
 def _refresh_semantics(ws: Workspace) -> dict[str, Any]:
     """Encode new or changed content, or arrange for it once the model lands."""
     encoder = embed_mod.load_encoder()
     if encoder is not None:
-        return vectors_mod.refresh(ws.store, encoder)
+        # Bounded, like the index and anchor passes above it. Encoding is
+        # proportional to repository size, and unbounded it runs INSIDE the
+        # tool call: on a cold repo the first investigate() after the model
+        # landed spent 67s encoding every symbol before it answered. The
+        # remainder goes to the same background builder that handles a model
+        # arriving late, so retrieval improves as it fills rather than making
+        # one call pay for all of it.
+        report = vectors_mod.refresh(ws.store, encoder, limit=SEMANTIC_FOREGROUND_LIMIT)
+        if report.get("encoded", 0) >= SEMANTIC_FOREGROUND_LIMIT:
+            report["truncated"] = _start_semantic_build(ws)
+        return report
 
     state = embed_mod.status()
     if state["state"] == embed_mod.LOADING:
-        threading.Thread(target=_build_semantics_later, args=(ws.repo_id,),
-                         daemon=True, name="icn-embed-build").start()
+        # Single-flight, exactly as _start_anchor_finish does it. Without the
+        # guard every call that landed while the model was still downloading
+        # started another whole-repository encode, and they then queued behind
+        # each other on the store's write lock.
+        _start_semantic_build(ws)
     return {"encoded": 0, "skipped": 0, **state}
 
 
@@ -208,6 +284,14 @@ def ensure_indexed(ws: Workspace, force_full: bool = False,
     last_indexed = repo["last_indexed_commit"] if repo else None
     state = indexer_mod.index_state(ws.store)
     cold = state["files_active"] == 0 and state["symbols_active"] == 0
+    # A store with content but no recorded indexed commit is an index that
+    # started and never finished: only a complete run stamps the commit, and a
+    # truncated first index hands the rest to a background thread that can die
+    # with the process. Resuming has to go through the full index, because the
+    # incremental path would ask git what changed, be told "nothing
+    # uncommitted", stamp the commit, and freeze the partial index in place as
+    # if it were whole - no call edges and no way to tell.
+    unfinished = not cold and last_indexed is None
 
     lease = _lease_for(ws.repo_id)
     if not lease.try_acquire():
@@ -218,10 +302,11 @@ def ensure_indexed(ws: Workspace, force_full: bool = False,
 
     try:
         idx = indexer_mod.Indexer(ws.store, ws.root, ws.repo_id, ws.excludes)
-        if force_full or cold:
-            report = idx.full_index(ws.commit, budget_seconds=budget if cold and not force_full else None)
+        if force_full or cold or unfinished:
+            budgeted = None if force_full else budget
+            report = idx.full_index(ws.commit, budget_seconds=budgeted)
         else:
-            report = idx.incremental_index(ws.commit, last_indexed)
+            report = idx.incremental_index(ws.commit, last_indexed, budget_seconds=budget)
 
         if report.get("truncated"):
             with _LOCK:
@@ -241,12 +326,36 @@ def ensure_indexed(ws: Workspace, force_full: bool = False,
     finally:
         lease.release()
 
-    # Before the cascade, not after: an anchor whose fingerprint moved only
-    # because the extractor changed must be carried across first, or the
-    # cascade reads the algorithm change as a body change and downgrades an
-    # anchor pointing at code nobody touched.
-    rebase = anchor_mod.rebase_extractor_change(ws.store, ws.root)
-    verification = anchor_mod.verify_repo(ws.store, ws.root, ws.commit)
+    # Both anchor passes read and re-fingerprint their anchors from disk, so
+    # their cost scales with the size of the store rather than with the size
+    # of the edit. On a repository with thousands of anchors that turned a
+    # no-op warm open into a minute of work: measured on a 7,152-anchor repo,
+    # 7.6s to rebase and 28.7s to verify with not one file changed. That is
+    # the same whole-repository warm-open cost the incremental indexer already
+    # guards against, arriving by a different route.
+    #
+    # Nothing can have drifted if nothing was reindexed: an anchor's status is
+    # a function of the source its symbol points at, and unchanged source
+    # cannot produce a different fingerprint. So skip both passes outright on
+    # a no-op open. A cold or truncated index is not a no-op - it has not
+    # finished looking yet - so it never takes this path.
+    touched = bool(report.get("files_indexed") or report.get("files_tombstoned"))
+    stale_index = cold or force_full or unfinished or report.get("truncated")
+    if not touched and not stale_index:
+        rebase = {"considered": 0, "rebased": 0, "restored": 0, "skipped": "no files changed"}
+        verification = {"checked": 0, "by_status": {}, "changed": [], "changed_total": 0,
+                        "skipped": "no files changed"}
+    else:
+        # Before the cascade, not after: an anchor whose fingerprint moved only
+        # because the extractor changed must be carried across first, or the
+        # cascade reads the algorithm change as a body change and downgrades an
+        # anchor pointing at code nobody touched.
+        rebase = anchor_mod.rebase_extractor_change(ws.store, ws.root,
+                                                   budget_seconds=ANCHOR_BUDGET)
+        verification = anchor_mod.verify_repo(ws.store, ws.root, ws.commit,
+                                              budget_seconds=ANCHOR_BUDGET)
+        if rebase.get("truncated") or verification.get("truncated"):
+            _start_anchor_finish(ws)
 
     # Semantic vectors, refreshed in the same pass that refreshed the symbols
     # they describe. Incremental by content hash, so an unchanged repository

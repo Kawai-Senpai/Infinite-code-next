@@ -25,8 +25,11 @@ def main() -> None:
         from .install import main as install_main
         raise SystemExit(install_main(sys.argv[2:]))
 
-    from .server import mcp
-    mcp.run("stdio")
+    # server.main(), not mcp.run() directly: the native preload it does first
+    # is what keeps workspace(action='open') from deadlocking on Windows, and
+    # this is the entry point the installed console script actually uses.
+    from .server import main as serve
+    serve()
 
 
 if __name__ == "__main__":
