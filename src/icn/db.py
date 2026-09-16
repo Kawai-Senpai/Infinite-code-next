@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Columns added after a schema version shipped. Migration is first-class
 # (PLAN.md section 11): additive, idempotent, and never destructive.
@@ -52,6 +52,17 @@ ADDED_COLUMNS: list[tuple[str, str, str]] = [
     # Receiver name -> possible types, the evidence the receiver_typed call
     # tier resolves through.
     ("symbols", "receiver_types", "TEXT"),
+    # The claim as the agent stated it, before event context was composed
+    # around it. Duplicate detection compares claims, not bodies: two records
+    # of the same rule made during different tasks have different context.
+    ("memories", "claim", "TEXT"),
+    # How many separate events asserted this memory. A rule recorded once is an
+    # opinion; one three sessions arrived at independently is settled.
+    ("memories", "evidence_count", "INTEGER DEFAULT 1"),
+    # Explicit votes. Access counts cannot tell "this answered the question"
+    # from "this wasted a read"; these can.
+    ("memories", "helpful_count", "INTEGER DEFAULT 0"),
+    ("memories", "unhelpful_count", "INTEGER DEFAULT 0"),
 ]
 
 BUSY_TIMEOUT_MS = 15000
@@ -386,6 +397,63 @@ CREATE TABLE IF NOT EXISTS investigations (
     frontier         TEXT,
     results          TEXT,
     created_at       TEXT NOT NULL
+);
+
+-- Every event that asserted a memory, including the one that created it.
+CREATE TABLE IF NOT EXISTS memory_evidence (
+    memory_id   TEXT NOT NULL,
+    event_id    TEXT NOT NULL,
+    similarity  REAL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (memory_id, event_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_feedback (
+    feedback_id TEXT PRIMARY KEY,
+    memory_id   TEXT NOT NULL,
+    signal      TEXT NOT NULL,        -- helpful | not_helpful | stale | wrong
+    reason      TEXT,
+    actor       TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_memory ON memory_feedback(memory_id, created_at);
+
+-- "Where I left off", written by one session and claimed exactly once by the next.
+CREATE TABLE IF NOT EXISTS handoffs (
+    handoff_id     TEXT PRIMARY KEY,
+    summary        TEXT NOT NULL,
+    open_questions TEXT,
+    next_steps     TEXT,
+    files          TEXT,
+    from_agent     TEXT,
+    branch         TEXT,
+    head_commit    TEXT,
+    status         TEXT NOT NULL DEFAULT 'open',   -- open | claimed | superseded | cancelled
+    created_at     TEXT NOT NULL,
+    claimed_at     TEXT,
+    claimed_by     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_handoffs_status ON handoffs(status, created_at);
+
+-- Rules promoted into this repository's CLAUDE.md / AGENTS.md managed block.
+CREATE TABLE IF NOT EXISTS promoted_rules (
+    memory_id   TEXT PRIMARY KEY,
+    text        TEXT NOT NULL,
+    score       REAL,
+    approved_by TEXT,
+    approved_at TEXT NOT NULL
+);
+
+-- What hooks put in front of a model, so their value can be measured against
+-- the feedback those memories later receive.
+CREATE TABLE IF NOT EXISTS hook_deliveries (
+    session_id   TEXT NOT NULL,
+    memory_id    TEXT NOT NULL,
+    event        TEXT NOT NULL,
+    file_path    TEXT,
+    agent        TEXT,
+    delivered_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, memory_id)
 );
 
 CREATE TABLE IF NOT EXISTS agit_checkpoints (

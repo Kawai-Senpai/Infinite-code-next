@@ -69,7 +69,7 @@ CALL_TIERS: dict[str, tuple[str, float]] = {
 }
 
 DEFAULT_EXCLUDES = {
-    ".git", ".agit", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+    ".git", ".agit", ".icn-lab", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
     "env", ".env", "dist", "build", "target", ".next", ".nuxt", ".output",
     "vendor", ".idea", ".vscode", ".mypy_cache", ".pytest_cache", ".ruff_cache",
     "coverage", ".tox", "site-packages", ".gradle", "bin", "obj", ".terraform",

@@ -640,8 +640,11 @@ def mark_verified(conn: sqlite3.Connection, memory_id: str, commit: str | None,
             " last_verified_commit=?, last_verified_at=? WHERE memory_id=? AND status IN (?,?)",
             (ACTIVE, commit, now(), memory_id, NEEDS_REVIEW, DRIFTED),
         )
+        # Confirming a memory also answers a "wrong" vote against it (see
+        # feedback.py), which is the only thing that lowers confidence this far.
         conn.execute(
-            "UPDATE memories SET last_verified_commit=?, last_verified_at=? WHERE memory_id=?",
+            "UPDATE memories SET last_verified_commit=?, last_verified_at=?,"
+            " confidence = MAX(confidence, 0.6) WHERE memory_id=?",
             (commit, now(), memory_id),
         )
         conn.execute(

@@ -410,4 +410,5 @@ def status(ws: Workspace) -> dict[str, Any]:
         },
         "indexer_lease": lease.holder(),
         "agit": {"present": (ws.root / ".agit" / "HEAD").exists()},
+        "lab": {"present": (ws.root / ".icn-lab" / "lab.db").exists()},
     }

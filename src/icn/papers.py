@@ -1,4 +1,7 @@
-"""Paper ingestion: search arXiv, fetch any PDF, read all of it, render pages.
+"""Paper ingestion: search arXiv and more, fetch any PDF, read all of it, render pages.
+
+Search reaches arXiv, alphaXiv (full-text and semantic retrieval over arXiv),
+OpenAlex (every discipline, journals included) and bioRxiv via OpenAlex.
 
 The abstract is not the paper. A tool that stops at the abstract forces the same
 rediscovery later, so this module is built around the full text: fetch once into
@@ -26,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import threading
@@ -43,6 +47,13 @@ from . import tex
 
 USER_AGENT = "infinite-code-next/0.1 (+https://ranitbhowmick.com)"
 ARXIV_API = "https://export.arxiv.org/api/query"
+# Discovery beyond arXiv, adopted from OpenResearch's `orx discover`. All three
+# are public and need no token. bioRxiv has no search API of its own, so it is
+# searched through OpenAlex restricted to bioRxiv's source id.
+ALPHAXIV_API = "https://api.alphaxiv.org"
+OPENALEX_API = "https://api.openalex.org"
+BIORXIV_SOURCE_ID = "S4306402567"
+SEARCH_SOURCES = ("arxiv", "alphaxiv", "alphaxiv_semantic", "openalex", "biorxiv")
 ATOM = "{http://www.w3.org/2005/Atom}"
 ARX = "{http://arxiv.org/schemas/atom}"
 OPENSEARCH = "{http://a9.com/-/spec/opensearch/1.1/}"
@@ -286,14 +297,192 @@ def _entry_to_dict(entry: ET.Element) -> dict[str, Any]:
     }
 
 
+def _clip_abstract(item: dict[str, Any], abstract_chars: int) -> dict[str, Any]:
+    if abstract_chars and len(item.get("abstract") or "") > abstract_chars:
+        item["abstract"] = item["abstract"][:abstract_chars].rstrip() + " [...]"
+        item["abstract_truncated"] = True
+    return item
+
+
+def _get_json(url: str, service: str) -> Any:
+    body, _, _ = _http_get(url, accept="application/json")
+    try:
+        return json.loads(body.decode("utf-8", errors="replace"))
+    except ValueError as err:
+        raise PaperError(f"{service} returned something that is not JSON: {err}") from err
+
+
+def search_alphaxiv(query: str, max_results: int = 10, sort: str = "relevance",
+                    semantic: bool = False, abstract_chars: int = 900) -> dict[str, Any]:
+    """alphaXiv full-text (keyword) or embedding retrieval over arXiv papers.
+
+    Unlike the arXiv API this searches the body of each paper and returns the
+    page-anchored snippets that matched, which is often enough to decide whether
+    a paper is worth fetching at all.
+    """
+    if not (query or "").strip():
+        raise PaperError("alphaXiv search needs a query")
+    strategy = "embedding" if semantic else "keyword"
+    prioritize = {"recent": "recency", "submitted": "recency", "updated": "recency",
+                  "popular": "popular", "historical": "historical"}.get(
+                      (sort or "").lower(), "default")
+    params = urllib.parse.urlencode({"q": query.strip(), "prioritize": prioritize})
+    hits = _get_json(f"{ALPHAXIV_API}/search/v2/paper/discover/{strategy}?{params}", "alphaXiv")
+    if not isinstance(hits, list):
+        raise PaperError("alphaXiv returned an unexpected shape (expected a list of papers)")
+
+    results = []
+    for hit in hits[:max(1, min(int(max_results or 10), 100))]:
+        ident = str(hit.get("paperId") or "")
+        arxiv_id = normalize_arxiv_id(ident) or ident
+        snippets = [
+            {"page": s.get("pageNumber"), "text": " ".join(str(s.get("snippet") or "").split())[:300]}
+            for s in (hit.get("snippets") or [])[:3]
+        ]
+        results.append(_clip_abstract({
+            "source": "alphaxiv",
+            "arxiv_id": arxiv_id,
+            "title": " ".join(str(hit.get("title") or "").split()),
+            "abstract": " ".join(str(hit.get("abstract") or "").split()),
+            "published": hit.get("publicationDate") or "",
+            "votes": hit.get("votes") or 0,
+            "snippets": snippets,
+            "abs_url": f"https://arxiv.org/abs/{arxiv_id}",
+            "pdf_url": f"https://arxiv.org/pdf/{arxiv_id}",
+            "alphaxiv_url": f"https://www.alphaxiv.org/abs/{arxiv_id}",
+        }, abstract_chars))
+
+    return {
+        "ok": True, "source": "alphaxiv", "strategy": strategy, "prioritize": prioritize,
+        "query": query.strip(), "returned": len(results), "results": results,
+        "next": "paper(action='fetch', paper_id=<arxiv_id>) downloads and extracts the full text",
+    }
+
+
+def _openalex_abstract(inverted: dict[str, list[int]] | None) -> str:
+    """OpenAlex ships abstracts as {word: [positions]}; put the words back in order."""
+    if not inverted:
+        return ""
+    placed: dict[int, str] = {}
+    for word, positions in inverted.items():
+        for position in positions or []:
+            placed[int(position)] = word
+    return " ".join(placed[i] for i in sorted(placed))
+
+
+def search_openalex(query: str, max_results: int = 10, sort: str = "relevance", start: int = 0,
+                    biorxiv: bool = False, abstract_chars: int = 900) -> dict[str, Any]:
+    """OpenAlex's cross-disciplinary works index, optionally only bioRxiv preprints.
+
+    The reach arXiv lacks: journals, conference proceedings, biology and
+    medicine. A hit is fetchable when OpenAlex knows an open-access PDF, and
+    many are not, so every result says which.
+    """
+    if not (query or "").strip():
+        raise PaperError("OpenAlex search needs a query")
+    wanted = max(1, min(int(max_results or 10), 200))
+    order = {"recent": "recent", "submitted": "recent", "updated": "recent",
+             "popular": "popular", "historical": "historical"}.get((sort or "").lower())
+    # `search=` matches full text, which is fine while relevance ranks the page
+    # but useless once something else orders it: sorted by citations, "speculative
+    # decoding" returned a CPU paper and a television study, measured live. Even
+    # OpenResearch's fix, reordering a wider relevance page locally, kept both.
+    # So a sorted search takes its candidates from titles and abstracts only,
+    # then reorders that page locally rather than asking OpenAlex to sort the
+    # whole matching corpus.
+    per_page = wanted if order is None else min(200, max(50, wanted * 4))
+    params: dict[str, Any] = {
+        "per_page": per_page,
+        "page": max(0, int(start)) // per_page + 1,
+        "select": ("id,doi,title,publication_date,cited_by_count,abstract_inverted_index,"
+                   "authorships,best_oa_location,primary_location"),
+    }
+    filters = []
+    if order is None:
+        params["search"] = query.strip()
+    else:
+        filters.append(f"title_and_abstract.search:{query.strip().replace(',', ' ')}")
+    if biorxiv:
+        filters.append(f"primary_location.source.id:{BIORXIV_SOURCE_ID}")
+    if filters:
+        params["filter"] = ",".join(filters)
+    # OpenAlex's faster "polite pool" wants a contact address. It is only sent
+    # when the user configured one: a tool must not volunteer anyone's email.
+    mailto = os.environ.get("ICN_OPENALEX_MAILTO", "").strip()
+    if mailto:
+        params["mailto"] = mailto
+
+    payload = _get_json(f"{OPENALEX_API}/works?{urllib.parse.urlencode(params)}", "OpenAlex")
+    source_name = "biorxiv" if biorxiv else "openalex"
+    works = list(payload.get("results") or [])
+    if order == "popular":
+        works.sort(key=lambda w: w.get("cited_by_count") or 0, reverse=True)
+    elif order in ("recent", "historical"):
+        dated = [w for w in works if w.get("publication_date")]
+        undated = [w for w in works if not w.get("publication_date")]
+        dated.sort(key=lambda w: w["publication_date"], reverse=order == "recent")
+        works = dated + undated
+    results = []
+    for work in works[:wanted]:
+        doi = str(work.get("doi") or "").replace("https://doi.org/", "")
+        arxiv_match = re.match(r"10\.48550/arxiv\.(.+)$", doi, re.IGNORECASE)
+        arxiv_id = normalize_arxiv_id(arxiv_match.group(1)) if arxiv_match else None
+        best = work.get("best_oa_location") or {}
+        primary = work.get("primary_location") or {}
+        pdf_url = best.get("pdf_url") or primary.get("pdf_url")
+        authors = [
+            (a.get("author") or {}).get("display_name")
+            for a in (work.get("authorships") or [])[:10]
+        ]
+        if arxiv_id:
+            fetch_hint = f"paper(action='fetch', paper_id='{arxiv_id}')"
+        elif pdf_url:
+            fetch_hint = f"paper(action='fetch', url='{pdf_url}')"
+        else:
+            fetch_hint = None
+        results.append(_clip_abstract({
+            "source": source_name,
+            "openalex_id": str(work.get("id") or "").rsplit("/", 1)[-1],
+            "doi": doi or None,
+            "arxiv_id": arxiv_id,
+            "title": " ".join(str(work.get("title") or "").split()),
+            "authors": [a for a in authors if a],
+            "abstract": _openalex_abstract(work.get("abstract_inverted_index")),
+            "published": work.get("publication_date") or "",
+            "cited_by": work.get("cited_by_count") or 0,
+            "landing_url": best.get("landing_page_url") or primary.get("landing_page_url")
+                           or (f"https://doi.org/{doi}" if doi else None),
+            "pdf_url": pdf_url,
+            "fetch": fetch_hint or "no open-access PDF is known; read it at landing_url",
+        }, abstract_chars))
+
+    return {
+        "ok": True, "source": source_name, "query": query.strip(), "sort": order or "relevance",
+        "total_available": (payload.get("meta") or {}).get("count"),
+        "returned": len(results), "start": max(0, int(start)), "results": results,
+        "next": "each result's `fetch` field says how to download it, when that is possible",
+    }
+
+
 def search(query: str = "", category: str = "", max_results: int = 10,
            sort: str = "relevance", start: int = 0,
-           abstract_chars: int = 900) -> dict[str, Any]:
-    """Search arXiv and return real metadata for every hit.
+           abstract_chars: int = 900, source: str = "arxiv") -> dict[str, Any]:
+    """Search arXiv (or another source) and return real metadata for every hit.
 
     Abstracts are truncated by default because a search is for choosing what to
     read, not for reading. fetch() gets the whole paper.
     """
+    chosen = (source or "arxiv").lower().strip().replace("-", "_")
+    if chosen not in SEARCH_SOURCES:
+        raise PaperError(f"unknown source {source!r}. Valid: {', '.join(SEARCH_SOURCES)}")
+    if chosen in ("alphaxiv", "alphaxiv_semantic"):
+        return search_alphaxiv(query, max_results=max_results, sort=sort,
+                               semantic=chosen == "alphaxiv_semantic",
+                               abstract_chars=abstract_chars)
+    if chosen in ("openalex", "biorxiv"):
+        return search_openalex(query, max_results=max_results, sort=sort, start=start,
+                               biorxiv=chosen == "biorxiv", abstract_chars=abstract_chars)
+
     sort_by = {
         "relevance": "relevance",
         "recent": "submittedDate",

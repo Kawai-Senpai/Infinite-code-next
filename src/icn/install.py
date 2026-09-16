@@ -7,10 +7,19 @@ tools list fine, `doctor` says READY, and the agent still never calls any of it
 because nothing told it to. Shipping the instruction with the software closes
 that gap.
 
-Two things are written, and they do different jobs:
+What is written, and the job each does:
 
     a skill    the workflow, in full, loaded when the agent needs it.
-    a hook     one line at session start, so the agent knows the skill is there.
+    hooks      `icn hook session-start`: the previous session's handoff and the
+               highest-standing rules. `icn hook pre-tool-use`: the knowledge
+               anchored to a file, just before the agent reads or edits it.
+               See hooks.py for the delivery rules.
+
+Claude Code reads hooks from the project's .claude/settings.json. Codex reads
+them from $CODEX_HOME/hooks.json (default ~/.codex/hooks.json), one file for
+every repository; the hook resolves which repository from the session's cwd
+and stays silent anywhere ICN has no knowledge. Codex also asks the user to
+trust new hooks once, in its TUI.
 
 Everything here is idempotent and additive. Existing settings are merged, never
 replaced: a hook installer that overwrites a user's own hooks has done more
@@ -20,6 +29,8 @@ damage than the problem it solves.
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -62,7 +73,26 @@ that is no longer there.
    symbols are actually connected rather than assuming.
 4. `agit(action="commit", message=...)` before a risky edit or broad refactor.
    It commits to `.agit/`, never the user's `.git`.
-5. `record(...)` after a verified finding or change.
+5. `record(...)` after a verified finding or change. Restating a rule that is
+   already stored reinforces it (the reply lists `memories_reinforced`), so
+   record what you confirmed even when it is not new.
+6. Stopping mid-task? `memory(action="handoff", body=<where it stands>,
+   next_steps=[...], open_questions=[...], files=[...])`. The next session
+   receives it once, automatically.
+
+## Knowledge that arrives on its own
+
+With the hooks installed, the session starts with the previous handoff and
+the highest-standing rules, and touching a file shows the rules, warnings and
+rejected attempts anchored to it. Treat those lines as you would a briefing.
+Then close the loop: `memory(action="feedback", memory_id=..., signal=...)`
+with `helpful` when one saved you a mistake, `not_helpful` when it was noise,
+`stale` or `wrong` (with a reason) when the code has moved past it. That vote
+is what keeps the next agent's context short and correct.
+
+Rules that should bind every task can be promoted into this repository's
+CLAUDE.md and AGENTS.md with `memory(action="rules_recommend")` and
+`rules_approve`, but only when the user asks: those files are theirs.
 
 Skip steps 2 and 5 only for purely mechanical work - fixing a typo, running a
 command you were explicitly asked to run.
@@ -137,39 +167,96 @@ def _load_settings(path: Path) -> dict[str, Any]:
     return loaded
 
 
-def _install_hook(settings: dict[str, Any]) -> bool:
-    """Merge our SessionStart hook in. Returns True if the file needs writing."""
+# Tools whose input names a file. Bash is included because both CLIs read
+# files through the shell too; the hook only reacts to real repository files.
+PRE_TOOL_MATCHER = "Read|Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch|shell|exec_command"
+HOOK_COMMAND_MARK = "-m icn hook "
+
+
+def hook_command(event: str, agent: str, python: str | None = None) -> str:
+    """The command line for one event, quoted the way each CLI runs it.
+
+    Measured on Windows: Codex runs hook commands through PowerShell, where a
+    command starting with a quoted path is a string, not a call, and fails;
+    the call operator makes it a call. Claude Code runs the quoted form.
+    """
+    exe = python or sys.executable
+    if agent == "codex" and os.name == "nt":
+        return f'& "{exe}" -m icn hook {event} --agent codex'
+    return f'"{exe}" -m icn hook {event} --agent {agent}'
+
+
+def _is_ours(handler: Any) -> bool:
+    return isinstance(handler, dict) and (
+        handler.get("_source") == HOOK_MARKER or HOOK_COMMAND_MARK in str(handler.get("command", "")))
+
+
+def _install_hook(settings: dict[str, Any], agent: str = "claude", python: str | None = None) -> bool:
+    """Merge our hooks in, replacing any older ICN entry. True if the file needs writing."""
     hooks = settings.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise ValueError("settings.json 'hooks' is not an object; refusing to replace it.")
-    session_start = hooks.setdefault("SessionStart", [])
-    if not isinstance(session_start, list):
-        raise ValueError("settings.json 'hooks.SessionStart' is not a list.")
 
-    entry = {
-        "matcher": "*",
-        "hooks": [{
-            "type": "command",
-            "command": f"echo {json.dumps(REMINDER)}",
-            "_source": HOOK_MARKER,
-        }],
+    wanted = {
+        "SessionStart": {"matcher": "*" if agent == "claude" else "", "hooks": [{
+            "type": "command", "command": hook_command("session-start", agent, python),
+            "timeout": 15}]},
+        # Codex tool names differ by version (shell, exec_command, apply_patch,
+        # ...); match every tool and let the hook ignore calls without a file.
+        "PreToolUse": {"matcher": PRE_TOOL_MATCHER if agent == "claude" else "", "hooks": [{
+            "type": "command", "command": hook_command("pre-tool-use", agent, python),
+            "timeout": 10}]},
     }
+    if agent == "claude":
+        for entry in wanted.values():
+            entry["hooks"][0]["_source"] = HOOK_MARKER
 
-    for index, existing in enumerate(session_start):
-        if not isinstance(existing, dict):
-            continue
-        inner = existing.get("hooks") or []
-        if any(isinstance(h, dict) and h.get("_source") == HOOK_MARKER for h in inner):
-            if existing == entry:
-                return False            # already exactly right
-            session_start[index] = entry
-            return True
+    changed = False
+    for event, entry in wanted.items():
+        entries = hooks.setdefault(event, [])
+        if not isinstance(entries, list):
+            raise ValueError(f"hooks '{event}' is not a list; refusing to replace it.")
+        placed = False
+        for index, existing in list(enumerate(entries)):
+            if not isinstance(existing, dict):
+                continue
+            if any(_is_ours(h) for h in existing.get("hooks") or []):
+                if not placed:
+                    if existing != entry:
+                        entries[index] = entry
+                        changed = True
+                    placed = True
+                else:
+                    entries[index] = None           # a duplicate from an older install
+                    changed = True
+        hooks[event] = [e for e in entries if e is not None]
+        if not placed:
+            hooks[event].append(entry)
+            changed = True
+    return changed
 
-    session_start.append(entry)
-    return True
+
+def codex_hooks_path() -> Path:
+    home = os.environ.get("CODEX_HOME")
+    return (Path(home) if home else Path.home() / ".codex") / "hooks.json"
 
 
-def install(root: Path, *, with_hook: bool = True) -> dict[str, Any]:
+def install_codex(path: Path | None = None, python: str | None = None) -> dict[str, Any]:
+    """Merge ICN's hooks into Codex's user-level hooks.json."""
+    path = Path(path) if path else codex_hooks_path()
+    settings = _load_settings(path)
+    if not _install_hook(settings, agent="codex", python=python):
+        return {"ok": True, "path": str(path), "changed": False}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".json.icn-tmp")
+    temp.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+    return {"ok": True, "path": str(path), "changed": True,
+            "note": "Codex asks you to trust new hooks the next time it starts; accept them once."}
+
+
+def install(root: Path, *, with_hook: bool = True, codex: bool = False,
+            codex_path: Path | None = None) -> dict[str, Any]:
     """Write the skill, and optionally the session hook, into `root`."""
     root = Path(root).expanduser().resolve()
     if not root.is_dir():
@@ -197,6 +284,10 @@ def install(root: Path, *, with_hook: bool = True) -> dict[str, Any]:
         else:
             unchanged.append(str(settings_path.relative_to(root)))
 
+    if codex:
+        report = install_codex(codex_path)
+        (written if report["changed"] else unchanged).append(report["path"])
+
     return {
         "ok": True,
         "root": str(root),
@@ -216,11 +307,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", default=".", help="project path (default: current directory)")
     parser.add_argument("--no-hook", action="store_true",
                         help="write the skill only, leaving settings.json alone")
+    parser.add_argument("--codex", action="store_true",
+                        help="also install the hooks for Codex (~/.codex/hooks.json)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
     try:
-        report = install(Path(args.root), with_hook=not args.no_hook)
+        report = install(Path(args.root), with_hook=not args.no_hook, codex=args.codex)
     except ValueError as exc:
         report = {"ok": False, "error": str(exc)}
 

@@ -18,6 +18,13 @@ def main() -> None:
         from . import paths
         print(paths.storage_root())
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "hook":
+        # Before anything heavy is imported: this runs before every tool call.
+        from .hooks import run as hook_run
+        raise SystemExit(hook_run(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "rules":
+        from .rules_cli import main as rules_main
+        raise SystemExit(rules_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "doctor":
         from .doctor import main as doctor_main
         raise SystemExit(doctor_main(sys.argv[2:]))

@@ -165,6 +165,7 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
             resolved.append({"reference": reference, **match})
 
     created_memories: list[dict[str, Any]] = []
+    reinforced: list[dict[str, Any]] = []
     created_edges = 0
     contradictions: list[dict[str, Any]] = []
 
@@ -201,10 +202,10 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
         # future agent nothing about the incident that made it one.
         context = _event_context(payload, summary, resolved)
 
-        entries: list[tuple[str, str, str]] = []   # (memory kind, severity, body)
+        entries: list[tuple[str, str, str, str]] = []   # (memory kind, severity, body, claim)
         for field, (memory_kind, severity) in FIELD_KINDS.items():
             for claim in _as_list(payload.get(field)):
-                entries.append((memory_kind, severity, _compose(claim, context)))
+                entries.append((memory_kind, severity, _compose(claim, context), str(claim).strip()))
 
         # The summary itself is a memory when the event describes a change.
         if summary and kind in EVENT_KIND_TO_MEMORY:
@@ -212,20 +213,29 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
             reasoning = str(payload.get("reasoning") or "").strip()
             body = f"{summary}\n\n{reasoning}".strip() if reasoning else summary
             entries.insert(0, (memory_kind, severity,
-                               _compose(body, context, is_summary=True)))
+                               _compose(body, context, is_summary=True), summary))
 
-        for memory_kind, severity, body in entries:
+        resolved_ids = {m["row"].get("symbol_id") if m["kind"] == "symbol" else m["row"].get("file_id")
+                        for m in resolved}
+        for memory_kind, severity, body, claim in entries:
+            duplicate, near = _find_duplicate(conn, memory_kind, claim, resolved_ids, event_id)
+            if duplicate is not None:
+                reinforced.append(_reinforce(conn, duplicate, event_id, resolved, commit))
+                continue
+
             memory_id = ids.new_id(ids.MEMORY)
             title = body.strip().split("\n", 1)[0][:200]
             conn.execute(
                 "INSERT INTO memories (memory_id, kind, title, body, severity, authority, confidence,"
                 " status, scope, source_event, version, created_at, updated_at, created_commit,"
-                " last_verified_commit, last_verified_at, valid_from)"
-                " VALUES (?,?,?,?,?,?,?,'ACTIVE','repo',?,1,?,?,?,?,?,?)",
+                " last_verified_commit, last_verified_at, valid_from, claim, evidence_count)"
+                " VALUES (?,?,?,?,?,?,?,'ACTIVE','repo',?,1,?,?,?,?,?,?,?,1)",
                 (memory_id, memory_kind, title, body, severity,
                  payload.get("authority", "agent"), float(payload.get("confidence", 0.8)),
-                 event_id, now(), now(), commit, commit, now(), now()),
+                 event_id, now(), now(), commit, commit, now(), now(), claim),
             )
+            conn.execute("INSERT OR IGNORE INTO memory_evidence (memory_id, event_id, similarity,"
+                         " created_at) VALUES (?,?,1.0,?)", (memory_id, event_id, now()))
             _index_memory(conn, memory_id, title, body, memory_kind)
             conn.execute(
                 "INSERT INTO memory_edges (edge_id, from_id, to_id, kind, edge_class, status,"
@@ -262,18 +272,23 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
                                         "ACTIVE", title)
             catalog_mod.upsert_entity_ref(catalog, memory_id, repo_id, "memory",
                                           {"title": title, "kind": memory_kind, "commit": commit})
-            created_memories.append({"memory_id": memory_id, "kind": memory_kind,
-                                     "severity": severity, "title": title,
-                                     "body": body, "anchors": len(anchor_ids)})
+            entry = {"memory_id": memory_id, "kind": memory_kind, "severity": severity,
+                     "title": title, "body": body, "anchors": len(anchor_ids)}
+            if near is not None:
+                entry["similar_to"] = near
+            created_memories.append(entry)
 
     _link_test_coverage(conn, created_memories)
     cross_links = _link_contracts(catalog, payload, resolved, created_memories, commit)
-    causal_links = _link_causal(conn, payload, created_memories)
+    # A reinforced memory still represents this event: caused_by on a record
+    # that only restated known rules must attach to those rules.
+    represented = created_memories + reinforced
+    causal_links = _link_causal(conn, payload, represented)
 
     # Say which memory represents this event. A caller passing caused_by next
     # would otherwise have to guess from an unordered list, and a causal edge
     # naming the wrong one silently builds a false chain.
-    primary_id = _primary_memory(created_memories)["memory_id"] if created_memories else None
+    primary_id = _primary_memory(represented)["memory_id"] if represented else None
     for entry in created_memories:
         if entry["memory_id"] == primary_id:
             entry["primary"] = True
@@ -282,6 +297,7 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
         "ok": True,
         "event_id": event_id,
         "memories_created": created_memories,
+        "memories_reinforced": reinforced,
         "primary_memory": primary_id,
         "edges_created": created_edges,
         "cross_repo_links": cross_links,
@@ -546,6 +562,138 @@ def _primary_memory(memories: list[dict[str, Any]]) -> dict[str, Any]:
         else len(_PRIMARY_ORDER))
     return ranked[0]
 
+# ------------------------------------------------------------- reinforcement
+
+# Same rule, restated: merge. Measured before this existed: recording one
+# invariant three times produced three copies, and every later search ranked
+# the copies against each other instead of against anything else.
+DUPLICATE_SIMILARITY = 0.8
+# Close enough that the caller should look before believing it is new.
+NEAR_SIMILARITY = 0.5
+_CLAIM_STOP = frozenset(
+    "the a an and or of to in on for is are be it this that with as by at from not "
+    "must should never always when was were has have had will can".split())
+
+
+def claim_tokens(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9_]{3,}", (text or "").lower())
+    return {w for w in words if w not in _CLAIM_STOP}
+
+
+def claim_similarity(a: str, b: str) -> float:
+    left, right = claim_tokens(a), claim_tokens(b)
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _stored_claim(memory: dict[str, Any]) -> str:
+    """The claim of a memory written before the claim column existed."""
+    if memory.get("claim"):
+        return memory["claim"]
+    body = memory.get("body") or ""
+    for marker in ("\n\nRecorded while: ", "\n\nWhy: ", "\n\nChanged: ", "\n\nApplies to: "):
+        body = body.split(marker, 1)[0]
+    return body
+
+
+def _find_duplicate(conn: sqlite3.Connection, kind: str, claim: str,
+                    resolved_ids: set[str],
+                    event_id: str | None = None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """(memory this restates, or None) and (a close match worth naming, or None).
+
+    Restating means the same kind, a near-identical claim, and the same code:
+    "must be idempotent" about settle() and about refund() are two rules even
+    though they read alike, so a scope mismatch is only ever a hint.
+    """
+    tokens = claim_tokens(claim)
+    if not tokens:
+        return None, None
+    # Two or three words carry too little to call "similar"; only the exact
+    # same short claim about the same code counts as a restatement.
+    short = len(tokens) < 3
+    match = " OR ".join(f'"{t}"' for t in sorted(tokens)[:24])
+    try:
+        candidates = rows(conn.execute(
+            "SELECT m.memory_id, m.kind, m.title, m.body, m.claim, m.evidence_count"
+            " FROM fts_memories f JOIN memories m ON m.memory_id = f.memory_id"
+            " WHERE fts_memories MATCH ? AND m.kind = ? AND m.status = 'ACTIVE'"
+            # One event is one piece of evidence: a summary and a decision that
+            # say the same thing must not reinforce each other.
+            " AND COALESCE(m.source_event, '') != ?"
+            " ORDER BY bm25(fts_memories) LIMIT 25", (match, kind, event_id or "")))
+    except sqlite3.OperationalError:
+        return None, None
+
+    best_dup, best_near = None, None
+    for memory in candidates:
+        similarity = claim_similarity(claim, _stored_claim(memory))
+        if similarity < (1.0 if short else NEAR_SIMILARITY):
+            continue
+        targets = {r["to_id"] for r in conn.execute(
+            "SELECT to_id FROM memory_edges WHERE from_id = ? AND kind = 'APPLIES_TO'"
+            " AND status = 'ACTIVE'", (memory["memory_id"],))}
+        same_scope = (not targets and not resolved_ids) or bool(targets & resolved_ids)
+        if similarity >= DUPLICATE_SIMILARITY and same_scope:
+            if best_dup is None or similarity > best_dup[1]:
+                best_dup = (memory, similarity)
+        elif best_near is None or similarity > best_near["similarity"]:
+            best_near = {"memory_id": memory["memory_id"], "title": memory["title"],
+                         "similarity": round(similarity, 2),
+                         "why": ("same claim about different code" if similarity >= DUPLICATE_SIMILARITY
+                                 else "similar claim; check it is not the same rule before relying on both")}
+    if best_dup is not None:
+        memory, similarity = best_dup
+        return {**memory, "similarity": similarity}, None
+    return None, best_near
+
+
+def _reinforce(conn: sqlite3.Connection, memory: dict[str, Any], event_id: str,
+               resolved: list[dict[str, Any]], commit: str | None) -> dict[str, Any]:
+    """Count a restatement as evidence instead of storing a copy.
+
+    Restating a rule while looking at the current code is also a check that it
+    still holds, so review flags on its anchors clear. A correction still
+    always wins: supersede() and correct() are untouched by evidence counts.
+    """
+    memory_id = memory["memory_id"]
+    conn.execute(
+        "UPDATE memories SET evidence_count = COALESCE(evidence_count, 1) + 1, updated_at = ?,"
+        " last_verified_commit = ?, last_verified_at = ?,"
+        " claim = COALESCE(claim, ?) WHERE memory_id = ?",
+        (now(), commit, now(), _stored_claim(memory), memory_id))
+    conn.execute("INSERT OR IGNORE INTO memory_evidence (memory_id, event_id, similarity, created_at)"
+                 " VALUES (?,?,?,?)", (memory_id, event_id, round(memory["similarity"], 3), now()))
+    conn.execute(
+        "INSERT INTO memory_edges (edge_id, from_id, to_id, kind, edge_class, status,"
+        " confidence, source, created_at) VALUES (?,?,?,'DERIVED_FROM','deterministic',"
+        "'ACTIVE',1.0,'reinforce',?)", (ids.new_id(ids.EDGE), memory_id, event_id, now()))
+    conn.execute(
+        "UPDATE anchors SET status = 'ACTIVE', last_verified_commit = ?, last_verified_at = ?"
+        " WHERE memory_id = ? AND status IN ('NEEDS_REVIEW', 'DRIFTED')", (commit, now(), memory_id))
+
+    linked = {r["to_id"] for r in conn.execute(
+        "SELECT to_id FROM memory_edges WHERE from_id = ? AND kind = 'APPLIES_TO'", (memory_id,))}
+    added = 0
+    for match in resolved:
+        row = match["row"]
+        target = row["symbol_id"] if match["kind"] == "symbol" else row["file_id"]
+        if target in linked:
+            continue
+        if match["kind"] == "symbol":
+            anchor_mod.create_anchor(conn, memory_id, row, None, commit)
+        else:
+            anchor_mod.create_anchor(conn, memory_id, None, row, commit)
+        _link(conn, memory_id, target, "APPLIES_TO", "asserted", match["confidence"])
+        added += 1
+
+    count = one(conn.execute("SELECT evidence_count FROM memories WHERE memory_id = ?", (memory_id,)))
+    return {"memory_id": memory_id, "kind": memory["kind"], "title": memory["title"],
+            "evidence_count": count["evidence_count"] if count else None,
+            "similarity": round(memory["similarity"], 2), "anchors_added": added,
+            "note": "restated an existing memory, so it was reinforced rather than copied"}
+
+
 def _link_causal(conn: sqlite3.Connection, payload: dict[str, Any],
                  memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Attach this event's memories to the story that produced them.
@@ -736,10 +884,13 @@ def correct(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id: str,
              memory["status"], now(), actor, reason),
         )
         conn.execute(
-            "UPDATE memories SET body=?, kind=?, severity=?, version=version+1, updated_at=?"
-            " WHERE memory_id=?",
+            # A rewritten body invalidates the stored claim: hooks, rule
+            # promotion and duplicate detection read the claim first, and would
+            # otherwise keep repeating the text that was just corrected.
+            "UPDATE memories SET body=?, kind=?, severity=?, version=version+1, updated_at=?,"
+            " claim = CASE WHEN ? THEN NULL ELSE claim END WHERE memory_id=?",
             (body if body is not None else memory["body"], kind or memory["kind"],
-             severity or memory["severity"], now(), memory_id),
+             severity or memory["severity"], now(), body is not None, memory_id),
         )
         _index_memory(conn, memory_id, memory["title"] or "",
                       body if body is not None else memory["body"], kind or memory["kind"])

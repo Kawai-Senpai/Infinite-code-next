@@ -80,7 +80,8 @@ prompting.
 
 `record` is on the list because it writes only to ICN's own knowledge store,
 never to your source. `agit` is deliberately **not** on the list: it commits to
-`.agit/`, so it changes files on disk and should stay behind a prompt.
+`.agit/`, so it changes files on disk and should stay behind a prompt. The same
+goes for `experiment`, which runs shell commands.
 
 A rejected or unapproved call is not a slow call. It is a call that never ran,
 and it will sit in the prompt for as long as nobody answers it. If ICN appears

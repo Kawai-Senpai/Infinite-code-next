@@ -315,7 +315,8 @@ to grepping instead. Pre-approve the tools that only read:
 That is `.claude/settings.json` for Claude Code; Codex, Cursor and Windsurf
 each expose the same idea in their own MCP settings. `record` writes only to
 ICN's knowledge store, so it belongs on the list. `agit` does not: it commits
-to `.agit/` and should keep prompting.
+to `.agit/` and should keep prompting. Neither does `experiment`: it runs shell
+commands.
 
 Note that an unapproved call is not a slow call, it is a call that has not run
 yet. If ICN seems to hang, look for a pending approval prompt first.
@@ -509,6 +510,7 @@ $XDG_DATA_HOME/infinite-code/              (Linux)
   cache/repos/<id>/         REBUILDABLE  safe to delete at any time
 
 <repo>/.agit/               agent git, gitignored
+<repo>/.icn-lab/            experiment lab, gitignored, separate from .agit
 <repo>/.icn.toml            optional, committed, tiny
 ```
 
@@ -599,9 +601,72 @@ published page must stay a single self-contained file.
 | `record` | one event → many anchored facts |
 | `memory` | `get` · `list` · `verify` · `guard` · `correct` · `supersede` · `resolve` · `reanchor` |
 | `agit` | `status` · `diff` · `commit` · `log` · `branches` · `switch` · `restore` · `reset` · `show` |
+| `experiment` | `init` · `tree` · `create` · `checkout` · `commit` · `diff` · `run` · `status` · `log` · `wait` · `cancel` · `runs` · `conclude` · `promote` · `apply` · `set_command` |
+| `paper` | `search` (arXiv, alphaXiv, OpenAlex, bioRxiv) · `fetch` · `read` · `grep` · `render` · `figures` · `download` · `list` · `forget` · `remember` |
 
 `agit` keeps agent checkpoints in `.agit/`, entirely separate from the user's
 `.git`. Checkpoint risky work, restore it, never touch their history.
+
+`experiment` settles questions by measurement, adapted from OpenResearch's
+experiment tree. The baseline is the current code plus one command that
+measures it. Each experiment is a child branch in `.icn-lab/` that changes
+code, never the command. A run executes the exact committed snapshot in its own
+folder, detached, so it survives the session. Programs report results by
+printing `ICN_METRIC name=value`. The lab enforces the rules: the command is
+fixed once anything is measured, an answered experiment is frozen, and two
+unanswered crashes in a row need `force`. `conclude` turns a judged run into a
+decision, failed attempt or rationale memory that carries the run's commit,
+command, exit code, metrics and diff against its parent. `record(evidence=[run_id])`
+attaches the same proof to any memory.
+
+## Knowledge that arrives without being asked
+
+Full setup, verification and troubleshooting guide: [docs/HOOKS.md](docs/HOOKS.md).
+
+`icn install --codex` wires two hooks into Claude Code (`.claude/settings.json`)
+and Codex (`~/.codex/hooks.json`):
+
+- **Session start:** the handoff the previous session left (claimed exactly
+  once), the highest-standing rules, and what needs attention.
+- **Before a tool reads or edits a file** (Read/Edit/Write, Codex `apply_patch`,
+  shell reads): the invariants, warnings, contracts and rejected attempts
+  anchored to that file. Capped in size, never repeated within a session,
+  silent for files with no knowledge, and fail-open (a broken hook exits 0 with
+  no output). Knowledge on code that changed since it was recorded is labelled
+  unverified rather than hidden.
+
+The same session can close the loop:
+
+- `memory(action="feedback", signal="helpful"|"not_helpful"|"stale"|"wrong")`.
+  Wrong or repeatedly unhelpful memories stop being volunteered; nothing is
+  deleted, and `verify` restores them.
+- `memory(action="handoff", body=..., next_steps=[...], open_questions=[...])`.
+- `record()` merges a restated claim about the same code into the existing
+  memory (`memories_reinforced`, `evidence_count`) and flags close matches
+  with `similar_to`.
+
+Settled rules can be promoted into this repository's `CLAUDE.md` and
+`AGENTS.md`: `icn rules recommend | approve <id> | edit | remove | list`, or
+`memory(action="rules_*")`. Candidates must be anchored to real code that
+still matches, undisputed, imperative and one line long; each promoted line
+names the file and symbol it governs. The managed block is capped (12), an
+approval past the cap is refused naming the weakest rule, and text outside the
+markers is never touched.
+
+Experiments are part of the knowledge graph, not beside it:
+
+- `workspace(action="open")` reports the lab, including finished runs nobody has
+  judged yet, and measured losses appear under `already_rejected`.
+- A conclusion is anchored to the symbols its diff touched, so `investigate()`
+  surfaces it next to the invariants and warnings on the same code.
+- Each conclusion links to its parent's (`LED_TO`), and `conclude(caused_by=[...])`
+  links what motivated it, such as a `paper(action="remember")` memory. So
+  `investigate(action="why")` tells how the code got here: prior art, baseline,
+  winner.
+- `apply` writes a measured experiment's code into the working tree, only if the
+  files still match the baseline. Measured memories are re-verified, because a
+  measurement of a recorded commit stays true; everything else the change put
+  under review is listed for a human look.
 
 ---
 

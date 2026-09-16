@@ -294,12 +294,18 @@ def usage_boost(memory: dict[str, Any]) -> float:
     """
     opened = memory.get("access_count") or 0
     surfaced = memory.get("surfaced_count") or 0
-    if not opened and not surfaced:
-        return 0.0
+    helpful = memory.get("helpful_count") or 0
+    unhelpful = memory.get("unhelpful_count") or 0
+    # An explicit "this did not help" is the one usage signal allowed to push
+    # below zero, and it is capped so a few votes cannot bury a critical rule.
+    penalty = min(0.3, 0.1 * unhelpful)
+    if not opened and not surfaced and not helpful:
+        return -penalty
 
     # Opens are worth far more than impressions; a memory can be surfaced by
-    # a loose lexical match without anyone finding it useful.
-    raw = math.log1p(opened * 4 + surfaced * 0.35)
+    # a loose lexical match without anyone finding it useful. A helpful vote
+    # is worth more than an open: it says the read paid off.
+    raw = math.log1p(opened * 4 + surfaced * 0.35 + helpful * 6)
 
     decay = 1.0
     stamp = memory.get("last_accessed_at")
@@ -311,7 +317,7 @@ def usage_boost(memory: dict[str, Any]) -> float:
         except (ValueError, TypeError):
             decay = 1.0
 
-    return min(0.5, raw * 0.18 * decay)
+    return min(0.5, raw * 0.18 * decay) - penalty
 
 # ------------------------------------------------------------------- retrieval
 

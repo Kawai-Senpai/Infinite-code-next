@@ -1,4 +1,4 @@
-"""MCP surface: seven tools.
+"""MCP surface: eight tools.
 
 PLAN 2 section 10. Agents waste turns choosing between near-identical tools, so
 the surface is deliberately small and grouped by action:
@@ -11,13 +11,15 @@ the surface is deliberately small and grouped by action:
     record       write one event, compiled into many facts
     memory       get, list, correct, supersede, verify, reanchor, resolve
     agit         status, diff, commit, log, branches, switch, restore, reset, show
+    experiment   init, tree, create, checkout, commit, diff, run, status, log,
+                 wait, cancel, runs, conclude, promote, apply, set_command
     paper        search, fetch, read, grep, render, figures, download, list,
                  forget, remember
 
 Every response carries the resolved root, so a wrong workspace is visible at
 once instead of quietly poisoning the store.
 
-paper() is annotated `-> Any` rather than `-> dict[str, Any]` like its five
+paper() is annotated `-> Any` rather than `-> dict[str, Any]` like its
 siblings, and that difference is load-bearing: FastMCP builds an output model
 from the return annotation and validates against it, so a dict annotation
 rejects the mixed [summary, Image, Image] list that action='render' returns.
@@ -40,7 +42,11 @@ from . import causal
 from . import compiler
 from . import embed as embed_mod
 from . import graph as graph_mod
+from . import feedback as feedback_mod
+from . import handoff as handoff_mod
 from . import history as history_mod
+from . import rules as rules_mod
+from . import lab as lab_mod
 from . import papers as papers_mod
 from . import search as search_mod
 from . import workspace as ws_mod
@@ -86,6 +92,12 @@ answers one question without loading the rest, and render() returns page images
 for the figures and tables the text layer drops. paper(action='remember') writes
 what a paper settled into this repository's memory graph, so the next agent
 asking why the code is shaped this way finds the citation instead of guessing.
+
+experiment() is for questions only a measurement can settle: is this change
+faster, more accurate, cheaper? Each experiment is exact code on its own branch
+in .icn-lab/ (separate from agit and from .git), run with one fixed command.
+conclude() turns a measured result into a memory that carries its evidence, so
+a later agent meets "we tried X, run R measured Y" rather than an opinion.
 """
 
 mcp = FastMCP("infinite-code-next", instructions=INSTRUCTIONS)
@@ -253,6 +265,9 @@ def workspace(
             # What already exists here. An agent cannot ask the right question
             # before it knows what is on the shelf, so open() volunteers it.
             brief = briefing_mod.build(current.store)
+            # A handoff the session-start hook has not already claimed. Claimed
+            # here, so it is shown exactly once whichever path reaches it first.
+            waiting = handoff_mod.claim(current.store, claimed_by="workspace-open")
             return {
                 "ok": True,
                 "resolved_root": str(current.root),
@@ -268,7 +283,10 @@ def workspace(
                 "anchors": state["anchors"],
                 "needs_review": urgent,
                 "briefing": brief,
-                "next": "investigate('what you are about to change')",
+                **_lab_briefing(current.root),
+                **({"handoff": waiting} if waiting else {}),
+                "next": ("read the handoff, then investigate() the next step it names" if waiting
+                         else "investigate('what you are about to change')"),
             }
         return _fail(f"unknown workspace action: {action}", str(current.root))
     finally:
@@ -645,6 +663,7 @@ def record(
     tests: list[str] | None = None,
     contracts_with: list[dict] | None = None,
     caused_by: list[str | dict] | None = None,
+    evidence: list[str] | None = None,
     authority: str = "agent",
     root: str | None = None,
 ) -> dict[str, Any]:
@@ -718,6 +737,10 @@ def record(
             decision -> bug -> failed fix -> accepted fix -> invariant -> test.
             Pass ids, or [{"memory": "mem_x", "kind": "CAUSED"}] where kind is
             CAUSED, LED_TO, ESTABLISHED, REFINES or DEPENDS_ON.
+        evidence: experiment run ids (from experiment()) that measured what
+            this records. Each finished run's commit, command, exit code and
+            metrics are written into every memory, so the claim carries its
+            proof instead of asking to be believed.
         authority: 'agent' or 'human'. Human memories cannot be rewritten by an agent.
         root: repository path. Defaults to the server's working directory.
     """
@@ -726,6 +749,13 @@ def record(
 
     current = ws_mod.open_workspace(root)
     try:
+        run_ids = [r.strip() for r in (evidence or []) if r and r.strip()]
+        if run_ids:
+            try:
+                proof = lab_mod.evidence_for(current.root, run_ids)
+            except lab_mod.LabError as err:
+                return _fail(str(err), str(current.root))
+            reasoning = "\n".join([reasoning.strip(), *proof]).strip()
         ws_mod.ensure_indexed(current)
         payload = {
             "kind": kind, "summary": summary, "reasoning": reasoning,
@@ -742,6 +772,10 @@ def record(
         result = compiler.record_event(current.store, current.catalog, current.repo_id,
                                        current.root, current.commit, payload)
         result["resolved_root"] = str(current.root)
+        if run_ids:
+            lab_mod.link_evidence(current.root, [m["memory_id"] for m in result["memories_created"]],
+                                  run_ids, None)
+            result["evidence"] = run_ids
         if result.get("unresolved_references"):
             result["hint"] = ("some names did not resolve to indexed code; they were kept as "
                               "repo-scoped knowledge. Check spelling or run "
@@ -764,6 +798,10 @@ def memory(
     actor: str = "agent",
     limit: int = 30,
     offset: int = 0,
+    signal: str = "",
+    open_questions: list[str] | None = None,
+    next_steps: list[str] | None = None,
+    files: list[str] | None = None,
     root: str | None = None,
 ) -> dict[str, Any]:
     """Inspect and correct stored knowledge.
@@ -788,6 +826,27 @@ def memory(
                   the two were written in separate calls. Pass the rule as
                   memory_id and the test_evidence memory id as body.
       reanchor    re-run the anchoring cascade for one memory.
+      feedback    vote on a memory you were shown: signal='helpful',
+                  'not_helpful', 'stale' or 'wrong' (stale and wrong need a
+                  reason). Wrong or repeatedly unhelpful memories stop being
+                  volunteered by hooks; nothing is deleted.
+
+    Handoffs, "where I left off" for the next session (claimed exactly once,
+    by its session-start hook or workspace(action='open')):
+      handoff          write one before stopping mid-task: body=summary, plus
+                       open_questions, next_steps, files.
+      handoff_list     recent handoffs and their status, without claiming.
+      handoff_cancel   withdraw an open one (memory_id=handoff id).
+
+    Rules promoted into this repository's CLAUDE.md and AGENTS.md, a small
+    capped block changed only by these commands:
+      rules_recommend  ranked, codebase-specific candidates. Read-only.
+      rules_approve    promote memory_id (body= optional wording). Refused at
+                       the cap, naming the weakest rule to remove first.
+      rules_edit       reword a promoted rule (body=).
+      rules_remove     demote; the memory itself is unchanged.
+      rules_list       what is promoted, and which rules have gone stale.
+      Promote only on the user's say-so: these edit files they own.
 
     Args:
         action: one of the actions above.
@@ -802,11 +861,50 @@ def memory(
         limit: maximum rows for list.
         offset: rows to skip for list. With `total` and `next_offset` in the
             reply, this pages through a filter larger than one call can carry.
+        signal: for feedback.
+        open_questions: for handoff.
+        next_steps: for handoff.
+        files: for handoff.
         root: repository path. Defaults to the server's working directory.
     """
     current = ws_mod.open_workspace(root)
     try:
         act = (action or "list").lower().strip()
+        where = str(current.root)
+
+        if act == "handoff":
+            identity = ws_mod.status(current).get("identity") or {}
+            return {"resolved_root": where,
+                    **handoff_mod.create(current.store, body, open_questions, next_steps, files,
+                                         from_agent=actor, branch=identity.get("branch"),
+                                         head_commit=current.commit)}
+        if act == "handoff_list":
+            return {"ok": True, "resolved_root": where,
+                    "handoffs": handoff_mod.listing(current.store, limit)}
+        if act == "handoff_cancel":
+            if not memory_id:
+                return _fail("handoff_cancel requires memory_id set to the handoff id", where)
+            return {"resolved_root": where, **handoff_mod.cancel(current.store, memory_id)}
+        if act.startswith("rules_"):
+            try:
+                if act == "rules_recommend":
+                    return {"resolved_root": where, **rules_mod.recommend(current.store, limit=min(limit, 20))}
+                if act == "rules_list":
+                    return {"resolved_root": where, **rules_mod.listing(current.store, current.root)}
+                if not memory_id:
+                    return _fail(f"{act} requires memory_id", where)
+                if act == "rules_approve":
+                    return {"resolved_root": where,
+                            **rules_mod.approve(current.store, current.root, memory_id, body, actor=actor)}
+                if act == "rules_edit":
+                    return {"resolved_root": where,
+                            **rules_mod.edit(current.store, current.root, memory_id, body)}
+                if act == "rules_remove":
+                    return {"resolved_root": where,
+                            **rules_mod.remove(current.store, current.root, memory_id)}
+            except rules_mod.RulesError as err:
+                return _fail(str(err), where)
+            return _fail(f"unknown rules action: {action}", where)
 
         if act == "list":
             found = compiler.list_memories(current.store, kind=kind, status=status,
@@ -852,6 +950,10 @@ def memory(
                              " test_evidence memory id", str(current.root))
             return {"resolved_root": str(current.root),
                     **compiler.guard_memory(current.store, memory_id, body.strip())}
+
+        if act == "feedback":
+            return {"resolved_root": str(current.root),
+                    **feedback_mod.record(current.store, memory_id, signal, reason, actor)}
 
         if act == "reanchor":
             ws_mod.ensure_indexed(current)
@@ -934,6 +1036,305 @@ def agit(
         current.close()
 
 
+def _lab_briefing(root: Path) -> dict[str, Any]:
+    """The experiment lab's state for open(), or nothing when there is no lab.
+
+    Never allowed to break open(): the briefing is a convenience, and a damaged
+    lab must not stop an agent from reaching the rest of its knowledge.
+    """
+    try:
+        found = lab_mod.summary(root)
+    except Exception as err:          # noqa: BLE001 - see docstring
+        return {"experiments": {"error": f"lab unreadable: {err}"}}
+    return {"experiments": found} if found else {}
+
+
+def _apply_experiment(current: Any, exp: str) -> dict[str, Any]:
+    """Write a measured experiment's code into the working tree and settle its memories.
+
+    Applying the winner changes exactly the code its conclusion memories
+    describe, so ICN's anchor cascade flags them NEEDS_REVIEW as if they had
+    gone stale. They have not: this is the change they recorded. They are
+    re-verified here; every other memory the change put under review is
+    reported, because those genuinely need a look.
+    """
+    import subprocess
+    import tempfile
+
+    plan = lab_mod.apply_plan(current.root, exp)
+    if not plan["patch"].strip():
+        return {"ok": True, "slug": plan["slug"], "applied": False,
+                "note": "this experiment's code is identical to the baseline"}
+
+    with tempfile.NamedTemporaryFile("wb", suffix=".patch", delete=False) as handle:
+        handle.write(plan["patch"].encode("utf-8") + b"\n")
+        patch_file = handle.name
+    try:
+        def git_apply(*extra: str) -> subprocess.CompletedProcess:
+            # stdin detached for the same reason as every other git child here.
+            return subprocess.run(["git", "apply", "--whitespace=nowarn", *extra, patch_file],
+                                  cwd=str(current.root), capture_output=True, text=True,
+                                  stdin=subprocess.DEVNULL, check=False)
+
+        checked = git_apply("--check")
+        if checked.returncode != 0:
+            raise lab_mod.LabError(
+                "the working tree no longer matches the baseline in the files this experiment "
+                f"changes ({', '.join(plan['files'][:10])}), so applying it could overwrite other "
+                "work. Nothing was changed. git said: "
+                f"{(checked.stderr or checked.stdout).strip()[:600]}")
+        applied = git_apply()
+        if applied.returncode != 0:
+            raise lab_mod.LabError(f"git apply failed: {(applied.stderr or applied.stdout).strip()[:600]}")
+    finally:
+        Path(patch_file).unlink(missing_ok=True)
+
+    ws_mod.ensure_indexed(current)
+    # A conclusion is a measurement of a recorded lab commit, so changing the
+    # working tree cannot make it untrue: "insertion sort was slower" still
+    # holds after the winner lands. Every lab-measured memory the cascade just
+    # flagged is re-verified; flagging them would bury the knowledge that does
+    # need a look under a pile that does not.
+    measured = set(plan["measured_memories"])
+    placeholders = ",".join("?" for _ in plan["files"]) or "''"
+    flagged = [dict(r) for r in current.store.execute(
+        "SELECT DISTINCT m.memory_id, m.kind, m.title FROM anchors a"
+        " JOIN memories m ON m.memory_id = a.memory_id"
+        f" WHERE a.status = ? AND m.status = 'ACTIVE' AND a.file_path IN ({placeholders})",
+        (anchor_mod.NEEDS_REVIEW, *plan["files"]))]
+    reverified = []
+    for memory in flagged:
+        if memory["memory_id"] in measured:
+            anchor_mod.mark_verified(current.store, memory["memory_id"], current.commit,
+                                     actor="experiment-apply")
+            reverified.append(memory["memory_id"])
+    review = [m for m in flagged if m["memory_id"] not in measured]
+    return {
+        "ok": True, "slug": plan["slug"], "applied": True, "files": plan["files"],
+        "from_lab_commit": plan["commit"], "lineage": plan["lineage"],
+        "memories_reverified": reverified,
+        "memories_to_review": [{k: m.get(k) for k in ("memory_id", "kind", "title")} for m in review],
+        "next": ("the code is in the working tree but not committed to git; run the project's "
+                 "tests, then commit it as you normally would"
+                 + ("; memories_to_review lists knowledge this change may have outdated"
+                    if review else "")),
+    }
+
+
+def _touched_symbols(store: Any, touched: dict[str, list[str]], cap: int = 12) -> list[str]:
+    """Indexed symbols in each changed file whose name the experiment's diff mentions.
+
+    investigate() attaches memories to capsules through symbol edges only, so a
+    conclusion anchored to files alone is stored, anchored, and never surfaced.
+    Measured live: a concluded loss on sort_impl.py did not appear for a query
+    naming it. Matching is by name within the same file, against the index of
+    the working tree, which is what a later agent will be investigating.
+    """
+    picked: list[str] = []
+    for path, names in touched.items():
+        wanted = set(names)
+        for row in store.execute(
+            "SELECT symbol_path, name FROM symbols WHERE status='ACTIVE' AND last_known_path=?"
+            " ORDER BY line_start", (path,)
+        ):
+            if row["name"] in wanted and row["symbol_path"] not in picked:
+                picked.append(row["symbol_path"])
+                if len(picked) >= cap:
+                    return picked
+    return picked
+
+
+@mcp.tool()
+def experiment(
+    action: str = "tree",
+    exp: str = "",
+    run: str = "",
+    title: str = "",
+    hypothesis: str = "",
+    parent: str = "",
+    command: str = "",
+    message: str = "",
+    against: str = "",
+    verdict: str = "",
+    note: str = "",
+    timeout_seconds: float = 0,
+    wait_seconds: float = 60,
+    tail: int = 8000,
+    offset: int | None = None,
+    force: bool = False,
+    limit: int = 20,
+    caused_by: list[str | dict] | None = None,
+    root: str | None = None,
+) -> dict[str, Any]:
+    """Measure ideas instead of arguing them: a tree of experiments with real runs.
+
+    WHEN TO USE: when a question can only be settled by running code - is this
+    faster, more accurate, smaller, more stable - and the answer should outlive
+    the session. Not for ordinary edits; use agit to checkpoint those.
+    AFTER THIS: conclude() every result you judged, so it becomes a memory with
+    its evidence attached.
+
+
+    Think of recipes. The baseline is the recipe you have and the one way you
+    taste it (the command). Each experiment copies a recipe and changes one
+    thing. You always taste the same way, you never scribble on a recipe you
+    already tasted, and the next round starts from the winner.
+
+    The lab lives in .icn-lab/ (gitignored), fully separate from agit and from
+    the user's .git. It enforces the rules rather than suggesting them:
+      - One command for every experiment, fixed once anything is measured.
+        Vary code and config on a child, never the command or env vars.
+      - An experiment freezes once a run answers it. commit then refuses; put
+        the next idea on a child. A crash answered nothing, so the node stays
+        editable, but two unanswered failures in a row need force=True.
+      - A run executes the committed snapshot in its own folder, never the
+        editable checkout, and refuses while the checkout has uncommitted edits.
+    Report results by printing lines like `ICN_METRIC loss=0.4312`.
+
+    Grow the tree downward: siblings are the co-equal options of ONE decision;
+    the next decision goes under that round's winner. tree() warns about a flat
+    fan (everything under the root) and a noodle (a chain of one-child links).
+
+    Actions:
+      init         create the lab. Snapshots the working tree as the baseline.
+                   Needs command. title defaults to 'baseline'.
+      tree         every experiment with its state, verdict, latest run and
+                   metrics, the focal node, and tree-shape warnings.
+      create       new experiment. Needs title; hypothesis is what you expect.
+                   parent defaults to the focal node (latest winner, else the
+                   baseline).
+      checkout     a folder with the experiment's code, to edit. Returns path.
+      commit       commit that folder onto the experiment. Refused when frozen.
+      diff         the experiment's change against its parent, or `against`.
+      run          launch a detached run of the committed code. Survives this
+                   server exiting. timeout_seconds bounds it.
+      status       one run (run=) or one experiment (exp=) in detail.
+      log          a run's output. tail bytes from the end, or from offset.
+      wait         block up to wait_seconds (max 600) until a run finishes.
+                   Returns on the FIRST finish so you can judge it and refill.
+      cancel       stop a run and everything it started.
+      runs         recent runs, all or for one experiment.
+      conclude     judge a finished run: verdict win | loss | inconclusive |
+                   void. win, loss and inconclusive freeze the experiment and
+                   write an ICN memory (decision, failed_attempt, rationale)
+                   carrying the run's commit, command, exit code, metrics and
+                   the change against the parent. win also promotes it. void
+                   says the run answered nothing (needs note) and unfreezes.
+      promote      make a measured experiment the parent for the next round.
+      apply        bring a measured experiment's code into the working tree:
+                   the whole lineage from the baseline, applied only if those
+                   files still match the baseline. The memories describing
+                   that lineage are re-verified against the new code, and any
+                   other memory the change put under review is listed.
+      set_command  change the command. Only before anything is measured.
+
+    It ties into the rest of ICN: a conclusion links to its parent's
+    conclusion (LED_TO), so investigate(action='why') tells the story of how
+    the code got here; caused_by= links it to what motivated it, such as a
+    paper(action='remember') memory; workspace(action='open') lists finished
+    runs still waiting for a verdict.
+
+    Read a run's log before concluding: status alone is not evidence.
+
+    Args:
+        action: one of the actions above.
+        exp: experiment id or slug.
+        run: run id.
+        title: for init and create.
+        hypothesis: for init and create - the expected effect, in a sentence.
+        parent: for create - experiment id or slug to branch from.
+        command: for init and set_command.
+        message: for commit.
+        against: for diff - compare with this experiment instead of the parent.
+        verdict: for conclude.
+        note: for conclude - what the result means, in your own words.
+        timeout_seconds: for run. 0 means no limit.
+        wait_seconds: for wait.
+        tail: for log - bytes to return.
+        offset: for log - start byte instead of the tail.
+        force: for run - launch past the consecutive-failure cap.
+        limit: for runs.
+        caused_by: for conclude - memory ids that motivated this experiment,
+            e.g. the paper memory that suggested it. Same shape as record().
+        root: repository path. Defaults to the server's working directory.
+    """
+    verb = (action or "tree").lower().strip()
+    current = ws_mod.open_workspace(root)
+    work = current.root
+    try:
+        if verb == "init":
+            result = lab_mod.init(work, command, title=title or "baseline", hypothesis=hypothesis)
+        elif verb == "tree":
+            result = lab_mod.tree(work)
+        elif verb == "create":
+            result = lab_mod.create(work, title, hypothesis=hypothesis, parent=parent)
+        elif verb == "checkout":
+            result = lab_mod.checkout(work, exp)
+        elif verb == "commit":
+            result = lab_mod.commit(work, exp, message)
+        elif verb == "diff":
+            result = lab_mod.diff(work, exp, against)
+        elif verb == "run":
+            result = lab_mod.start_run(work, exp, timeout_seconds=timeout_seconds or None,
+                                       force=force)
+        elif verb == "status":
+            result = lab_mod.status(work, run=run, exp=exp)
+        elif verb == "log":
+            result = lab_mod.read_log(work, run, tail=tail, offset=offset)
+        elif verb == "wait":
+            result = lab_mod.wait(work, exp=exp, run=run, timeout=wait_seconds)
+        elif verb == "cancel":
+            result = lab_mod.cancel(work, run)
+        elif verb == "runs":
+            result = lab_mod.list_runs(work, exp, limit=limit)
+        elif verb == "promote":
+            result = lab_mod.promote(work, exp)
+        elif verb == "set_command":
+            result = lab_mod.set_command(work, command)
+        elif verb == "conclude":
+            result = lab_mod.conclude(work, verdict, exp=exp, run=run, note=note)
+            payload = result.pop("memory_payload", None)
+            if payload:
+                # Memories come from typed fields; fill the ones record_event
+                # expects so an absent list is never read as a missing key.
+                for field in ("symbols", "changes", "invariants", "warnings", "failed_attempts",
+                              "decisions", "contracts", "performance", "security", "conventions",
+                              "rationale_notes", "bugs", "migrations", "tests", "contracts_with",
+                              "caused_by"):
+                    payload.setdefault(field, [])
+                payload["authority"] = "agent"
+                ws_mod.ensure_indexed(current)
+                payload["symbols"] = _touched_symbols(current.store,
+                                                      payload.pop("touched_identifiers", {}))
+                lineage = payload.pop("lineage_memory", None)
+                payload["caused_by"] = list(caused_by or [])
+                if lineage:
+                    payload["caused_by"].append({"memory": lineage, "kind": "LED_TO"})
+                recorded = compiler.record_event(current.store, current.catalog, current.repo_id,
+                                                 current.root, current.commit, payload)
+                memory_ids = [m["memory_id"] for m in recorded.get("memories_created", [])]
+                lab_mod.link_evidence(work, memory_ids, [result["run_id"]], result["verdict"],
+                                      primary=recorded.get("primary_memory"))
+                result["causal_links"] = recorded.get("causal_links", [])
+                result["memories_created"] = [
+                    {k: m[k] for k in ("memory_id", "kind", "title") if k in m}
+                    for m in recorded.get("memories_created", [])
+                ]
+                result["primary_memory"] = recorded.get("primary_memory")
+        elif verb == "apply":
+            result = _apply_experiment(current, exp)
+        else:
+            return _fail(f"unknown experiment action {action!r}. Valid: init, tree, create, "
+                         "checkout, commit, diff, run, status, log, wait, cancel, runs, "
+                         "conclude, promote, apply, set_command", str(work))
+        result["resolved_root"] = str(work)
+        return result
+    except lab_mod.LabError as err:
+        return _fail(str(err), str(work))
+    finally:
+        current.close()
+
+
 @mcp.tool()
 def paper(
     action: str = "search",
@@ -942,6 +1343,7 @@ def paper(
     url: str = "",
     path: str = "",
     category: str = "",
+    source: str = "arxiv",
     max_results: int = 10,
     sort: str = "relevance",
     start: int = 0,
@@ -990,8 +1392,14 @@ def paper(
     PDF or a landing page that names one; path takes a local .pdf.
 
     Actions:
-      search    query arXiv. Returns real metadata, abstracts truncated,
-                because a search is for choosing what to read.
+      search    query a literature index. Returns real metadata, abstracts
+                truncated, because a search is for choosing what to read.
+                source='arxiv' (default) is the arXiv API. 'alphaxiv' searches
+                the full text of arXiv papers and returns the matching snippets;
+                'alphaxiv_semantic' is the same corpus by meaning rather than
+                words. 'openalex' reaches journals and every discipline, and
+                'biorxiv' is OpenAlex limited to bioRxiv preprints. Each result
+                says how to fetch it, or that no open PDF is known.
       fetch     download, extract, and cache one paper. Returns the outline and
                 page count so you know what to ask for next. Idempotent.
       read      the cached text. mode='outline' (default) lists sections;
@@ -1026,9 +1434,11 @@ def paper(
         paper_id: an arXiv id, in any of the forms above.
         url: any http(s) PDF URL, or a landing page that names one.
         path: a local .pdf file.
-        category: arXiv categories to restrict to, e.g. "cs.DC cs.DB".
+        category: arXiv categories to restrict to, e.g. "cs.DC cs.DB". arXiv only.
+        source: for search - arxiv | alphaxiv | alphaxiv_semantic | openalex | biorxiv.
         max_results: search hits to return, 1-100.
-        sort: relevance | recent | updated.
+        sort: relevance | recent | updated, plus popular | historical for the
+            non-arXiv sources.
         start: offset into the search results, for paging.
         mode: for read - outline | full | latex | html | abstract.
         pages: page selection like "3" or "7-12" or "1,4,9-11". Used by read,
@@ -1067,7 +1477,7 @@ def paper(
     try:
         if verb == "search":
             return papers_mod.search(query=query, category=category, max_results=max_results,
-                                     sort=sort, start=start)
+                                     sort=sort, start=start, source=source)
 
         if verb == "fetch":
             return papers_mod.fetch(paper_id=paper_id, url=url, path=path,
