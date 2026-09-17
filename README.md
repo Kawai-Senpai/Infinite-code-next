@@ -306,6 +306,7 @@ to grepping instead. Pre-approve the tools that only read:
       "mcp__icn__graph",
       "mcp__icn__memory",
       "mcp__icn__paper",
+      "mcp__icn__conversations",
       "mcp__icn__record"
     ]
   }
@@ -314,7 +315,9 @@ to grepping instead. Pre-approve the tools that only read:
 
 That is `.claude/settings.json` for Claude Code; Codex, Cursor and Windsurf
 each expose the same idea in their own MCP settings. `record` writes only to
-ICN's knowledge store, so it belongs on the list. `agit` does not: it commits
+ICN's knowledge store, so it belongs on the list. So does `conversations`:
+it only ever reads the other agents' transcript stores and writes to ICN's own
+index and archive. `agit` does not: it commits
 to `.agit/` and should keep prompting. Neither does `experiment`: it runs shell
 commands.
 
@@ -334,6 +337,7 @@ a warning finds you even when you never named the file it lives in.
 | `intent=` | `locate`, `understand`, `modify`, `debug`, `audit` — inferred if omitted |
 | `budget=` | approximate token ceiling (default 9000) |
 | `cross_repos=True` | follow contracts into other repositories |
+| `conversations=False` | skip the transcript index; by default the result carries what past sessions from any agent said about the same terms in this repository |
 | `find_problems=` | targeted diagnostics over the narrowed subgraph |
 
 ### 3. Before deleting anything load-bearing, ask why
@@ -507,6 +511,8 @@ $XDG_DATA_HOME/infinite-code/              (Linux)
 
   catalog.db                repositories, aliases, checkouts, cross-repo edges
   data/repos/<id>/repo.db   DURABLE      code graph, memories, anchors, events
+  data/transcripts-archive/ DURABLE      raw copies of agent transcripts the vendors delete
+  data/transcripts.db       REBUILDABLE  normalised, searchable conversations from every agent
   cache/repos/<id>/         REBUILDABLE  safe to delete at any time
 
 <repo>/.agit/               agent git, gitignored
@@ -604,6 +610,7 @@ published page must stay a single self-contained file.
 | `agit` | `status` · `diff` · `commit` · `log` · `branches` · `switch` · `restore` · `reset` · `show` |
 | `experiment` | `init` · `tree` · `create` · `checkout` · `commit` · `diff` · `run` · `status` · `log` · `wait` · `cancel` · `runs` · `conclude` · `promote` · `apply` · `set_command` |
 | `paper` | `search` (arXiv, alphaXiv, OpenAlex, bioRxiv) · `fetch` · `read` · `grep` · `render` · `figures` · `download` · `list` · `forget` · `remember` |
+| `conversations` | `search` · `list` · `get` · `digest` · `refresh` · `status` · `doctor` · `schema` · `purge` · `restore` |
 
 `agit` keeps agent checkpoints in `.agit/`, entirely separate from the user's
 `.git`. Checkpoint risky work, restore it, never touch their history.
@@ -619,6 +626,21 @@ unanswered crashes in a row need `force`. `conclude` turns a judged run into a
 decision, failed attempt or rationale memory that carries the run's commit,
 command, exit code, metrics and diff against its parent. `record(evidence=[run_id])`
 attaches the same proof to any memory.
+
+`conversations` searches the transcripts every coding agent on this machine
+keeps in its own private format: Codex, Claude Code, Copilot (CLI and VS Code),
+Cursor, Windsurf, Gemini CLI. Each is read through an adapter into one
+normalised shape and indexed with FTS5, so a question answered in a Cursor
+session is findable from Claude Code. The vendors treat transcripts as scratch
+(Claude Code prunes after 30 days by default), so a sync thread inside the
+server copies new bytes into ICN's own append-only archive on a timer; one
+lease-holding process does the work however many servers are running. When an
+adapter parses a file as JSON but finds no conversation, it reports
+`SCHEMA_DRIFT` naming itself instead of quietly returning nothing.
+`investigate()` already attaches the hits scoped to the repository being
+investigated; `conversations` is for reading a whole session, its `digest`, or
+searching across every codebase. Vendor stores are only ever read, and the
+index and archive never leave the machine.
 
 ## Knowledge that arrives without being asked
 
@@ -736,7 +758,7 @@ part of the knowledge graph rather than a side artifact:
 python -m pytest
 ```
 
-**177 tests**, including a live MCP suite that spawns the real server over
+**596 tests**, including a live MCP suite that spawns the real server over
 stdio and drives a full agent workflow through the wire protocol, and a
 dirty-worktree harness that asserts cascade behaviour on **uncommitted** edits
 — reformat, rename, body change, cross-file move, delete, weak migration.

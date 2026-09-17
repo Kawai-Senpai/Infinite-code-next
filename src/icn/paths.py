@@ -63,6 +63,16 @@ def cache_dir(repo_id: str) -> Path:
     return storage_root() / "cache" / "repos" / repo_id
 
 
+def transcripts_db_path() -> Path:
+    """transcripts.db - normalised coding-agent conversations, all providers.
+
+    Under data/, not cache/: the vendors delete their own transcripts (Claude
+    Code after 30 days by default), and the normalised copy is what survives
+    that. Deleting it loses history the source no longer has.
+    """
+    return storage_root() / "data" / "transcripts.db"
+
+
 def logs_dir() -> Path:
     return storage_root() / "logs"
 

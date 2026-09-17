@@ -340,3 +340,98 @@ def test_usage_tracking_never_breaks_a_search(workspace, monkeypatch):
     monkeypatch.setattr(search_mod, "write_tx", explode)
     search_mod.note_surfaced(workspace.store, ["mem_whatever"])
     search_mod.note_accessed(workspace.store, "mem_whatever")
+
+
+# ------------------------------------------------------- past conversations
+
+
+def _index_chat(tmp_path, name: str, cwd: str, turns: list[tuple[str, str]]) -> None:
+    """Put one synthetic Claude Code session into the (isolated) transcript index."""
+    import json
+    from icn import transcripts as tx
+
+    records = [{"type": role, "sessionId": name, "cwd": cwd,
+                "message": {"role": role, "content": text}} for role, text in turns]
+    file = tmp_path / "chats" / f"{name}.jsonl"
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    index = tx.Index()
+    try:
+        index.refresh(sources=[tx.Source("claude", "claude_code", str(file), "v")])
+    finally:
+        index.close()
+
+
+def test_investigation_recalls_what_past_sessions_said_about_this_repository(workspace, tmp_path):
+    _index_chat(tmp_path, "here", str(workspace.root), [
+        ("user", "why does RefreshCoordinator hold a Redis mutex during refresh?"),
+        ("assistant", "RefreshCoordinator serialises refresh so two workers cannot rotate"
+                      " the same token twice; the Redis mutex is the cross-process guard."),
+    ])
+    _index_chat(tmp_path, "elsewhere", str(tmp_path / "other-project"), [
+        ("user", "RefreshCoordinator here is a different class in a different repo"),
+    ])
+
+    result = run(workspace, "why does RefreshCoordinator need the Redis mutex")
+
+    section = result["conversations"]
+    hits = section["hits"]
+    assert hits, "a past session discussed exactly this and investigate() did not surface it"
+    assert all(h["session"]["cwd"] == str(workspace.root) for h in hits), \
+        "another repository's chats leaked into this investigation"
+    assert any("mutex" in h["text"] for h in hits)
+    assert all(h["session"]["session_key"] for h in hits), "a hit must be followable with conversations(action='get')"
+    assert "lead" in section["note"]
+
+
+def test_conversation_recall_skips_tool_output(workspace, tmp_path):
+    """A tool_result is the file itself, not anyone talking about it. If it
+    counted, every identifier query would be answered by its own definition."""
+    _index_chat(tmp_path, "dump", str(workspace.root), [
+        ("user", "please read auth.py"),
+    ])
+    from icn import transcripts as tx
+    index = tx.Index()
+    try:
+        with tx.write_tx(index.conn):
+            key = index.conn.execute("SELECT session_key FROM sessions").fetchone()[0]
+            index.conn.execute(
+                "INSERT INTO messages (session_key, ordinal, role, kind, text, tool_name)"
+                " VALUES (?, 99, 'tool', 'tool_result', ?, 'Read')",
+                (key, "class RefreshCoordinator: acquire release Redis mutex"))
+            index.conn.execute("INSERT INTO messages_fts(rowid, text)"
+                               " SELECT id, text FROM messages WHERE ordinal = 99")
+    finally:
+        index.close()
+
+    result = run(workspace, "RefreshCoordinator Redis mutex")
+    assert all(h["role"] != "tool" for h in result["conversations"]["hits"])
+
+
+def test_conversation_recall_can_be_switched_off(workspace):
+    assert run(workspace, "refresh token rotation", conversations=False)["conversations"] is None
+
+
+def test_a_broken_transcript_index_cannot_fail_an_investigation(workspace, monkeypatch):
+    """The transcript store is a separate database that may be locked by the
+    sync process or mid-migration. It must degrade to an explained empty
+    section, never to a failed investigate() call and never to silence."""
+    from icn import transcripts as tx
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("simulated locked index")
+
+    monkeypatch.setattr(tx, "Index", explode)
+    result = run(workspace, "refresh token rotation")
+    assert result["capsules"], "the code search itself must still answer"
+    assert result["conversations"]["hits"] == []
+    assert "simulated locked index" in result["conversations"]["unavailable"]
+
+
+def test_conversations_are_returned_even_when_no_code_matches(workspace, tmp_path):
+    _index_chat(tmp_path, "history", str(workspace.root), [
+        ("user", "we decided against zanzibar style authorization, too heavy for this service"),
+    ])
+    result = run(workspace, "zanzibar authorization")
+    assert result["capsules"] == []
+    assert any("zanzibar" in h["text"] for h in result["conversations"]["hits"])

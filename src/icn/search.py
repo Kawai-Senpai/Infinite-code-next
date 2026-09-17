@@ -2,7 +2,9 @@
 
 PLAN 2 section 7. Engines fused per call: FTS over symbols and memories, exact
 symbol lookup, code-graph traversal, memory-graph traversal, anchor status, git
-history and agit checkpoints.
+history and agit checkpoints. Past agent conversations about the repository
+(transcripts.recall) ride along as a separate section: they are leads, never
+capsules, because a chat turn is anchored to nothing and can be wrong.
 
 Ranking is a static, inspectable formula rather than a trained reranker. Every
 strong result in the retrieval literature buys its gains with labeled relevance
@@ -35,6 +37,7 @@ from . import diagnostics
 from . import embed
 from . import ids
 from . import relevance
+from . import transcripts
 from . import vectors
 from .db import jdump, jload, one, rows, write_tx
 from .identity import run_git
@@ -99,6 +102,12 @@ STALE_PENALTY = {
 
 # Edge trust decides how far relevance travels along it.
 EDGE_DECAY = {"deterministic": 0.75, "asserted": 0.65, "inferred": 0.35}
+
+# Past conversations attached to an investigation. Few hits and a small share
+# of the budget: they supplement the capsules, and a long assistant turn must
+# not crowd out the anchored knowledge the call exists to return.
+CONVERSATION_HITS = 5
+CONVERSATION_BUDGET_SHARE = 0.15
 
 INTENT_PATTERNS = [
     ("modify", r"\b(change|modify|refactor|rewrite|remove|delete|replace|rename|add|implement|migrate|break)\b"),
@@ -983,11 +992,12 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
                 query: str, intent: str | None = None, depth: int = 2,
                 budget: int = 9000, find_problems: bool = True,
                 commit: str | None = None, cross_repos: bool = False,
-                repo_id: str | None = None) -> dict[str, Any]:
+                repo_id: str | None = None, conversations: bool = True) -> dict[str, Any]:
     """One call, many engines, one budgeted answer."""
     chosen = intent if intent in INTENTS else infer_intent(query)
     weights = INTENT_WEIGHTS[chosen]
     terms = _terms(query)
+    recalled = _recall_conversations(root, terms, budget) if conversations else None
 
     seeds = _seed_symbols(conn, terms)
     _boost_explicit_paths(conn, query, seeds)
@@ -1022,7 +1032,7 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
     proximity = _expand(conn, seeds, depth)
     candidate_ids = list(proximity.keys())[:400]
     if not candidate_ids:
-        return _empty_result(query, chosen, terms)
+        return _empty_result(query, chosen, terms, recalled)
 
     placeholders = ",".join("?" for _ in candidate_ids)
     symbols = {
@@ -1132,6 +1142,7 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
         "unanchored_knowledge": unanchored,
         "considered": len(scored),
         "cross_repo": _cross_repo_context(catalog, top_ids, repo_id) if cross_repos else None,
+        "conversations": recalled,
         "budget": {"limit": budget, "used_estimate": used},
         "note": "memories carry an anchor_status; anything not ACTIVE is unverified against current code",
     }
@@ -1188,10 +1199,60 @@ def _cross_repo_context(catalog: sqlite3.Connection, symbol_ids: list[str],
                 " repository is unavailable",
     }
 
-def _empty_result(query: str, intent: str, terms: list[str]) -> dict[str, Any]:
+def _recall_conversations(root: Path, terms: list[str], budget: int) -> dict[str, Any]:
+    """What earlier sessions, from any coding agent, said about these terms
+    while working in this repository.
+
+    Scoped to the repository on purpose. The transcript index spans every
+    codebase on the machine and carries whatever went through the agents'
+    tools; an investigation of one repository must not quote another one's
+    chats. conversations() is the tool for that wider search.
+
+    The index is a separate store that may be missing, locked by the sync
+    process, or mid-migration. None of that may fail the investigation, but
+    none of it may vanish either: the section says why it is empty.
+    """
+    if not terms:
+        return {"hits": [], "scope": str(root), "note": "no searchable terms in the query"}
+    try:
+        index = transcripts.Index()
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        return {"hits": [], "scope": str(root),
+                "unavailable": f"transcript index could not be opened: {type(exc).__name__}: {exc}"}
+    try:
+        found = transcripts.recall(index, terms, codebase=str(root), limit=CONVERSATION_HITS)
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        return {"hits": [], "scope": str(root),
+                "unavailable": f"transcript search failed: {type(exc).__name__}: {exc}"}
+    finally:
+        index.close()
+
+    cap = max(400, int(budget * CONVERSATION_BUDGET_SHARE))
+    hits: list[dict[str, Any]] = []
+    used = 0
+    for hit in found["hits"]:
+        cost = _estimate_tokens(hit)
+        if hits and used + cost > cap:
+            break
+        hits.append(hit)
+        used += cost
+    return {
+        "hits": hits,
+        "scanned": found["scanned"],
+        "scope": str(root),
+        "note": "past sessions from any agent that worked in this repository; a chat turn is"
+                " anchored to nothing and may be stale or wrong, so treat it as a lead."
+                " conversations(action='get', session=<session_key>) reads the whole session;"
+                " conversations(action='search') searches every codebase.",
+    }
+
+
+def _empty_result(query: str, intent: str, terms: list[str],
+                  recalled: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "investigation_id": None, "query": query, "intent": intent, "terms": terms,
         "capsules": [], "problems": [], "unanchored_knowledge": [], "considered": 0,
+        "conversations": recalled,
         "note": "nothing matched; the repository may not be indexed yet "
                 "(workspace action='reindex') or the query terms may not appear in this codebase",
     }

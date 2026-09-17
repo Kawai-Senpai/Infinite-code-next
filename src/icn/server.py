@@ -1,4 +1,4 @@
-"""MCP surface: eight tools.
+"""MCP surface: nine tools.
 
 PLAN 2 section 10. Agents waste turns choosing between near-identical tools, so
 the surface is deliberately small and grouped by action:
@@ -15,6 +15,8 @@ the surface is deliberately small and grouped by action:
                  wait, cancel, runs, conclude, promote, apply, set_command
     paper        search, fetch, read, grep, render, figures, download, list,
                  forget, remember
+    conversations search, list, get, digest, refresh, status, doctor, schema,
+                 purge, restore - past chats from every agent on this machine
 
 Every response carries the resolved root, so a wrong workspace is visible at
 once instead of quietly poisoning the store.
@@ -61,8 +63,10 @@ have to rediscover by reading.
 
 Then investigate() with what you are about to do, in plain language. One call
 returns code structure, the rationale behind it, prior failures, invariants,
-tests and blast radius, as compact capsules rather than file dumps. Prefer it
-over grepping: it searches code and knowledge together.
+tests and blast radius, as compact capsules rather than file dumps, plus what
+earlier sessions from any coding agent said while working in this repository.
+Prefer it over grepping: it searches code, knowledge and past conversations
+together.
 
 Before changing or deleting something load-bearing, investigate(action='why',
 symbol=...) reconstructs why it exists - the decision, the bug that followed,
@@ -99,6 +103,13 @@ faster, more accurate, cheaper? Each experiment is exact code on its own branch
 in .icn-lab/ (separate from agit and from .git), run with one fixed command.
 conclude() turns a measured result into a memory that carries its evidence, so
 a later agent meets "we tried X, run R measured Y" rather than an opinion.
+
+conversations() reads the transcripts every coding agent on this machine keeps
+(Codex, Claude Code, Copilot, Cursor, Gemini, ...) plus ICN's own archive of
+the ones the vendors have since deleted. investigate() already attaches the
+hits for this repository; use conversations() to read a whole session
+(action='get'), see what it did (action='digest'), or search across every
+codebase. A chat turn is anchored to nothing, so it is a lead, never a fact.
 """
 
 mcp = FastMCP("infinite-code-next", instructions=INSTRUCTIONS)
@@ -305,6 +316,7 @@ def investigate(
     budget: int = 9000,
     find_problems: bool = True,
     cross_repos: bool = False,
+    conversations: bool = True,
     action: str = "search",
     investigation_id: str | None = None,
     focus: str = "",
@@ -322,7 +334,10 @@ def investigate(
 
     Searches code and knowledge together - lexical, symbol, code graph, memory
     graph, anchor status and git history - and returns compact capsules under a
-    token budget rather than file dumps.
+    token budget rather than file dumps. The `conversations` section is what
+    past sessions from any coding agent (Codex, Claude Code, Copilot, Cursor,
+    ...) said about the same terms while working in this repository: leads to
+    follow with conversations(action='get'), not anchored facts.
 
     Actions:
       search  (default) run an investigation.
@@ -342,6 +357,8 @@ def investigate(
         cross_repos: also follow contract edges into other repositories and
             report their active warnings. Reads the central catalog only, so
             it works even when those repositories are missing.
+        conversations: also search past agent transcripts scoped to this
+            repository. Off skips the transcript index entirely.
         action: search, expand, or verify.
         investigation_id: required for expand.
         focus: what to drill into, for expand.
@@ -370,6 +387,7 @@ def investigate(
                     intent=intent, depth=depth, budget=per_repo_budget,
                     find_problems=find_problems, commit=current.commit,
                     cross_repos=cross_repos, repo_id=current.repo_id,
+                    conversations=conversations,
                 )
                 repository_results.append({
                     "root": str(current.root), "repo_id": current.repo_id,
@@ -386,6 +404,12 @@ def investigate(
             {"repository_root": item["root"], **problem}
             for item in repository_results for problem in item.get("problems", [])
         ]
+        recalled = [
+            {"repository_root": item["root"], **hit}
+            for item in repository_results
+            for hit in ((item.get("conversations") or {}).get("hits") or [])
+        ]
+        recalled.sort(key=lambda value: float(value.get("score", 0)))
         return {
             "ok": True,
             "multi_root": True,
@@ -394,6 +418,7 @@ def investigate(
             "repositories": repository_results,
             "capsules": capsules[:12],
             "problems": problems,
+            "conversations": {"hits": recalled[:search_mod.CONVERSATION_HITS]} if conversations else None,
             "budget": {"limit": budget, "per_repository": per_repo_budget},
         }
 
@@ -463,6 +488,7 @@ def investigate(
             intent=intent, depth=depth, budget=budget,
             find_problems=find_problems, commit=current.commit,
             cross_repos=cross_repos, repo_id=current.repo_id,
+            conversations=conversations,
         )
         result["ok"] = True
         result["resolved_root"] = str(current.root)
@@ -1763,9 +1789,165 @@ def paper(
         return _fail(str(err))
 
 
+@mcp.tool()
+def conversations(
+    action: str = "search",
+    query: str | None = None,
+    session: str | None = None,
+    codebase: str | None = None,
+    provider: str | None = None,
+    surface: str | None = None,
+    role: str | None = None,
+    kind: str | None = None,
+    tool_name: str | None = None,
+    origin: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    match: str = "all",
+    limit: int = 10,
+    offset: int = 0,
+    per_session: int = 3,
+    context_before: int = 3,
+    context_after: int = 3,
+    start: int = 0,
+    sort: str = "relevance",
+    source_path: str | None = None,
+    target: str | None = None,
+    mode: str = "archive_only",
+    reason: str | None = None,
+    include_archive: bool = True,
+    fuzzy: bool | str = "auto",
+) -> dict[str, Any]:
+    """Search past conversations from every coding agent on this machine.
+
+    Codex, Claude Code, Copilot (CLI and VS Code), Cursor and the rest each keep
+    transcripts in their own private format, and none can read the others'. This
+    reads all of them, plus our own archive of transcripts the vendors have since
+    deleted, and answers across the lot.
+
+    Actions:
+      search   full-text across every agent, with the messages around each hit.
+               Filter by codebase (a directory), provider, surface, role, kind,
+               tool_name, origin (live | archive), and a time window.
+               Misspellings and other word forms still match: when the exact
+               query finds little, each word is matched against similar terms
+               that are actually in the index, and the reply says what it
+               expanded to. match="any" ORs the words, match="phrase" requires
+               them adjacent, a trailing * is a prefix, "quoted text" is exact.
+      list     browse sessions rather than messages.
+      get      one session's messages, paginated from `start`.
+      digest   what a session did: tools used, files touched, user turns, errors.
+      refresh  sync the archive and reindex now (the server also does this on a
+               timer; you do not have to call this).
+      status   is the background sync running, when did it last tick, what is
+               in the archive.
+      doctor   index health and any vendor schema drift.
+      schema   the record shapes in one source file, for fixing an adapter.
+      purge    delete an archived copy and tombstone it so a later sync does not
+               copy it straight back. mode=archive_only keeps the live file
+               searchable; mode=exclude_all hides it everywhere.
+      restore  remove a tombstone so `target` can be archived and indexed again.
+
+    Vendor stores are only ever read. The index and archive stay on this machine
+    and carry whatever went through the agents' tools, so treat them as sensitive.
+    """
+    from . import transcripts as tx_mod
+    from . import transcript_archive as archive_mod
+    from . import transcript_sync as sync_mod
+
+    action = (action or "search").strip().lower()
+    index = None
+    try:
+        if action in ("status", "purge", "restore", "archives", "tombstones"):
+            store = archive_mod.ArchiveStore()
+            try:
+                if action == "status":
+                    return {"ok": True, "sync": sync_mod.status(), "archive": store.stats()}
+                if action == "archives":
+                    return {"ok": True, "archives": store.list_archives(provider=provider,
+                                                                       limit=limit, offset=offset)}
+                if action == "tombstones":
+                    return {"ok": True, "tombstones": store.list_tombstones()}
+                if action == "purge":
+                    what = target or source_path or session
+                    if not what:
+                        return _fail("purge needs target=<live path, archive path or archive key>")
+                    if mode not in archive_mod.TOMBSTONE_MODES:
+                        return _fail(f"mode must be one of {archive_mod.TOMBSTONE_MODES}")
+                    result = archive_mod.delete_archive(store, what, mode, reason)
+                    # The index would otherwise keep serving what was purged.
+                    idx = tx_mod.Index()
+                    try:
+                        result["index_rows_removed"] = idx.forget_source(what)
+                    finally:
+                        idx.close()
+                    return {"ok": True, **result}
+                if action == "restore":
+                    if not target:
+                        return _fail("restore needs target=<the tombstoned identifier>")
+                    return {"ok": True, "removed": store.remove_tombstone(target), "target": target}
+            finally:
+                store.close()
+
+        index = tx_mod.Index()
+
+        if action == "search":
+            if not query:
+                return _fail("search needs a query")
+            result = tx_mod.search(
+                index, query, provider=provider, surface=surface, codebase=codebase, role=role,
+                kind=kind, tool_name=tool_name, session=session, after=after, before=before,
+                match=match, limit=limit, per_session=per_session, context_before=context_before,
+                context_after=context_after, sort=sort, origin=origin, fuzzy=fuzzy)
+            return {"ok": True, **result}
+
+        if action == "list":
+            return {"ok": True, **tx_mod.list_sessions(
+                index, provider=provider, surface=surface, codebase=codebase, after=after,
+                before=before, title=query, limit=limit, offset=offset, origin=origin)}
+
+        if action == "get":
+            if not session:
+                return _fail("get needs session=<session_key, native id or source path>")
+            return {"ok": True, **tx_mod.get_session(
+                index, session, start=start, limit=limit, roles=role, kinds=kind)}
+
+        if action == "digest":
+            if not session:
+                return _fail("digest needs session=<session_key, native id or source path>")
+            return {"ok": True, **tx_mod.digest(index, session)}
+
+        if action == "refresh":
+            sources = None if include_archive else tx_mod.discover_sources()
+            return {"ok": True, **index.refresh(sources=sources)}
+
+        if action == "doctor":
+            return {"ok": True, **tx_mod.doctor(index)}
+
+        if action == "schema":
+            if not source_path:
+                return _fail("schema needs source_path=<a vendor transcript file>")
+            return {"ok": True, **tx_mod.inspect_schema(index, source_path)}
+
+        return _fail(f"unknown conversations action {action!r}. Valid: search, list, get, digest, "
+                     "refresh, status, doctor, schema, purge, restore, archives, tombstones")
+    finally:
+        if index is not None:
+            index.close()
+
+
 def main() -> None:
     # Before mcp.run(), never after: loading numpy's native extensions once the
     # stdio server owns the process wedges in the Windows loader and the first
     # workspace(action='open') never returns. See embed.preload_native.
     embed_mod.preload_native()
+    # Transcript sync runs itself from here on: the vendors delete history on
+    # their own schedule, so waiting for someone to run a sync command loses it.
+    # One lease-holding process does the work however many servers are running,
+    # and a failure here must never stop the server coming up.
+    try:
+        from . import transcript_sync
+        transcript_sync.start()
+    except Exception:  # noqa: BLE001
+        pass
     mcp.run("stdio")

@@ -66,6 +66,7 @@ Pre-approve the read-only tools. In Claude Code, `.claude/settings.json`:
       "mcp__icn__graph",
       "mcp__icn__memory",
       "mcp__icn__paper",
+      "mcp__icn__conversations",
       "mcp__icn__record"
     ]
   }
