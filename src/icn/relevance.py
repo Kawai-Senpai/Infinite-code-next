@@ -44,6 +44,60 @@ def symbol_names(symbol_path: str) -> list[str]:
     return [symbol_path, parts[-1]] if parts else []
 
 
+def claim_text(memory: dict[str, Any]) -> str:
+    """The claim alone, without the event context composed into the body."""
+    text = memory.get("claim") or memory.get("body") or ""
+    for marker in ("\n\nRecorded while: ", "\n\nWhy: ", "\n\nChanged: ", "\n\nApplies to: "):
+        text = text.split(marker, 1)[0]
+    return text
+
+
+def narrowed(conn: Any, memory_ids: list[str],
+             keep_unnamed: bool = False) -> dict[str, dict[str, Any]]:
+    """{memory_id: focus} for broad memories whose claim names specific code.
+
+    Only these need filtering. A narrow memory keeps every anchor. A broad one
+    whose claim names nothing it is anchored to also keeps every anchor in
+    search, where hiding it would lose knowledge rather than noise; hooks,
+    which volunteer knowledge unasked, pass keep_unnamed=True to receive its
+    empty focus and so volunteer it nowhere.
+    """
+    ids = sorted(set(memory_ids))
+    if not ids:
+        return {}
+    anchors: dict[str, list[dict[str, Any]]] = {}
+    for start in range(0, len(ids), 400):
+        part = ids[start:start + 400]
+        marks = ",".join("?" for _ in part)
+        for memory_id, file_path, symbol_path in conn.execute(
+                f"SELECT memory_id, file_path, symbol_path FROM anchors WHERE memory_id IN ({marks})",
+                tuple(part)):
+            anchors.setdefault(memory_id, []).append(
+                {"file_path": file_path, "symbol_path": symbol_path})
+    broad = [m for m, a in anchors.items()
+             if len({x["file_path"] for x in a if x["file_path"]}) > BROAD]
+    out: dict[str, dict[str, Any]] = {}
+    for start in range(0, len(broad), 400):
+        part = broad[start:start + 400]
+        marks = ",".join("?" for _ in part)
+        for memory_id, claim, body in conn.execute(
+                f"SELECT memory_id, claim, body FROM memories WHERE memory_id IN ({marks})",
+                tuple(part)):
+            focused = focus(claim_text({"claim": claim, "body": body}), anchors[memory_id])
+            if keep_unnamed or focused["files"] or focused["symbols"]:
+                out[memory_id] = focused
+    return out
+
+
+def applies(focused: dict[str, Any], file_path: str | None, symbol_path: str | None) -> bool:
+    """Whether a narrowed memory applies to this symbol (or, with no symbol, file)."""
+    if symbol_path is None:
+        return bool(file_path) and file_path in focused["files"]
+    if symbol_path in focused["symbols"]:
+        return True
+    return bool(file_path) and file_path in focused.get("whole_files", [])
+
+
 def focus(claim: str, anchors: list[dict[str, Any]]) -> dict[str, Any]:
     """{files, symbols, broad}: the anchors this claim is about.
 
@@ -56,7 +110,12 @@ def focus(claim: str, anchors: list[dict[str, Any]]) -> dict[str, Any]:
         return {"files": files, "symbols": symbols, "broad": False}
     named_symbols = [s for s in symbols if any(_mentions(claim, n) for n in symbol_names(s))]
     named_files = {f for f in files if any(_mentions(claim, n) for n in file_names(f))}
+    whole_files = sorted(named_files)
     for a in anchors:
         if a.get("symbol_path") in named_symbols and a.get("file_path"):
             named_files.add(a["file_path"])
-    return {"files": sorted(named_files), "symbols": named_symbols, "broad": True}
+    # `files` includes the files of named symbols, which is right for "does
+    # this apply to the file being edited". `whole_files` are the files the
+    # claim names outright, which is what makes it apply to every symbol in one.
+    return {"files": sorted(named_files), "symbols": named_symbols, "broad": True,
+            "whole_files": whole_files}

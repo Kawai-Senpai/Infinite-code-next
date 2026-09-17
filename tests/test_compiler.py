@@ -92,6 +92,23 @@ def test_contradiction_is_flagged_not_resolved(workspace):
     assert len(active) >= 2
 
 
+def test_one_event_never_contradicts_itself(workspace):
+    # Siblings share the event's context text, which once made every pair look
+    # alike; a negated warning beside a positive invariant was flagged.
+    result = compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "decision", "summary": "refresh coordination for websocket and polling clients",
+         "reasoning": "refresh operations raced across websocket and polling clients",
+         "invariants": ["Refresh operations must use RefreshCoordinator for polling clients"],
+         "warnings": ["Do not remove RefreshCoordinator from websocket refresh operations"],
+         "symbols": ["RefreshCoordinator.acquire"]},
+    )
+    assert not result["contradictions"]
+    edges = rows(workspace.store.execute(
+        "SELECT * FROM memory_edges WHERE kind='CONTRADICTS'"))
+    assert not edges
+
+
 def test_record_marks_agent_semantics_as_unverified(workspace):
     result = record_baseline(workspace)
     assert result["trust"]["authority"] == "agent"

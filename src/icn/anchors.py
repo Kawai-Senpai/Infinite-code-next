@@ -600,7 +600,13 @@ def verify_repo(conn: sqlite3.Connection, root: Path, commit: str | None,
     summary: dict[str, int] = {}
     for result in results:
         summary[result["status"]] = summary.get(result["status"], 0) + 1
-    changed = [r for r in results if r["transition"] not in ("unchanged", "skipped")]
+    # `unchanged_unverified` is an anchor whose code did not change and whose
+    # review is still pending: a state, not a change. Listing it made every
+    # open() repeat the same entries (measured 180 of 195 "changed" anchors on
+    # this repository) and crowd out the anchors that did move.
+    held = sum(1 for r in results if r["transition"] == "unchanged_unverified")
+    changed = [r for r in results
+               if r["transition"] not in ("unchanged", "skipped", "unchanged_unverified")]
 
     # A repository with thousands of anchors produced thousands of these
     # records, and they travelled inside every workspace(action='open')
@@ -611,6 +617,11 @@ def verify_repo(conn: sqlite3.Connection, root: Path, commit: str | None,
     detail = changed if only_memory else changed[:_CHANGED_DETAIL]
     report = {"checked": len(results), "by_status": summary, "changed": detail,
               "changed_total": len(changed), "truncated": truncated}
+    if held:
+        report["still_unverified"] = held
+        report["still_unverified_note"] = (
+            "anchors whose code is unchanged but whose review is pending; confirm with "
+            "memory(action='verify') or list them with memory(action='list', anchor_status='NEEDS_REVIEW')")
     if len(detail) < len(changed):
         by_transition: dict[str, int] = {}
         for entry in changed:

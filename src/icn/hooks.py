@@ -92,15 +92,109 @@ def _store(repo_id: str) -> sqlite3.Connection | None:
     path = paths.repo_db_path(repo_id)
     if not path.exists():
         return None
+    # The server migrates a store whenever it opens it. Re-running the schema
+    # script and backfills here cost ~40 ms of a measured 60-85 ms hook, before
+    # every tool call; only a store from an older version needs it.
+    conn = db.connect(path)
+    if conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION:
+        return conn
+    conn.close()
     return db.init_repo_store(path)
+
+
+SHELL_TOOLS = ("bash", "shell", "shell_command", "powershell", "exec_command", "local_shell")
+# Commands that search or list rather than read. A file named only as their
+# argument is not being worked on yet, and delivering its knowledge then spent
+# the once-per-session delivery before the agent read or edited the file.
+# Measured in a live session: a grep for "def _migrate" in db.py delivered four
+# clone-fingerprinting rules, which were then withheld when db.py was edited.
+SEARCH_COMMANDS = {"grep", "egrep", "fgrep", "rg", "ag", "ack", "findstr", "select-string", "sls",
+                   "find", "fd", "ls", "dir", "gci", "get-childitem", "tree", "wc", "du", "stat",
+                   "file", "test-path", "measure-object"}
+GIT_SEARCH = {"grep", "log", "status", "ls-files", "shortlog", "rev-list"}
+FILE_TOKEN = re.compile(r"[\w./\\:-]+\.[A-Za-z0-9]{1,8}")
+
+
+def _command_word(segment: str) -> tuple[str, str]:
+    words = [w.strip("\"'()") for w in segment.split()]
+    words = [w for w in words if w and "=" not in w.split("/")[0]]   # FOO=bar cmd
+    if not words:
+        return "", ""
+    head = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    head = head[:-4] if head.endswith(".exe") else head
+    if head in ("powershell", "pwsh", "cmd", "bash", "sh") and len(words) > 1:
+        rest = [w for w in words[1:] if not w.startswith(("-", "/"))]
+        return _command_word(" ".join(rest)) if rest else (head, "")
+    return head, (words[1].lower() if len(words) > 1 else "")
+
+
+def _segments(command: str) -> list[str]:
+    """Split on `|`, `||`, `&&`, `;` and newlines outside quotes.
+
+    A regex split cut `grep -n "def \\|import_from" src/icn/imports.py` at the
+    `|` inside the pattern, so the pattern's tail became a "command" and the
+    file after it counted as read (measured: it delivered parsing.py rules).
+    """
+    out, current, quote, i = [], [], "", 0
+    while i < len(command):
+        char = command[i]
+        if quote:
+            if char == "\\" and quote == '"' and i + 1 < len(command):
+                current.append(command[i:i + 2])
+                i += 2
+                continue
+            if char == quote:
+                quote = ""
+            current.append(char)
+        elif char in "'\"":
+            quote = char
+            current.append(char)
+        elif char in "|;\n&":
+            if char == "&" and command[i + 1:i + 2] != "&":
+                current.append(char)          # a lone & (background) is not a separator we split on
+            else:
+                out.append("".join(current))
+                current = []
+                if command[i + 1:i + 2] in ("|", "&") and char in "|&":
+                    i += 1
+        else:
+            current.append(char)
+        i += 1
+    out.append("".join(current))
+    return [s for s in out if s.strip()]
+
+
+def _shell_files(command: str) -> list[str]:
+    """File tokens in a shell command, skipping those only searched or listed."""
+    out: list[str] = []
+    for segment in _segments(command):
+        head, sub = _command_word(segment)
+        if head in SEARCH_COMMANDS or (head == "git" and sub in GIT_SEARCH):
+            continue
+        out.extend(FILE_TOKEN.findall(segment))
+    return out[:30]
 
 
 def touched_files(payload: dict[str, Any], root: Path) -> list[str]:
     """Repository-relative files a tool call is about to read or change."""
+    return list(touched_ranges(payload, root))
+
+
+def _line_range(text: str, needle: str) -> tuple[int, int] | None:
+    at = text.find(needle) if needle else -1
+    if at < 0:
+        return None
+    start = text.count("\n", 0, at) + 1
+    # A trailing newline ends the last line; it does not reach the next one.
+    return start, start + needle.rstrip("\n").count("\n")
+
+
+def touched_ranges(payload: dict[str, Any], root: Path) -> dict[str, tuple[int, int] | None]:
+    """{repository-relative file: (first line, last line) or None for all of it}."""
     tool = str(payload.get("tool_name") or "").lower()
     tool_input = payload.get("tool_input") or {}
     if not isinstance(tool_input, dict):
-        return []
+        return {}
     raw: list[str] = []
     if tool in FILE_TOOLS:
         for key in ("file_path", "path", "notebook_path", "filePath"):
@@ -112,15 +206,14 @@ def touched_files(payload: dict[str, Any], root: Path) -> list[str]:
     if isinstance(command, str):
         if "*** Begin Patch" in command:
             raw.extend(m.strip() for m in PATCH_FILE.findall(command))
-        elif tool in ("bash", "shell", "shell_command", "powershell", "exec_command", "local_shell"):
+        elif tool in SHELL_TOOLS:
             # A shell read (`cat src/x.py`, `Get-Content x`) is contact with a
             # file too. Only tokens naming a real file count.
-            for token in re.findall(r"[\w./\\:-]+\.[A-Za-z0-9]{1,8}", command)[:30]:
-                raw.append(token)
+            raw.extend(_shell_files(command))
 
     cwd = Path(payload.get("cwd") or root)
     root_norm = _norm(root.resolve())
-    out: list[str] = []
+    out: dict[str, tuple[int, int] | None] = {}
     for item in raw:
         candidate = Path(item)
         if not candidate.is_absolute():
@@ -133,10 +226,38 @@ def touched_files(payload: dict[str, Any], root: Path) -> list[str]:
         if not full.startswith(root_norm + "/") or not resolved.is_file():
             continue
         relative = str(resolved)[len(str(root.resolve())):].lstrip("\\/").replace("\\", "/")
-        if relative.startswith((".git/", ".agit/", ".icn-lab/")) or relative in out:
+        if relative.startswith((".git/", ".agit/", ".icn-lab/", ".icn-trace/")) or relative in out:
             continue
-        out.append(relative)
-    return out[:6]
+        out[relative] = _span(tool, tool_input, resolved) if tool in FILE_TOOLS else None
+        if len(out) >= 6:
+            break
+    return out
+
+
+def _span(tool: str, tool_input: dict[str, Any], path: Path) -> tuple[int, int] | None:
+    """The lines a Read or Edit call touches, or None when it is the whole file.
+
+    Any doubt means the whole file: an unlocatable edit or an unreadable file
+    must not hide knowledge, only a precisely located one may narrow it.
+    """
+    try:
+        if tool == "read" and (tool_input.get("offset") or tool_input.get("limit")):
+            start = max(1, int(tool_input.get("offset") or 1))
+            return start, start + max(1, int(tool_input.get("limit") or 2000)) - 1
+        edits = []
+        if tool in ("edit", "edit_file") and isinstance(tool_input.get("old_string"), str):
+            edits = [tool_input]
+        elif tool == "multiedit" and isinstance(tool_input.get("edits"), list):
+            edits = [e for e in tool_input["edits"] if isinstance(e, dict)]
+        if not edits or any(e.get("replace_all") for e in edits):
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace")
+        spans = [_line_range(text, str(e.get("old_string") or "")) for e in edits]
+        if any(s is None for s in spans):
+            return None
+        return min(s[0] for s in spans), max(s[1] for s in spans)
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 # ------------------------------------------------------------------ selection
@@ -154,42 +275,104 @@ def _claim_line(memory: dict[str, Any], limit: int = 260) -> str:
     return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
 
 
-def memories_for_files(conn: sqlite3.Connection, files: list[str]) -> list[dict[str, Any]]:
-    """Memories anchored to these files, unless their code is gone."""
-    if not files:
+_NOT_CODE = re.compile(r"^\s*(?:(?:#|//|--|;|\*|/\*).*)?$")
+
+
+def _inside_symbols(conn: sqlite3.Connection, root: Path | None, file_path: str,
+                    span: tuple[int, int]) -> bool:
+    """Whether every line of code in the span lies inside some indexed symbol.
+
+    Module-level code (constants, imports, top-level statements) belongs to no
+    symbol, so knowledge about it is anchored to the file. A span touching it
+    is treated as touching the whole file, or INTENT_WEIGHTS in search.py would
+    never surface the rule that governs it. Blank and comment lines between
+    symbols are not code, or every span crossing two functions would count.
+    """
+    ranges = conn.execute(
+        "SELECT line_start, COALESCE(line_end, line_start) FROM symbols"
+        " WHERE last_known_path = ? AND status = 'ACTIVE'"
+        " AND line_start IS NOT NULL AND line_start <= ? AND COALESCE(line_end, line_start) >= ?",
+        (file_path, span[1], span[0])).fetchall()
+    covered: set[int] = set()
+    for start, end in ranges:
+        covered.update(range(max(start, span[0]), min(end, span[1]) + 1))
+    gaps = [n for n in range(span[0], span[1] + 1) if n not in covered]
+    if not gaps:
+        return True
+    if root is None:
+        return False
+    try:
+        with (root / file_path).open(encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return False
+    return all(n > len(lines) or _NOT_CODE.match(lines[n - 1]) for n in gaps)
+
+
+def _overlaps(span: tuple[int, int] | None, start: Any, end: Any) -> bool:
+    if span is None or start is None:
+        return True
+    return int(start) <= span[1] and int(end if end is not None else start) >= span[0]
+
+
+def memories_for_files(conn: sqlite3.Connection, files: list[str] | dict[str, tuple[int, int] | None],
+                       root: Path | None = None) -> list[dict[str, Any]]:
+    """Memories anchored to these files, unless their code is gone.
+
+    Given {file: (first, last line)}, a memory anchored only to symbols outside
+    those lines is left for when that code is touched; a file-level anchor, or
+    a symbol with no known lines, always applies.
+    """
+    spans = files if isinstance(files, dict) else {f: None for f in files}
+    if not spans:
         return []
     conn.row_factory = sqlite3.Row
-    marks = ",".join("?" for _ in files)
+    spans = {f: (s if s is None or _inside_symbols(conn, root, f, s) else None)
+             for f, s in spans.items()}
+    marks = ",".join("?" for _ in spans)
     kinds = ",".join("?" for _ in DELIVERED_KINDS)
     found = conn.execute(
         f"SELECT m.memory_id, m.kind, m.severity, m.claim, m.body, m.confidence,"
         f" m.helpful_count, m.unhelpful_count, m.evidence_count, a.file_path, a.symbol_path,"
+        f" COALESCE(s.line_start, a.line_start) AS line_start,"
+        f" COALESCE(s.line_end, a.line_end) AS line_end,"
         f" (SELECT COUNT(*) FROM anchors c WHERE c.memory_id = m.memory_id"
         f"   AND c.status IN ('NEEDS_REVIEW','DRIFTED')) AS unverified"
         f" FROM anchors a JOIN memories m ON m.memory_id = a.memory_id"
+        f" LEFT JOIN symbols s ON s.symbol_id = a.symbol_id AND s.status = 'ACTIVE'"
         f" WHERE a.file_path IN ({marks}) AND m.status = 'ACTIVE' AND m.kind IN ({kinds})"
         f" AND a.status IN ('ACTIVE','NEEDS_REVIEW','DRIFTED')",
-        (*files, *DELIVERED_KINDS)).fetchall()
+        (*spans, *DELIVERED_KINDS)).fetchall()
+    # A memory from a record that touched many files only applies to the
+    # files and symbols its own claim names (see relevance.py).
+    from .relevance import applies, narrowed
+    # Hooks volunteer knowledge unasked, so a broad memory whose claim names
+    # nothing is not volunteered anywhere; investigate() still finds it.
+    focused = narrowed(conn, list({row["memory_id"] for row in found}), keep_unnamed=True)
+    # (memory, file) -> whether any symbol anchor there overlaps the span, and
+    # whether there is any symbol anchor there at all. A memory with symbol
+    # anchors in a file is about those symbols: its file-level anchor is just
+    # their container and must not make it apply to every line.
+    hit: dict[tuple[str, str], bool] = {}
     by_id: dict[str, dict[str, Any]] = {}
     for row in found:
         memory = dict(row)
-        entry = by_id.setdefault(memory["memory_id"], {**memory, "symbols": set()})
+        focus = focused.get(memory["memory_id"])
+        if focus is not None and not applies(focus, memory["file_path"], memory["symbol_path"]):
+            continue
+        key = (memory["memory_id"], memory["file_path"])
+        if memory["symbol_path"]:
+            hit[key] = hit.get(key, False) or _overlaps(
+                spans.get(memory["file_path"]), memory["line_start"], memory["line_end"])
+            if not hit[key]:
+                continue
+        entry = by_id.setdefault(memory["memory_id"], {**memory, "symbols": set(), "files": set()})
+        entry["files"].add(memory["file_path"])
         if memory["symbol_path"]:
             entry["symbols"].add(memory["symbol_path"])
-    # A memory from a record that touched many files only applies to the
-    # files its own claim names (see relevance.py).
-    from .relevance import focus
-    if by_id:
-        marks = ",".join("?" for _ in by_id)
-        anchors: dict[str, list[dict[str, Any]]] = {}
-        for row in conn.execute(f"SELECT memory_id, file_path, symbol_path FROM anchors"
-                                f" WHERE memory_id IN ({marks})", tuple(by_id)):
-            anchors.setdefault(row["memory_id"], []).append(dict(row))
-        for memory_id in list(by_id):
-            memory = by_id[memory_id]
-            focused = focus(_claim_line(memory, 10_000), anchors.get(memory_id, []))
-            if focused["broad"] and not set(focused["files"]) & set(files):
-                del by_id[memory_id]
+    for memory_id in list(by_id):
+        if not any(hit.get((memory_id, f), True) for f in by_id[memory_id]["files"]):
+            del by_id[memory_id]
     ranked = [m for m in by_id.values() if _trusted(m)]
     ranked.sort(key=lambda m: (1 if m["unverified"] else 0, SEVERITY_RANK.get(m["severity"], 2),
                                0 if m["kind"] in ("invariant", "security", "contract") else 1,
@@ -226,15 +409,16 @@ def pre_tool_use(payload: dict[str, Any], agent: str) -> str:
     if not located:
         return ""
     repo_id, root = located
-    files = touched_files(payload, root)
-    if not files:
+    spans = touched_ranges(payload, root)
+    if not spans:
         return ""
+    files = list(spans)
     conn = _store(repo_id)
     if conn is None:
         return ""
     try:
         session = str(payload.get("session_id") or "unknown")
-        candidates = memories_for_files(conn, files)
+        candidates = memories_for_files(conn, spans, root)
         fresh = _undelivered(conn, session, [m["memory_id"] for m in candidates])
         chosen, lines, used = [], [], 0
         for memory in candidates:

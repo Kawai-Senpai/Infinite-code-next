@@ -457,6 +457,7 @@ def test_record_evidence_embeds_the_run_and_refuses_unfinished_runs(research):
                              performance=["The baseline trains to loss 0.07"],
                              evidence=[run_id], root=root)
     assert recorded["ok"] and recorded["evidence"] == [run_id]
-    assert all(run_id in m["body"] for m in recorded["memories_created"])
+    assert all(run_id in server.memory(action="get", memory_id=m["memory_id"], root=root)
+               ["memory"]["body"] for m in recorded["memories_created"])
 
     assert not server.record(summary="x", evidence=["run_missing"], root=root)["ok"]

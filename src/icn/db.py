@@ -358,6 +358,9 @@ CREATE TABLE IF NOT EXISTS anchors (
 CREATE INDEX IF NOT EXISTS idx_anchor_mem    ON anchors(memory_id);
 CREATE INDEX IF NOT EXISTS idx_anchor_sym    ON anchors(symbol_id);
 CREATE INDEX IF NOT EXISTS idx_anchor_status ON anchors(status);
+-- The hook asks "what is anchored to this file" before every tool call. Without
+-- this the planner drove the query from memories and probed anchors per row.
+CREATE INDEX IF NOT EXISTS idx_anchor_file   ON anchors(file_path);
 CREATE INDEX IF NOT EXISTS idx_anchor_fp     ON anchors(content_fingerprint);
 
 CREATE TABLE IF NOT EXISTS memory_edges (
@@ -576,6 +579,7 @@ def _apply_schema(conn: sqlite3.Connection, schema: str) -> None:
             _migrate(conn)
             _backfill_fts(conn)
             _repair_ref_commits(conn)
+            _retire_sibling_contradictions(conn)
             _backfill_test_coverage(conn)
             _set_version(conn)
             return
@@ -694,6 +698,31 @@ def _backfill_test_coverage(conn: sqlite3.Connection) -> None:
             conn.execute("ROLLBACK")
         except sqlite3.Error:
             pass
+
+def _retire_sibling_contradictions(conn: sqlite3.Connection) -> None:
+    """Retire CONTRADICTS edges between memories written by the same event.
+
+    Contradiction detection once compared composed bodies, whose shared event
+    context made every sibling pair look alike, so these edges are all false.
+    They become HISTORICAL rather than being deleted. A no-op once repaired.
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE memory_edges SET status='HISTORICAL'"
+            " WHERE kind='CONTRADICTS' AND status='ACTIVE' AND edge_id IN ("
+            "   SELECT e.edge_id FROM memory_edges e"
+            "   JOIN memories a ON a.memory_id = e.from_id"
+            "   JOIN memories b ON b.memory_id = e.to_id"
+            "   WHERE e.kind='CONTRADICTS' AND a.source_event IS NOT NULL"
+            "   AND a.source_event = b.source_event)")
+        conn.execute("COMMIT")
+    except sqlite3.OperationalError:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
 
 def _repair_ref_commits(conn: sqlite3.Connection) -> None:
     """Null out ref names stored where a commit id belongs.

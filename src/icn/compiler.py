@@ -264,7 +264,7 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
                 anchor_ids.append(anchor_mod.create_anchor(conn, memory_id, None, None, commit,
                                                            target_kind="repo"))
 
-            found = _detect_contradictions(conn, memory_id, memory_kind, body, resolved)
+            found = _detect_contradictions(conn, memory_id, memory_kind, claim, resolved, event_id)
             contradictions.extend(found)
             created_edges += len(found)
 
@@ -808,12 +808,19 @@ def _looks_like_test(symbol: dict[str, Any]) -> bool:
 
 
 def _detect_contradictions(conn: sqlite3.Connection, memory_id: str, kind: str, body: str,
-                           resolved: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                           resolved: list[dict[str, Any]],
+                           event_id: str | None = None) -> list[dict[str, Any]]:
     """Flag a possible knowledge conflict rather than overwriting anything.
 
     Deliberately weak and deliberately `inferred`: this raises the question for
     a human or agent to settle, it never decides. Silently overwriting a prior
     invariant is exactly the failure the trust classes exist to prevent.
+
+    `body` is the claim alone. Comparing composed bodies, which repeat the
+    event's shared "Recorded while" and "Why" context, made every pair of
+    memories from one record() look alike: measured 67 of 67 stored CONTRADICTS
+    edges on this repository linked siblings of the same event. One event does
+    not contradict itself, so siblings are excluded outright.
     """
     if kind not in ("invariant", "warning", "contract", "decision"):
         return []
@@ -825,21 +832,24 @@ def _detect_contradictions(conn: sqlite3.Connection, memory_id: str, kind: str, 
     existing = rows(conn.execute(
         f"SELECT DISTINCT m.* FROM memories m JOIN memory_edges e ON e.from_id = m.memory_id"
         f" WHERE e.to_id IN ({placeholders}) AND e.kind='APPLIES_TO' AND m.status='ACTIVE'"
-        f" AND m.memory_id != ? AND m.kind IN ('invariant','warning','contract','decision')",
-        (*symbol_ids, memory_id),
+        f" AND m.memory_id != ? AND m.kind IN ('invariant','warning','contract','decision')"
+        f" AND COALESCE(m.source_event, '') != ?",
+        (*symbol_ids, memory_id, event_id or ""),
     ))
 
     new_tokens = set(re.findall(r"[a-z]{4,}", body.lower()))
     new_negated = bool(NEGATION.search(body))
     found: list[dict[str, Any]] = []
     for other in existing:
-        other_tokens = set(re.findall(r"[a-z]{4,}", (other["body"] or "").lower()))
+        other_claim = _stored_claim(other)
+        other_tokens = set(re.findall(r"[a-z]{4,}", other_claim.lower()))
         if not other_tokens or not new_tokens:
             continue
         overlap = len(new_tokens & other_tokens) / len(new_tokens | other_tokens)
         if overlap < 0.28:
             continue
-        if new_negated == bool(NEGATION.search(other["body"] or "")):
+        other_negated = bool(NEGATION.search(other_claim))
+        if new_negated == other_negated:
             continue
         _link(conn, memory_id, other["memory_id"], "CONTRADICTS", "inferred", round(overlap, 3),
               {"reason": "similar subject, opposite polarity"})
@@ -847,11 +857,10 @@ def _detect_contradictions(conn: sqlite3.Connection, memory_id: str, kind: str, 
         found.append({"memory_id": other["memory_id"], "title": other["title"],
                       "overlap": round(overlap, 3),
                       "new_claim": body.split("\n", 1)[0],
-                      "existing_claim": (other["body"] or "").split("\n", 1)[0],
+                      "existing_claim": other_claim.split("\n", 1)[0],
                       "shared_terms": shared[:12],
                       "new_polarity": "negative" if new_negated else "positive",
-                      "existing_polarity": ("negative" if NEGATION.search(other["body"] or "")
-                                            else "positive"),
+                      "existing_polarity": "negative" if other_negated else "positive",
                       "existing_authority": other["authority"],
                       "note": "flagged for review, nothing was overwritten"})
     return found

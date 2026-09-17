@@ -261,3 +261,114 @@ def test_correcting_a_memory_changes_what_hooks_deliver(billing):
                   root=billing["root"])
     context = hook("pre-tool-use", edit(billing, "s-corrected"))
     assert "per payment intent id" in context and "charge an invoice twice" not in context
+
+
+# ------------------------------------------------------------------ targeting
+
+def shell(billing, session, command):
+    return {"session_id": session, "cwd": billing["root"], "tool_name": "Bash",
+            "tool_input": {"command": command}}
+
+
+def test_searching_a_file_does_not_spend_its_delivery(billing):
+    # A grep is not work on the file. Delivering then used up the once-per-
+    # session delivery, and the rule was withheld when the file was edited.
+    assert hook("pre-tool-use", shell(billing, "g1", "grep -n settle billing.py | head")) == ""
+    assert hook("pre-tool-use", shell(billing, "g1", "git log -- billing.py")) == ""
+    assert billing["rule"] in hook("pre-tool-use", edit(billing, "g1"))
+    assert billing["rule"] in hook("pre-tool-use", shell(billing, "g2", "cd . && cat billing.py"))
+
+
+def test_reads_and_edits_get_the_knowledge_of_the_code_they_touch(billing):
+    path = str(billing["repo"].root / "billing.py")
+    refund_line = BILLING[:BILLING.index("def refund")].count("\n") + 1
+    elsewhere = {"session_id": "t1", "cwd": billing["root"], "tool_name": "Read",
+                 "tool_input": {"file_path": path, "offset": refund_line, "limit": 2}}
+    assert hook("pre-tool-use", elsewhere) == ""
+    on_refund = {"session_id": "t1", "cwd": billing["root"], "tool_name": "Edit",
+                 "tool_input": {"file_path": path, "old_string": "return {\"invoice\": invoice_id}\n",
+                                "new_string": "return None\n"}}
+    assert hook("pre-tool-use", on_refund) == ""
+    on_settle = {"session_id": "t1", "cwd": billing["root"], "tool_name": "Edit",
+                 "tool_input": {"file_path": path, "old_string": "\"charged\": amount",
+                                "new_string": "\"charged\": amount or 0"}}
+    assert billing["rule"] in hook("pre-tool-use", on_settle)
+
+
+def test_an_edit_that_cannot_be_located_gets_the_whole_file(billing):
+    path = str(billing["repo"].root / "billing.py")
+    unlocatable = {"session_id": "u1", "cwd": billing["root"], "tool_name": "Edit",
+                   "tool_input": {"file_path": path, "old_string": "not in the file",
+                                  "new_string": "x"}}
+    assert billing["rule"] in hook("pre-tool-use", unlocatable)
+
+
+def test_module_level_lines_count_as_the_whole_file(billing):
+    repo, root = billing["repo"], billing["root"]
+    repo.write("limits.py", "MAX_RETRIES = 3\n\n\ndef retry():\n    return MAX_RETRIES\n")
+    repo.commit("limits")
+    server.workspace(action="open", root=root)
+    recorded = server.record(root=root, kind="decision", summary="retry cap",
+                             invariants=["MAX_RETRIES must stay at 3: the provider bans a fourth retry."],
+                             files=["limits.py"])
+    rule = next(m["memory_id"] for m in recorded["memories_created"] if m["kind"] == "invariant")
+    top = {"session_id": "m1", "cwd": root, "tool_name": "Read",
+           "tool_input": {"file_path": str(repo.root / "limits.py"), "offset": 1, "limit": 1}}
+    assert rule in hook("pre-tool-use", top)
+
+
+def test_record_accepts_a_bare_string_and_does_not_echo_bodies(billing):
+    result = server.record(root=billing["root"], kind="note", summary="refund audit",
+                           warnings="refund() must not be called twice for one invoice; the "
+                                    "second call double-credits the customer.",
+                           symbols="refund")
+    assert result["ok"] and result["memories_created"]
+    assert all("body" not in m for m in result["memories_created"])
+    got = server.memory(action="get", memory_id=result["memories_created"][0]["memory_id"],
+                        root=billing["root"])
+    assert "double-credits" in got["memory"]["body"]
+
+
+def test_why_without_a_chain_lists_the_attached_knowledge(billing):
+    why = server.investigate(action="why", symbol="settle", root=billing["root"])
+    assert why["ok"] and why["why_it_exists"] is None
+    assert billing["rule"] in {m["memory_id"] for m in why["attached_memories"]}
+
+
+def test_investigate_prints_a_broad_memory_only_where_its_claim_points(billing):
+    repo, root = billing["repo"], billing["root"]
+    for name in ("ledger", "tax", "audit"):
+        repo.write(f"{name}.py", f"def {name}_entry(x):\n    return x\n")
+    repo.commit("more modules")
+    server.workspace(action="open", root=root)
+    recorded = server.record(root=root, kind="decision", summary="billing review across modules",
+                             invariants=["tax_entry must round half-even: auditors reject banker drift."],
+                             files=["billing.py", "ledger.py", "tax.py", "audit.py"],
+                             symbols=["tax_entry", "ledger_entry"])
+    rule = next(m["memory_id"] for m in recorded["memories_created"] if m["kind"] == "invariant")
+    result = server.investigate(query="ledger_entry tax_entry rounding", intent="modify", root=root)
+    printed = {c["symbol"]: {m["memory_id"] for m in c["memory"]} for c in result["capsules"]}
+    assert rule in printed.get("tax_entry", set())
+    assert "ledger_entry" in printed and rule not in printed["ledger_entry"]
+
+
+def test_file_anchors_are_indexed_for_the_hook_query(billing):
+    """The hook asks 'what is anchored to this file' before every tool call.
+
+    Without an index on anchors(file_path) SQLite drove that query from the
+    memories table and probed anchors per row: measured 16-24 ms against 11 ms,
+    on every tool call.
+    """
+    from icn import db, paths
+    from icn.hooks import resolve_repo
+
+    repo_id, _ = resolve_repo(billing["root"])
+    conn = db.init_repo_store(paths.repo_db_path(repo_id))
+    try:
+        plan = " ".join(str(r[-1]) for r in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT m.memory_id FROM anchors a"
+            " JOIN memories m ON m.memory_id = a.memory_id"
+            " WHERE a.file_path IN ('billing.py') AND m.status='ACTIVE'"))
+    finally:
+        conn.close()
+    assert "idx_anchor_file" in plan, plan

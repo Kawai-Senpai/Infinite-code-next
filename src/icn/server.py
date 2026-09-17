@@ -50,6 +50,7 @@ from . import lab as lab_mod
 from . import papers as papers_mod
 from . import search as search_mod
 from . import workspace as ws_mod
+from .db import rows
 
 INSTRUCTIONS = """Persistent code knowledge for this workspace.
 
@@ -284,6 +285,7 @@ def workspace(
                 "needs_review": urgent,
                 "briefing": brief,
                 **_lab_briefing(current.root),
+                **_trace_briefing(current.root),
                 **({"handoff": waiting} if waiting else {}),
                 "next": ("read the handoff, then investigate() the next step it names" if waiting
                          else "investigate('what you are about to change')"),
@@ -421,12 +423,27 @@ def investigate(
                 return _fail("could not resolve symbol " + repr(symbol), str(current.root))
             story = causal.why_does_this_exist(current.store, match["row"]["symbol_id"])
             if story is None:
+                # No chain is not no knowledge: a symbol governed by a
+                # high-severity invariant used to come back empty-handed here.
+                attached = rows(current.store.execute(
+                    "SELECT DISTINCT m.memory_id, m.kind, m.severity, m.title,"
+                    " (SELECT a.status FROM anchors a WHERE a.memory_id = m.memory_id"
+                    "   AND a.symbol_id = e.to_id LIMIT 1) AS anchor_status"
+                    " FROM memory_edges e JOIN memories m ON m.memory_id = e.from_id"
+                    " WHERE e.to_id = ? AND e.kind = 'APPLIES_TO' AND e.status = 'ACTIVE'"
+                    " AND m.status = 'ACTIVE'"
+                    " ORDER BY CASE m.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1"
+                    " WHEN 'medium' THEN 2 ELSE 3 END LIMIT 8",
+                    (match["row"]["symbol_id"],)))
                 return {"ok": True, "resolved_root": str(current.root),
                         "symbol": match["row"]["symbol_path"], "why_it_exists": None,
-                        "note": "no causal history recorded for this symbol; use"
-                                " investigate() for the memories attached to it"}
+                        "attached_memories": attached,
+                        **_observed(current.root, match["row"]),
+                        "note": "no causal chain recorded for this symbol; the memories"
+                                " attached to it are listed instead"}
             return {"ok": True, "resolved_root": str(current.root),
                     "symbol": match["row"]["symbol_path"], "why_it_exists": story,
+                    **_observed(current.root, match["row"]),
                     "rendered": causal.render(story)}
 
         if act == "expand":
@@ -490,6 +507,8 @@ def graph(
     window: int = 500,
     since: str = "",
     root: str | None = None,
+    timeout_seconds: int = 600,
+    run_options: list[str] | str | None = None,
 ) -> dict[str, Any]:
     """Structural questions about the code graph: blast radius, paths, cycles.
 
@@ -537,6 +556,22 @@ def graph(
               symbols nothing in the graph reaches. CANDIDATES, never a
               verdict - read `confidence` on every row and the boundaries
               before acting on one.
+      run     the runtime counterpart of all of the above: execute `target`
+              (any shell command: 'python app.py', 'pytest -x tests/test_a.py',
+              'npm test') and record what actually happened. Python gets the
+              full call flow, arguments, return values, how local variables
+              changed line by line, time and CPU per function, exceptions and
+              library calls; Node.js gets a sampled CPU profile; anything else
+              gets time, memory, exit code and output. Calls the static graph
+              does not know (dynamic dispatch, callbacks) are listed. Returns
+              the path of report.md: READ THAT FILE, it is written for you.
+      run_diff
+              compare two recorded runs, e.g. before and after a change, or a
+              passing and a failing input: the first point where the call
+              sequence diverges, the first variables whose values differ, calls
+              and exceptions present in only one run, and time that moved.
+              `target` and `to` name the two runs (folder or name fragment);
+              omit both to compare the two most recent runs in `root`.
 
     READ THE ENVELOPE BEFORE THE RESULT. Every answer carries:
       epistemic   'exact' or 'lower-bound'. 'lower-bound' means callers exist
@@ -585,12 +620,31 @@ def graph(
         window: commits to read, for the history actions. Default 500, max 5000.
         since: a git date ('3 months ago', '2026-01-01') bounding that window.
         root: repository path. Defaults to the server's working directory.
+            For action='run', the directory the command runs in.
+        timeout_seconds: for action='run', stop the command after this long.
+        run_options: for action='run', any of 'libraries' (also trace the
+            standard library and installed packages; slower), 'memory'
+            (allocation sites; slower), 'no-values' (flow and timing only;
+            fastest).
     """
     action = (action or "impact").lower().strip()
     known = ("impact", "trace", "cycles", "entrypoints", "areas", "triggers",
-             "coupling", "hotspots", "deadcode")
+             "coupling", "hotspots", "deadcode", "run", "run_diff")
     if action not in known:
         return _fail(f"unknown action {action!r}; use one of {', '.join(known)}", root)
+    if action == "run":
+        return _run_traced(target, root, timeout_seconds, run_options)
+    if action == "run_diff":
+        from . import flowdiff
+        cwd = Path(root).resolve() if root else Path.cwd()
+        try:
+            if bool(target.strip()) != bool(to.strip()):
+                return _fail("run_diff takes both `target` and `to`, or neither", root)
+            result = flowdiff.diff(cwd, target.strip() or None, to.strip() or None)
+        except ValueError as err:
+            return _fail(str(err), root)
+        return {**result, "action": "run_diff", "resolved_root": str(cwd),
+                "next": "read the report file: first divergence, differing values, calls, errors"}
     if action in ("impact", "trace", "triggers") and not target.strip():
         return _fail(f"target is required for action={action!r}", root)
     if action == "trace" and not to.strip():
@@ -641,29 +695,72 @@ def graph(
         current.close()
 
 
+def _run_traced(command: str, root: str | None, timeout_seconds: int,
+                options: list[str] | str | None) -> dict[str, Any]:
+    from . import flowrun
+    if not command.strip():
+        return _fail("target is required for action='run': the command to execute", root)
+    chosen = {o.strip().lower() for o in ([options] if isinstance(options, str) else options or [])}
+    unknown = chosen - {"libraries", "memory", "no-values"}
+    if unknown:
+        return _fail(f"unknown run_options {sorted(unknown)}; use libraries, memory, no-values", root)
+    cwd = Path(root).resolve() if root else Path.cwd()
+    if not cwd.is_dir():
+        return _fail(f"{cwd} is not a directory", root)
+    store_path = None
+    try:
+        # Only a repository ICN already knows is compared, found through the
+        # catalog alone: opening a workspace on an arbitrary directory would
+        # register it as a new repository. It is indexed first so the runtime
+        # calls meet the current code, then released, since the command may
+        # run for minutes.
+        from . import hooks as hooks_mod, paths
+        located = hooks_mod.resolve_repo(str(cwd))
+        if located:
+            current = ws_mod.open_workspace(str(located[1]))
+            try:
+                ws_mod.ensure_indexed(current)
+                store_path = paths.repo_db_path(current.repo_id)
+            finally:
+                current.close()
+    except Exception:  # noqa: BLE001 - tracing works outside a repository too
+        store_path = None
+    result = flowrun.run(
+        command, cwd, values="no-values" not in chosen, libraries="libraries" in chosen,
+        memory="memory" in chosen, timeout=max(1, timeout_seconds), echo=False,
+        static_graph=(lambda edges: flowrun.check_static_graph(store_path, edges))
+        if store_path and store_path.exists() else None)
+    result["action"] = "run"
+    result["resolved_root"] = str(cwd)
+    result["validation_boundary"] = (
+        "Runtime evidence from one execution. It proves these calls and values happened on this "
+        "run with these inputs; it says nothing about paths this run did not take.")
+    return result
+
+
 @mcp.tool()
 def record(
     summary: str,
     kind: str = "note",
     reasoning: str = "",
-    files: list[str] | None = None,
-    symbols: list[str] | None = None,
-    changes: list[str] | None = None,
-    invariants: list[str] | None = None,
-    warnings: list[str] | None = None,
-    failed_attempts: list[str] | None = None,
-    decisions: list[str] | None = None,
-    contracts: list[str] | None = None,
-    performance: list[str] | None = None,
-    security: list[str] | None = None,
-    conventions: list[str] | None = None,
-    rationale: list[str] | None = None,
-    bugs: list[str] | None = None,
-    migrations: list[str] | None = None,
-    tests: list[str] | None = None,
+    files: list[str] | str | None = None,
+    symbols: list[str] | str | None = None,
+    changes: list[str] | str | None = None,
+    invariants: list[str] | str | None = None,
+    warnings: list[str] | str | None = None,
+    failed_attempts: list[str] | str | None = None,
+    decisions: list[str] | str | None = None,
+    contracts: list[str] | str | None = None,
+    performance: list[str] | str | None = None,
+    security: list[str] | str | None = None,
+    conventions: list[str] | str | None = None,
+    rationale: list[str] | str | None = None,
+    bugs: list[str] | str | None = None,
+    migrations: list[str] | str | None = None,
+    tests: list[str] | str | None = None,
     contracts_with: list[dict] | None = None,
     caused_by: list[str | dict] | None = None,
-    evidence: list[str] | None = None,
+    evidence: list[str] | str | None = None,
     authority: str = "agent",
     root: str | None = None,
 ) -> dict[str, Any]:
@@ -737,23 +834,45 @@ def record(
             decision -> bug -> failed fix -> accepted fix -> invariant -> test.
             Pass ids, or [{"memory": "mem_x", "kind": "CAUSED"}] where kind is
             CAUSED, LED_TO, ESTABLISHED, REFINES or DEPENDS_ON.
-        evidence: experiment run ids (from experiment()) that measured what
-            this records. Each finished run's commit, command, exit code and
-            metrics are written into every memory, so the claim carries its
-            proof instead of asking to be believed.
+        evidence: proof that what this records actually happened. Either
+            experiment run ids (from experiment()), whose commit, command,
+            exit code and metrics are written into every memory, or recorded
+            runs (from graph(action='run'), named by their folder such as
+            '20260917-160603-perms'), whose command, exit code, timing and
+            hottest functions are written in the same way, with the path of
+            the full report. The claim then carries its proof instead of
+            asking to be believed.
         authority: 'agent' or 'human'. Human memories cannot be rewritten by an agent.
         root: repository path. Defaults to the server's working directory.
     """
     if not summary.strip():
         return _fail("record requires a summary")
+    # Agents routinely pass one claim as a bare string. Rejecting that with a
+    # schema error cost a retry of the whole call; one string is a one-item list.
+    (files, symbols, changes, invariants, warnings, failed_attempts, decisions, contracts,
+     performance, security, conventions, rationale, bugs, migrations, tests, evidence) = (
+        [v] if isinstance(v, str) else v
+        for v in (files, symbols, changes, invariants, warnings, failed_attempts, decisions,
+                  contracts, performance, security, conventions, rationale, bugs, migrations,
+                  tests, evidence))
 
     current = ws_mod.open_workspace(root)
     try:
         run_ids = [r.strip() for r in (evidence or []) if r and r.strip()]
         if run_ids:
+            # Two kinds of proof, one field: a lab run measured something, a
+            # recorded run observed something. Recorded runs are named by their
+            # folder (`20260917-160603-perms`), lab runs by a `run_` id.
+            traces = [r for r in run_ids if not r.startswith("run_")]
+            lab_runs = [r for r in run_ids if r.startswith("run_")]
+            proof = []
             try:
-                proof = lab_mod.evidence_for(current.root, run_ids)
-            except lab_mod.LabError as err:
+                if lab_runs:
+                    proof += lab_mod.evidence_for(current.root, lab_runs)
+                if traces:
+                    from . import flowrun
+                    proof += flowrun.evidence_for(current.root, traces)
+            except (lab_mod.LabError, ValueError) as err:
                 return _fail(str(err), str(current.root))
             reasoning = "\n".join([reasoning.strip(), *proof]).strip()
         ws_mod.ensure_indexed(current)
@@ -780,6 +899,12 @@ def record(
             result["hint"] = ("some names did not resolve to indexed code; they were kept as "
                               "repo-scoped knowledge. Check spelling or run "
                               "workspace(action='reindex').")
+        # The caller wrote these bodies moments ago. Echoing each composed body
+        # (claim plus the shared reasoning, ~900 characters apiece) made a
+        # seven-memory record answer with ~5k tokens of its own input.
+        for memory in result.get("memories_created", []):
+            memory.pop("body", None)
+        result["memories_note"] = "bodies omitted; memory(action='get', memory_id=...) returns one"
         return result
     finally:
         current.close()
@@ -1034,6 +1159,66 @@ def agit(
         return result
     finally:
         current.close()
+
+
+def _observed(root: Path, symbol: dict[str, Any]) -> dict[str, Any]:
+    """Whether a recorded run actually ran this symbol, and who called it.
+
+    The static graph answers 'who could call this' and says so as a lower
+    bound. A recording answers 'who did call this, on that run', which is the
+    evidence the bound is missing. Never allowed to break why().
+    """
+    try:
+        from . import flowdiff, flowrun
+
+        recorded = flowdiff.runs_in(root)
+        if not recorded:
+            return {}
+        wanted = symbol.get("symbol_path")
+        for run in recorded[-3:][::-1]:
+            edges = flowrun.edges_of_run(run, root)
+            callers = sorted({f"{e['caller']} ({e['caller_file']}:{e['caller_line']})"
+                              for e in edges if e["callee"] == wanted})
+            calls = sum(e["count"] for e in edges if e["callee"] == wanted)
+            if calls:
+                return {"observed_at_runtime": {
+                    "run": run.name, "calls": calls, "called_by": callers[:8],
+                    "report": str(run / "report.md"),
+                    "note": "observed on that run only; it says nothing about paths that run "
+                            "did not take"}}
+        return {"observed_at_runtime": {
+            "run": recorded[-1].name, "calls": 0,
+            "note": "the most recent recorded runs never reached this symbol; that is not proof "
+                    "it is unreachable, only that those runs did not take it"}}
+    except Exception:  # noqa: BLE001 - see docstring
+        return {}
+
+
+def _trace_briefing(root: Path) -> dict[str, Any]:
+    """Recorded runs waiting to be read, for open().
+
+    A recording nobody knows about is worth as little as a memory nobody
+    queries, so open() names the most recent ones. Like the lab briefing, it
+    is never allowed to break open().
+    """
+    try:
+        from . import flowdiff
+
+        recorded = flowdiff.runs_in(root)
+        if not recorded:
+            return {}
+        latest = []
+        for run in recorded[-3:][::-1]:
+            summary = flowdiff.summary_of(run)
+            latest.append({"run": run.name, "command": summary["command"],
+                           "exit_code": summary["process"].get("exit_code"),
+                           "report": str(run / "report.md")})
+        return {"recorded_runs": {
+            "total": len(recorded), "latest": latest,
+            "note": "graph(action='run') records a new one; graph(action='run_diff') compares two; "
+                    "record(evidence=['<run>']) cites one as proof"}}
+    except Exception as err:          # noqa: BLE001 - see docstring
+        return {"recorded_runs": {"error": f"recordings unreadable: {err}"}}
 
 
 def _lab_briefing(root: Path) -> dict[str, Any]:

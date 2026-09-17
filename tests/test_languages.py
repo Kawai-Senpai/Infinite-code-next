@@ -475,3 +475,33 @@ def test_a_receiver_that_names_no_import_does_not_resolve_by_module(polyglot):
         " WHERE e.kind='CALLS' AND e.source='tree-sitter:imported_module'"
         " AND s.symbol_path='Lookup'"))
     assert found[0]["n"] == 0
+
+
+def test_a_call_through_an_import_alias_resolves_to_that_module(repo):
+    """`from . import catalog as catalog_mod; catalog_mod.open_workspace()`.
+
+    The receiver is the local alias, which is neither the module's stem nor its
+    package, and `open_workspace` is defined in two files. The call was dropped
+    as ambiguous until aliases were read off the import statement; found by
+    recording a real run and comparing it with the static graph.
+    """
+    from icn import server
+    from icn import workspace as ws_mod
+
+    repo.write("pkg/__init__.py", "")
+    repo.write("pkg/catalog.py", "def open_workspace(root):\n    return root\n")
+    repo.write("pkg/workspace.py",
+               "from . import catalog as catalog_mod\n\n\n"
+               "def open_workspace(root=None):\n    return catalog_mod.open_workspace(root)\n")
+    repo.commit("alias")
+    server.workspace(action="open", root=str(repo.root))
+    current = ws_mod.open_workspace(str(repo.root))
+    try:
+        found = rows(current.store.execute(
+            "SELECT t.last_known_path path, e.source FROM code_edges e"
+            " JOIN symbols s ON s.symbol_id = e.from_id JOIN symbols t ON t.symbol_id = e.to_id"
+            " WHERE e.kind='CALLS' AND e.status='ACTIVE' AND s.last_known_path='pkg/workspace.py'"
+            " AND t.name='open_workspace'"))
+    finally:
+        current.close()
+    assert [(r["path"], r["source"]) for r in found] == [("pkg/catalog.py", "tree-sitter:imported_module")]

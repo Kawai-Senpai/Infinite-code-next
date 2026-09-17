@@ -12,6 +12,7 @@ Splitting it into independent sessions would test setup, not behaviour.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -132,6 +133,16 @@ def live(tmp_path_factory):
                                 "kind": "CONSUMES_CONTRACT"}]})
         captured["cross"] = client.call("investigate", {
             "query": "refresh session", "cross_repos": True})
+
+        # A bare string where a list is declared, as agents routinely send it.
+        captured["string_record"] = client.call("record", {
+            "kind": "note", "summary": "one warning as a string",
+            "warnings": "Do not call refresh_session without the coordinator lock",
+            "symbols": "refresh_session"})
+        # Record a real run over the wire; stdout must stay pure protocol.
+        captured["traced"] = client.call("graph", {
+            "action": "run", "timeout_seconds": 120,
+            "target": f'"{sys.executable}" -c "import auth"'})
 
         captured["briefing"] = client.call("workspace", {"action": "open"})
         captured["repos"] = client.call("workspace", {"action": "list"})
@@ -300,3 +311,16 @@ def test_new_problem_detectors_are_live(live):
     kinds = {p["kind"] for p in live["after"]["problems"]}
     assert kinds, "expected at least one problem reported"
     assert "stale_knowledge" in kinds
+
+
+def test_record_accepts_a_bare_string_over_the_wire(live):
+    result = live["string_record"]
+    assert result["ok"] is True and result["memories_created"]
+    assert all("body" not in m for m in result["memories_created"])
+
+
+def test_a_run_is_recorded_over_the_wire(live):
+    result = live["traced"]
+    assert result["ok"] is True and result["action"] == "run"
+    assert result["exit_code"] == 0 and result["python_processes"] >= 1
+    assert Path(result["report"]).read_text(encoding="utf-8").startswith("# Execution report")

@@ -105,3 +105,21 @@ def test_verify_repo_caps_the_detail_it_reports(monkeypatch, tmp_path):
 
     import json
     assert len(json.dumps(report)) < 20_000, "open() payload must stay readable"
+
+
+def test_verify_repo_counts_held_anchors_instead_of_listing_them(monkeypatch, tmp_path):
+    """An unchanged anchor still awaiting review is a state, not a change."""
+    from icn import anchors as anchor_mod
+
+    held = {"status": "NEEDS_REVIEW", "transition": "unchanged_unverified"}
+    moved = {"status": "NEEDS_REVIEW", "transition": "body_changed"}
+    monkeypatch.setattr(anchor_mod, "verify_anchor",
+                        lambda conn, anchor, root, commit: moved if anchor["anchor_id"] == "anc_0" else held)
+    conn = db.init_repo_store(tmp_path / "s.db")
+    for i in range(5):
+        conn.execute("INSERT INTO anchors (anchor_id, memory_id, target_kind, status, created_at)"
+                     " VALUES (?,?,?,?,?)", (f"anc_{i}", f"mem_{i}", "symbol", "NEEDS_REVIEW", now()))
+    conn.commit()
+    report = anchor_mod.verify_repo(conn, tmp_path, "abc123")
+    conn.close()
+    assert report["changed_total"] == 1 and report["still_unverified"] == 4

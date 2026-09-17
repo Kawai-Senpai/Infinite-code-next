@@ -46,6 +46,12 @@ def probe(root: Path, timeout: float = 15.0) -> dict[str, Any]:
     """Launch ICN exactly as an MCP client does and verify tools/list."""
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
     env.pop("INFINITE_CODE_ROOT", None)
+    # Probe the icn that is running this check. An interpreter with icn loaded
+    # from a source tree rather than installed failed with "No module named icn",
+    # and one with a different installed copy would have probed the wrong code.
+    package_parent = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (package_parent, env.get("PYTHONPATH", "")) if p)
     proc = subprocess.Popen(
         [sys.executable, "-m", "icn"], cwd=str(root), env=env,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

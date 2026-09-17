@@ -21,6 +21,7 @@ Two rules shape this module:
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -69,7 +70,7 @@ CALL_TIERS: dict[str, tuple[str, float]] = {
 }
 
 DEFAULT_EXCLUDES = {
-    ".git", ".agit", ".icn-lab", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+    ".git", ".agit", ".icn-lab", ".icn-trace", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
     "env", ".env", "dist", "build", "target", ".next", ".nuxt", ".output",
     "vendor", ".idea", ".vscode", ".mypy_cache", ".pytest_cache", ".ruff_cache",
     "coverage", ".tox", "site-packages", ".gradle", "bin", "obj", ".terraform",
@@ -140,6 +141,27 @@ def iter_source_files(root: Path, extra_excludes: Iterable[str] = ()):
 def walk_source_files(root: Path, extra_excludes: Iterable[str] = ()) -> list[Path]:
     """Every parseable file in the tree, excludes applied."""
     return list(iter_source_files(root, extra_excludes))
+
+
+_FROM_IMPORT = re.compile(r"^\s*from\s+\S+\s+import\s+\(?(.+?)\)?\s*$")
+_PLAIN_IMPORT = re.compile(r"^\s*import\s+(?!type\b)([\w.]+(?:\s+as\s+\w+)?(?:\s*,\s*[\w.]+(?:\s+as\s+\w+)?)*)\s*;?\s*$")
+_JS_NAMESPACE = re.compile(r"\*\s+as\s+(\w+)\s+from\s+['\"]([^'\"]+)['\"]")
+
+
+def _import_aliases(raw: str) -> list[tuple[str, str]]:
+    """(imported name, local alias) pairs bound with `as` in one import statement."""
+    js = _JS_NAMESPACE.search(raw)
+    if js:
+        return [(js.group(2), js.group(1))]
+    match = _FROM_IMPORT.match(raw) or _PLAIN_IMPORT.match(raw)
+    if not match:
+        return []
+    pairs = []
+    for part in match.group(1).split(","):
+        words = part.split()
+        if len(words) == 3 and words[1] == "as":
+            pairs.append((words[0], words[2]))
+    return pairs
 
 
 def _defer_under_budget(path: Path) -> bool:
@@ -450,6 +472,31 @@ class Indexer:
                     if alias:
                         table.setdefault(alias, set()).add(target)
 
+        # Local names bound with `as`. `from . import catalog as catalog_mod`
+        # makes the receiver `catalog_mod`, which matched neither stem nor
+        # package, so `catalog_mod.open_workspace(...)` fell through to the
+        # name tiers and was dropped as ambiguous: found by `graph(action='run')`
+        # observing a call the static graph did not have, and 28 call sites of
+        # open_workspace unattributed. The raw import text is already stored.
+        by_stem: dict[str, dict[str, set[str]]] = {}
+        for from_id, targets in imports_of.items():
+            for target in targets:
+                path = paths.get(target, "")
+                if path:
+                    stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                    by_stem.setdefault(from_id, {}).setdefault(stem, set()).add(target)
+        for row in rows(self.conn.execute(
+                "SELECT file_id, imports_raw FROM files WHERE status='ACTIVE'"
+                " AND imports_raw IS NOT NULL AND imports_raw LIKE '% as %'")):
+            stems = by_stem.get(row["file_id"])
+            if not stems:
+                continue
+            for spec in jload(row["imports_raw"], []) or []:
+                for original, alias in _import_aliases(spec.get("raw") or ""):
+                    hit = stems.get(original.rsplit(".", 1)[-1].rsplit("/", 1)[-1])
+                    if hit and alias:
+                        aliases.setdefault(row["file_id"], {}).setdefault(alias, set()).update(hit)
+
         # Field types, keyed by the container that declares them. A field is
         # assigned in one method - usually the constructor - and read in
         # others, so a per-symbol table alone would resolve `self.store.get()`
@@ -663,8 +710,21 @@ class Indexer:
                     for callee in sorted(set(jload(row["calls_raw"], []) or [])):
                         callee = str(callee)
                         leaf = callee.rsplit(".", 1)[-1].strip()
-                        if not leaf or leaf == row["name"]:
+                        if not leaf:
                             continue
+                        if leaf == row["name"]:
+                            # Recursion (`walk()`, `self.walk()`, `super().walk()`)
+                            # is skipped: resolving it by name would point it at
+                            # a same-named function elsewhere. A call through
+                            # another receiver is not recursion. Skipping every
+                            # same-named call dropped each delegating wrapper,
+                            # `open_workspace` -> `catalog_mod.open_workspace`,
+                            # without even recording it as unresolved; a
+                            # recorded run showed the call the graph lacked.
+                            receiver = callee.rsplit(".", 1)[0] if "." in callee else ""
+                            if not receiver or receiver in ("self", "this", "cls") \
+                                    or receiver.startswith("super"):
+                                continue
                         target_id, tier, count = self._resolve_one_call(
                             callee, row, tables)
                         if target_id is None:

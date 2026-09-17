@@ -19,6 +19,7 @@ fact when its anchor says otherwise.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import sqlite3
@@ -33,6 +34,7 @@ from . import crossrepo
 from . import diagnostics
 from . import embed
 from . import ids
+from . import relevance
 from . import vectors
 from .db import jdump, jload, one, rows, write_tx
 from .identity import run_git
@@ -518,9 +520,12 @@ def _memories_for_symbols(conn: sqlite3.Connection, symbol_ids: list[str]) -> di
     placeholders = ",".join("?" for _ in symbol_ids)
     found = rows(conn.execute(
         f"SELECT e.to_id AS symbol_id, m.*, a.status AS anchor_status,"
-        f" a.anchor_confidence, a.last_verified_commit AS anchor_verified_commit"
+        f" a.anchor_confidence, a.last_verified_commit AS anchor_verified_commit,"
+        f" e.kind AS edge_kind, e.evidence AS edge_evidence,"
+        f" s.symbol_path AS edge_symbol_path, s.last_known_path AS edge_file_path"
         f" FROM memory_edges e JOIN memories m ON m.memory_id = e.from_id"
         f" LEFT JOIN anchors a ON a.memory_id = m.memory_id AND a.symbol_id = e.to_id"
+        f" LEFT JOIN symbols s ON s.symbol_id = e.to_id"
         f" WHERE e.to_id IN ({placeholders}) AND e.kind IN ('APPLIES_TO','IMPACTS','GUARDED_BY')"
         f" AND e.status='ACTIVE'",
         tuple(symbol_ids),
@@ -537,6 +542,42 @@ def _memories_for_symbols(conn: sqlite3.Connection, symbol_ids: list[str]) -> di
         seen.add(key)
         grouped.setdefault(row["symbol_id"], []).append(row)
     return grouped
+
+
+def _focused_for_display(conn: sqlite3.Connection,
+                         grouped: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
+    """The memories a capsule should print, as opposed to the ones that score it.
+
+    record() anchors every memory of an event to every symbol the event named,
+    so `record` printed lab.py invariants and hook_command a _find_duplicate
+    rule. A broad memory whose claim names specific code is printed only there
+    and on callers derived from there.
+
+    Scoring deliberately still sees every attachment. Filtering it too was
+    measured (memory title -> anchored symbol, 120 queries per repository):
+    MRR fell on all four repositories measured, e.g. 0.418 -> 0.389 on
+    Infinite-code-next and 0.481 -> 0.467 on be-core-service, even when only the
+    symbols a claim names counted as correct, because sibling memories are part
+    of what the calibrated memory signal rewards.
+    """
+    narrowed = relevance.narrowed(conn, [m["memory_id"] for ms in grouped.values() for m in ms])
+    if not narrowed:
+        return grouped
+    return {symbol_id: [m for m in ms if m["memory_id"] not in narrowed
+                        or _focus_reaches(narrowed[m["memory_id"]], m)]
+            for symbol_id, ms in grouped.items()}
+
+
+def _focus_reaches(focused: dict[str, Any], row: dict[str, Any]) -> bool:
+    if row["edge_kind"] == "APPLIES_TO":
+        return relevance.applies(focused, row["edge_file_path"], row["edge_symbol_path"])
+    # A derived edge (a caller, a guarding test) applies when the symbol it was
+    # derived from does.
+    try:
+        target = (json.loads(row["edge_evidence"] or "null") or {}).get("target")
+    except (ValueError, AttributeError):
+        target = None
+    return target is None or target in focused["symbols"]
 
 
 def _specificity_map(conn: sqlite3.Connection, symbol_ids: list[str]) -> dict[str, float]:
@@ -991,6 +1032,7 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
         ))
     }
     memories_by_symbol = _memories_for_symbols(conn, candidate_ids)
+    shown_by_symbol = _focused_for_display(conn, memories_by_symbol)
 
     touched = _recency_map(root, commit) if weights["time"] > 0.2 else {}
 
@@ -1042,8 +1084,8 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
     for score, symbol, attached, breakdown in scored:
         if score <= 0.05:
             break
-        capsule = _capsule(conn, catalog, symbol, attached, chosen, shown,
-                           memory_hits, terms)
+        capsule = _capsule(conn, catalog, symbol, shown_by_symbol.get(symbol["symbol_id"], []),
+                           chosen, shown, memory_hits, terms)
         capsule["score"] = round(score, 3)
         capsule["score_breakdown"] = breakdown
         cost = _estimate_tokens(capsule)
@@ -1209,7 +1251,8 @@ def expand(conn: sqlite3.Connection, catalog: sqlite3.Connection, investigation_
                                     "run investigate() again with the narrower query",
         }
 
-    memories_by_symbol = _memories_for_symbols(conn, [s["symbol_id"] for s in matched])
+    memories_by_symbol = _focused_for_display(
+        conn, _memories_for_symbols(conn, [s["symbol_id"] for s in matched]))
     capsules = []
     used = 0
     for symbol in matched[:8]:

@@ -599,6 +599,7 @@ published page must stay a single self-contained file.
 | `workspace` | `open` · `status` · `list` · `reindex` · `health` · `reconcile` · `archive` · `detach` · `forget_checkout` · `purge` |
 | `investigate` | search · `why` · `expand` · `verify` |
 | `record` | one event → many anchored facts |
+| `graph` | `impact` · `trace` · `cycles` · `entrypoints` · `areas` · `triggers` · `coupling` · `hotspots` · `deadcode` · `run` · `run_diff` |
 | `memory` | `get` · `list` · `verify` · `guard` · `correct` · `supersede` · `resolve` · `reanchor` |
 | `agit` | `status` · `diff` · `commit` · `log` · `branches` · `switch` · `restore` · `reset` · `show` |
 | `experiment` | `init` · `tree` · `create` · `checkout` · `commit` · `diff` · `run` · `status` · `log` · `wait` · `cancel` · `runs` · `conclude` · `promote` · `apply` · `set_command` |
@@ -621,7 +622,7 @@ attaches the same proof to any memory.
 
 ## Knowledge that arrives without being asked
 
-Full setup, verification and troubleshooting guide: [docs/HOOKS.md](docs/HOOKS.md).
+Full setup, verification and troubleshooting guide: [guides/HOOKS.md](guides/HOOKS.md).
 
 `icn install --codex` wires two hooks into Claude Code (`.claude/settings.json`)
 and Codex (`~/.codex/hooks.json`):
@@ -634,6 +635,12 @@ and Codex (`~/.codex/hooks.json`):
   silent for files with no knowledge, and fail-open (a broken hook exits 0 with
   no output). Knowledge on code that changed since it was recorded is labelled
   unverified rather than hidden.
+- **Targeted to the code actually touched.** A ranged Read or an Edit gets the
+  knowledge of the symbols in those lines (plus file-level knowledge when the
+  lines include module-level code); rules about other functions in the same
+  file wait until that code is touched. Searching or listing (`grep`, `rg`,
+  `ls`, `find`, `git log`) delivers nothing, so a search never uses up the
+  once-per-session delivery before the file is read.
 
 The same session can close the loop:
 
@@ -667,6 +674,59 @@ Experiments are part of the knowledge graph, not beside it:
   files still match the baseline. Measured memories are re-verified, because a
   measurement of a recorded commit stays true; everything else the change put
   under review is listed for a human look.
+
+## Recording what actually ran
+
+Full guide: [guides/TRACE.md](guides/TRACE.md).
+
+Static analysis says what could happen. `icn trace` records what did:
+
+```sh
+icn trace python app.py
+icn trace -- pytest -x tests/test_orders.py
+icn trace npm test
+```
+
+Any command works. Every Python process it starts records its call flow,
+arguments, return values, how local variables changed line by line, wall and
+CPU time per function, library calls and exceptions (Python 3.12+ uses
+`sys.monitoring`; older versions fall back to `sys.settrace`). Every Node.js
+process writes a sampled CPU profile. Anything else gets time, memory, exit
+code and output. The result is `.icn-trace/<run>/report.md`, written to be read
+top to bottom by a person or an agent, with `report-full.md` and the raw
+recordings beside it.
+
+When the repository is indexed, the report also lists calls that ran but are
+missing from ICN's static call graph. Those are the callers
+`graph(action="impact")` cannot see.
+
+To find where a working run and a broken one parted ways:
+
+```sh
+icn trace python app.py        # works
+# ... change something ...
+icn trace python app.py        # fails
+icn trace diff                 # the two most recent runs
+```
+
+The diff names the first point where the call sequence diverged, the earliest
+variable whose value differed (with the line that produced it), calls and
+exceptions present in only one run, and time that moved. Agents get the same
+through `graph(action="run", target="<command>")` and
+`graph(action="run_diff")`.
+
+A recording is evidence, on the same footing as a measured experiment, so it is
+part of the knowledge graph rather than a side artifact:
+
+- `record(evidence=["<run>"])` writes the run's command, exit code, timing and
+  hottest functions into every memory of that event, with the path of its
+  report, exactly as `evidence=["run_..."]` does for a lab run.
+- `workspace(action="open")` lists the most recent recordings.
+- `investigate(action="why", symbol=...)` reports whether a recorded run
+  actually executed that symbol and which functions called it. That is the
+  evidence `graph(action="impact")` cannot give: it answers who *could* call
+  something and labels itself a lower bound. A symbol no run reached is
+  reported as exactly that, never as dead code.
 
 ---
 

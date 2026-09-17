@@ -25,6 +25,9 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "rules":
         from .rules_cli import main as rules_main
         raise SystemExit(rules_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "trace":
+        from .trace_cli import main as trace_main
+        raise SystemExit(trace_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "doctor":
         from .doctor import main as doctor_main
         raise SystemExit(doctor_main(sys.argv[2:]))
