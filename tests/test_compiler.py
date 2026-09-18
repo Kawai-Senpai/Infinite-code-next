@@ -258,3 +258,79 @@ def test_a_rich_write_passes_without_nagging(workspace):
 
     assert rich["quality"]["sufficient"] is True, rich["quality"]["notes"]
     assert rich["quality"]["median_body_chars"] > 250
+
+
+# ------------------------------------------------------------------- extends
+
+def test_a_claim_that_adds_detail_extends_rather_than_contradicts(workspace):
+    """The case that used to be discarded.
+
+    Before EXTENDS, a memory that enriched an existing one about the same code
+    was dropped on the floor by _detect_contradictions (same polarity, so not a
+    conflict) and by _find_duplicate (not similar enough to reinforce). It
+    landed as an unconnected sibling, and the two were only ever found together
+    by luck.
+    """
+    compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "note", "summary": "base",
+         "invariants": ["Only one refresh operation per session may execute at once"],
+         "symbols": ["RefreshCoordinator.acquire"]},
+    )
+    result = compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "note", "summary": "more",
+         "invariants": ["Only one refresh operation per session may execute at once,"
+                        " enforced by a per-session lock acquired before rotation"],
+         "symbols": ["RefreshCoordinator.acquire"]},
+    )
+
+    assert result["extends"], "an enriching claim must attach to what it builds on"
+    assert not result["contradictions"], "agreeing claims are not a conflict"
+    edges = rows(workspace.store.execute(
+        "SELECT * FROM memory_edges WHERE kind='EXTENDS' AND status='ACTIVE'"))
+    assert edges, "the EXTENDS edge must reach the graph"
+    # Never asserted: the compiler inferred this relation, it was not declared.
+    assert all(e["edge_class"] == "inferred" for e in edges)
+
+
+def test_an_opposing_claim_still_contradicts_and_does_not_extend(workspace):
+    """Adding EXTENDS must not have stolen the conflict case.
+
+    The two claims are worded differently on purpose. `_CLAIM_STOP` strips
+    "not", so a rule and its exact negation read as one claim to duplicate
+    detection and are reinforced before they ever reach this path - which is
+    pre-existing behaviour, not something EXTENDS changed.
+    """
+    compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "note", "summary": "base",
+         "invariants": ["The coordinator lock is always held while rotation runs"],
+         "symbols": ["RefreshCoordinator.acquire"]},
+    )
+    result = compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "note", "summary": "opposite",
+         "invariants": ["Rotation must never run while the coordinator lock is held"],
+         "symbols": ["RefreshCoordinator.acquire"]},
+    )
+
+    assert result["contradictions"], "opposite polarity is still a conflict"
+    assert not result["extends"], "a conflict is not an extension"
+
+
+def test_unrelated_claims_about_one_symbol_are_left_unlinked(workspace):
+    """EXTENDS must not weld together two rules that merely share a symbol."""
+    compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "note", "summary": "a",
+         "invariants": ["Only one refresh operation per session may execute at once"],
+         "symbols": ["RefreshCoordinator.acquire"]},
+    )
+    result = compiler.record_event(
+        workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
+        {"kind": "note", "summary": "b",
+         "invariants": ["Telemetry counters increment before the audit log is written"],
+         "symbols": ["RefreshCoordinator.acquire"]},
+    )
+    assert not result["extends"]

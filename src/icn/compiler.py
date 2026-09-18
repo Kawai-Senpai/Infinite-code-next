@@ -168,6 +168,7 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
     reinforced: list[dict[str, Any]] = []
     created_edges = 0
     contradictions: list[dict[str, Any]] = []
+    extensions: list[dict[str, Any]] = []
 
     # Mirror every resolved entity into the catalog up front. This has to
     # happen per event, not per memory: an event can legitimately name code
@@ -264,9 +265,13 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
                 anchor_ids.append(anchor_mod.create_anchor(conn, memory_id, None, None, commit,
                                                            target_kind="repo"))
 
-            found = _detect_contradictions(conn, memory_id, memory_kind, claim, resolved, event_id)
+            found, extends = _detect_contradictions(conn, memory_id, memory_kind, claim,
+                                                    resolved, event_id)
             contradictions.extend(found)
             created_edges += len(found)
+            if extends:
+                extensions.append({"memory_id": memory_id, "extends": extends})
+                created_edges += len(extends)
 
             catalog_mod.register_memory(catalog, memory_id, repo_id, memory_kind, severity,
                                         "ACTIVE", title)
@@ -310,6 +315,10 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
         ],
         "unresolved_references": unresolved,
         "contradictions": contradictions,
+        # What this record built on rather than disputed. Reported so a caller
+        # can see its claim landed in an existing thread of knowledge instead
+        # of starting a new one nobody will find.
+        "extends": extensions,
         "trust": {
             "authority": payload.get("authority", "agent"),
             "verified": payload.get("authority") == "human",
@@ -587,6 +596,13 @@ def _primary_memory(memories: list[dict[str, Any]]) -> dict[str, Any]:
 DUPLICATE_SIMILARITY = 0.8
 # Close enough that the caller should look before believing it is new.
 NEAR_SIMILARITY = 0.5
+# Two claims about the same code, agreeing, this alike are about one subject:
+# the later one adds detail to the earlier. Set above the 0.28 floor that makes
+# a contradiction worth flagging, because a false CONTRADICTS asks a human a
+# question and is cheap, while a false EXTENDS silently welds two unrelated
+# rules together and is not. Below DUPLICATE_SIMILARITY by construction:
+# anything at or above that was already reinforced and never reaches here.
+EXTENDS_SIMILARITY = 0.45
 _CLAIM_STOP = frozenset(
     "the a an and or of to in on for is are be it this that with as by at from not "
     "must should never always when was were has have had will can".split())
@@ -826,8 +842,14 @@ def _looks_like_test(symbol: dict[str, Any]) -> bool:
 
 def _detect_contradictions(conn: sqlite3.Connection, memory_id: str, kind: str, body: str,
                            resolved: list[dict[str, Any]],
-                           event_id: str | None = None) -> list[dict[str, Any]]:
-    """Flag a possible knowledge conflict rather than overwriting anything.
+                           event_id: str | None = None,
+                           ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Relate this claim to what is already known about the same code.
+
+    Returns (contradictions, extensions). Two memories about one symbol can
+    disagree or they can build on each other, and both are worth an edge: the
+    first is a question for a human, the second is what makes accumulated
+    knowledge navigable instead of a flat list.
 
     Deliberately weak and deliberately `inferred`: this raises the question for
     a human or agent to settle, it never decides. Silently overwriting a prior
@@ -840,10 +862,10 @@ def _detect_contradictions(conn: sqlite3.Connection, memory_id: str, kind: str, 
     not contradict itself, so siblings are excluded outright.
     """
     if kind not in ("invariant", "warning", "contract", "decision"):
-        return []
+        return [], []
     symbol_ids = [m["row"]["symbol_id"] for m in resolved if m["kind"] == "symbol"]
     if not symbol_ids:
-        return []
+        return [], []
 
     placeholders = ",".join("?" for _ in symbol_ids)
     existing = rows(conn.execute(
@@ -857,6 +879,7 @@ def _detect_contradictions(conn: sqlite3.Connection, memory_id: str, kind: str, 
     new_tokens = set(re.findall(r"[a-z]{4,}", body.lower()))
     new_negated = bool(NEGATION.search(body))
     found: list[dict[str, Any]] = []
+    extended: list[dict[str, Any]] = []
     for other in existing:
         other_claim = _stored_claim(other)
         other_tokens = set(re.findall(r"[a-z]{4,}", other_claim.lower()))
@@ -866,11 +889,24 @@ def _detect_contradictions(conn: sqlite3.Connection, memory_id: str, kind: str, 
         if overlap < 0.28:
             continue
         other_negated = bool(NEGATION.search(other_claim))
+        shared = sorted(new_tokens & other_tokens)
         if new_negated == other_negated:
+            # Same subject, same polarity: this does not contradict the earlier
+            # memory, it says more about the same thing. Before EXTENDS existed
+            # this case was discarded, so a memory that enriched another landed
+            # as an unconnected sibling and the two were only ever found
+            # together by luck. Not a duplicate either: _find_duplicate ran
+            # first and would have reinforced instead of reaching here, so the
+            # claims are related without restating each other.
+            if overlap < EXTENDS_SIMILARITY:
+                continue
+            _link(conn, memory_id, other["memory_id"], "EXTENDS", "inferred",
+                  round(overlap, 3), {"reason": "same subject and polarity, additional detail"})
+            extended.append({"memory_id": other["memory_id"], "title": other["title"],
+                             "overlap": round(overlap, 3), "shared_terms": shared[:12]})
             continue
         _link(conn, memory_id, other["memory_id"], "CONTRADICTS", "inferred", round(overlap, 3),
               {"reason": "similar subject, opposite polarity"})
-        shared = sorted(new_tokens & other_tokens)
         found.append({"memory_id": other["memory_id"], "title": other["title"],
                       "overlap": round(overlap, 3),
                       "new_claim": body.split("\n", 1)[0],
@@ -880,7 +916,7 @@ def _detect_contradictions(conn: sqlite3.Connection, memory_id: str, kind: str, 
                       "existing_polarity": "negative" if other_negated else "positive",
                       "existing_authority": other["authority"],
                       "note": "flagged for review, nothing was overwritten"})
-    return found
+    return found, extended
 
 
 # ---------------------------------------------------------------- memory edits

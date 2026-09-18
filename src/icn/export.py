@@ -119,7 +119,10 @@ def build_graph(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id: 
     memory_filter = "" if include_deleted else " WHERE status = 'ACTIVE'"
     for row in rows(conn.execute(
             "SELECT memory_id, kind, severity, title, body, authority, confidence,"
-            " status, scope, created_at, last_verified_at, source_event"
+            " status, scope, created_at, last_verified_at, source_event,"
+            " COALESCE(is_inference, 0) AS is_inference, review_status,"
+            " COALESCE(parent_count, 0) AS parent_count, COALESCE(evidence_count, 1)"
+            "   AS evidence_count"
             " FROM memories" + memory_filter)):
         attached = anchors.get(row["memory_id"], [])
         worst = _worst_anchor(attached)
@@ -130,7 +133,15 @@ def build_graph(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id: 
                        "body": row["body"], "authority": row["authority"],
                        "anchor_status": worst, "created_at": row["created_at"],
                        "last_verified_at": row["last_verified_at"],
-                       "scope": row["scope"]},
+                       "scope": row["scope"],
+                       # What the machine derived versus what an agent stated.
+                       # The explorer must be able to show the difference: an
+                       # unreviewed proposal drawn like a fact is the whole
+                       # failure the review queue exists to prevent.
+                       "is_inference": int(row["is_inference"] or 0),
+                       "review_status": row["review_status"],
+                       "parent_count": int(row["parent_count"] or 0),
+                       "evidence_count": int(row["evidence_count"] or 1)},
         })
         for anchor in attached:
             target = anchor["symbol_id"] or anchor["file_id"]
@@ -158,8 +169,23 @@ def build_graph(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id: 
         "nodes": nodes,
         "edges": kept,
         "areas": _areas(conn),
+        "profile": _profile(conn),
         "stats": _stats(nodes, kept),
     }
+
+
+def _profile(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The repository's standing facts and current work, for the page header.
+
+    Guarded: the explorer must still render against a store written before
+    these columns existed. A missing profile is a missing panel, not a blank
+    page.
+    """
+    try:
+        from .briefing import profile as build_profile
+        return build_profile(conn, limit=6)
+    except sqlite3.Error:
+        return {"static": [], "dynamic": []}
 
 
 def _worst_anchor(anchors: list[dict[str, Any]]) -> str:

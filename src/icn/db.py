@@ -63,6 +63,21 @@ ADDED_COLUMNS: list[tuple[str, str, str]] = [
     # from "this wasted a read"; these can.
     ("memories", "helpful_count", "INTEGER DEFAULT 0"),
     ("memories", "unhelpful_count", "INTEGER DEFAULT 0"),
+    # A memory ICN inferred rather than was told. Nothing else in the store is
+    # written by the machine's own reasoning, so it must be separable from what
+    # an agent asserted: inferred memories are down-ranked in search until a
+    # reviewer settles them, and never promoted to rules. 0 = stated, 1 =
+    # inferred and awaiting review. See infer.py.
+    ("memories", "is_inference", "INTEGER DEFAULT 0"),
+    # 'approved' | 'declined' | NULL (unreviewed). Only meaningful when
+    # is_inference is 1. An approved inference stops being down-ranked; a
+    # declined one is forgotten. Kept separate from `status` so that undoing a
+    # review restores the memory exactly, rather than guessing its old status.
+    ("memories", "review_status", "TEXT"),
+    # How many existing memories an inference was derived from. A candidate
+    # supported by five memories is a stronger signal than one supported by
+    # two, and the review queue orders by it.
+    ("memories", "parent_count", "INTEGER DEFAULT 0"),
 ]
 
 BUSY_TIMEOUT_MS = 15000

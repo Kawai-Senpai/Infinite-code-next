@@ -103,6 +103,14 @@ STALE_PENALTY = {
 # Edge trust decides how far relevance travels along it.
 EDGE_DECAY = {"deterministic": 0.75, "asserted": 0.65, "inferred": 0.35}
 
+# A memory ICN derived and nobody has reviewed. Sized against MEMORY_FLOOR
+# (1.45): large enough that an unreviewed inference cannot displace a stated
+# memory of equal lexical strength, small enough that a strongly-matching one
+# still clears the floor and gets named rather than vanishing. Approving an
+# inference clears is_inference, so this stops applying the moment a reviewer
+# settles it.
+INFERENCE_PENALTY = 0.55
+
 # Past conversations attached to an investigation. Few hits and a small share
 # of the budget: they supplement the capsules, and a long assistant turn must
 # not crowd out the anchored knowledge the call exists to return.
@@ -536,7 +544,11 @@ def _memories_for_symbols(conn: sqlite3.Connection, symbol_ids: list[str]) -> di
         f" LEFT JOIN anchors a ON a.memory_id = m.memory_id AND a.symbol_id = e.to_id"
         f" LEFT JOIN symbols s ON s.symbol_id = e.to_id"
         f" WHERE e.to_id IN ({placeholders}) AND e.kind IN ('APPLIES_TO','IMPACTS','GUARDED_BY')"
-        f" AND e.status='ACTIVE'",
+        f" AND e.status='ACTIVE'"
+        # A declined inference is forgotten: a reviewer looked at it and said
+        # no, and it must not come back through the capsule path that does not
+        # go via fts_memories.
+        f" AND m.status != 'FORGOTTEN'",
         tuple(symbol_ids),
     ))
     # One memory can reach a symbol by more than one edge kind - APPLIES_TO
@@ -698,8 +710,13 @@ def _memory_score(memory: dict[str, Any], relevance: dict[str, float] | None,
     weight = 1.4 if intent in ("modify", "debug") else 0.8
 
     stale = STALE_PENALTY.get(memory.get("anchor_status") or anchor_mod.ACTIVE, 0.0)
+    # An unreviewed inference is something ICN worked out, not something anyone
+    # confirmed. It stays retrievable - hiding it would make the review queue
+    # the only way to ever see it - but it must never outrank a stated fact
+    # answering the same query, because the two are not the same kind of claim.
+    inference = INFERENCE_PENALTY if int(memory.get("is_inference") or 0) else 0.0
     return (max(floor, lexical) * 1.6 + severity * weight
-            + usage_boost(memory) - stale * 0.5)
+            + usage_boost(memory) - stale * 0.5 - inference)
 
 def _capsule(conn: sqlite3.Connection, catalog: sqlite3.Connection, symbol: dict[str, Any],
              memories: list[dict[str, Any]], intent: str,

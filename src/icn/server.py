@@ -7,9 +7,10 @@ the surface is deliberately small and grouped by action:
                  detach, forget_checkout, purge
     investigate  search (default), expand, verify
     graph        impact, trace, cycles, entrypoints, areas, triggers,
-                 coupling, hotspots, deadcode
+                 coupling, hotspots, deadcode, memscore
     record       write one event, compiled into many facts
-    memory       get, list, correct, supersede, verify, reanchor, resolve
+    memory       get, list, correct, supersede, verify, reanchor, resolve,
+                 infer, review_queue, review
     agit         status, diff, commit, log, branches, switch, restore, reset, show
     experiment   init, tree, create, checkout, commit, diff, run, status, log,
                  wait, cancel, runs, conclude, promote, apply, set_command
@@ -47,6 +48,8 @@ from . import graph as graph_mod
 from . import feedback as feedback_mod
 from . import handoff as handoff_mod
 from . import history as history_mod
+from . import infer as infer_mod
+from . import memscore as memscore_mod
 from . import rules as rules_mod
 from . import lab as lab_mod
 from . import papers as papers_mod
@@ -584,6 +587,14 @@ def graph(
               symbols nothing in the graph reaches. CANDIDATES, never a
               verdict - read `confidence` on every row and the boundaries
               before acting on one.
+      memscore
+              measure this repository's own retrieval: accuracy, latency and
+              context cost, reported side by side and deliberately not
+              combined into one number. Ground truth is the store's anchored
+              memories, so it is free and specific to this repository - and
+              only comparable to another run on the SAME repository. Use it
+              before and after touching search weights. `window` sets the
+              sample size.
       run     the runtime counterpart of all of the above: execute `target`
               (any shell command: 'python app.py', 'pytest -x tests/test_a.py',
               'npm test') and record what actually happened. Python gets the
@@ -630,7 +641,7 @@ def graph(
 
     Args:
         action: impact (default), trace, cycles, entrypoints, areas, triggers,
-            coupling, hotspots, deadcode.
+            coupling, hotspots, deadcode, memscore.
         target: symbol to analyse, the path source for trace, or - for
             action='entrypoints' - a kind to filter by (route, tool, cli, test).
             A bare name is fine; if it is ambiguous the candidates come back
@@ -657,7 +668,7 @@ def graph(
     """
     action = (action or "impact").lower().strip()
     known = ("impact", "trace", "cycles", "entrypoints", "areas", "triggers",
-             "coupling", "hotspots", "deadcode", "run", "run_diff")
+             "coupling", "hotspots", "deadcode", "memscore", "run", "run_diff")
     if action not in known:
         return _fail(f"unknown action {action!r}; use one of {', '.join(known)}", root)
     if action == "run":
@@ -706,6 +717,14 @@ def graph(
         elif action == "deadcode":
             result = history_mod.dead_code(
                 current.store, include_tests=include_tests)
+        elif action == "memscore":
+            ws_mod.ensure_indexed(current)
+            # `window` doubles as the sample size here: it already means "how
+            # much history to look at" for the other actions that take it.
+            result = memscore_mod.run(
+                current.store, current.root, current.catalog,
+                sample=window if window and 10 < window <= 500
+                else memscore_mod.DEFAULT_SAMPLE)
         else:
             result = graph_mod.import_cycles(current.store)
 
@@ -989,6 +1008,16 @@ def memory(
                   reason). Wrong or repeatedly unhelpful memories stop being
                   volunteered by hooks; nothing is deleted.
 
+    Knowledge ICN derived itself, rather than being told. These are proposals:
+    they are down-ranked in search and never treated as rules until settled.
+      infer         look for patterns across stored knowledge and the call
+                    graph, and propose what they imply. Writes nothing but
+                    unreviewed candidates. Safe to re-run: a proposal already
+                    made, or already declined, is not raised again.
+      review_queue  the proposals awaiting a decision, best-supported first.
+      review        settle one: memory_id plus signal='approve' (promote it to
+                    a stated fact), 'decline' (forget it), or 'undo'.
+
     Handoffs, "where I left off" for the next session (claimed exactly once,
     by its session-start hook or workspace(action='open')):
       handoff          write one before stopping mid-task: body=summary, plus
@@ -1078,8 +1107,22 @@ def memory(
             if max(0, offset) + len(found) < total:
                 page["next_offset"] = max(0, offset) + len(found)
             return page
+        if act == "infer":
+            # Reasoning over the call graph, so the index has to be current:
+            # proposing a rule from callers that no longer exist would be worse
+            # than proposing nothing.
+            ws_mod.ensure_indexed(current)
+            return {"resolved_root": where,
+                    **infer_mod.propose(current.store, current.commit, limit=min(limit, 25))}
+        if act == "review_queue":
+            return {"resolved_root": where, **infer_mod.queue(current.store, limit=limit)}
+
         if not memory_id:
             return _fail(f"{act} requires memory_id", str(current.root))
+
+        if act == "review":
+            return {"resolved_root": where,
+                    **infer_mod.review(current.store, memory_id, signal, reason, actor)}
 
         if act == "get":
             found = compiler.get_memory(current.store, memory_id)

@@ -23,6 +23,14 @@ const EDGE = {
   ESTABLISHED:{c:'#f4677c', w:1.4, dash:true},
   CONTRADICTS:{c:'#f4677c', w:1.6, dash:true},
   SUPERSEDES: {c:'#7b849f', w:1.2, dash:true},
+  // Knowledge building on knowledge rather than disputing it. Teal, distinct
+  // from the red of conflict and the purple of anchoring: a reader scanning
+  // the graph has to be able to tell "this adds to that" from "this fights
+  // that" without reading a label.
+  EXTENDS:    {c:'#2dd4bf', w:1.4, dash:false},
+  // What ICN worked out for itself. Dashed everywhere, because every edge a
+  // proposal takes part in is provisional until somebody reviews it.
+  DERIVES_FROM:{c:'#c084fc', w:1.1, dash:true},
   CALLS:      {c:'#39436e', w:.8,  dash:false},
   DEFINES:    {c:'#2e3760', w:.7,  dash:false},
   CONTAINS:   {c:'#272f52', w:.6,  dash:false},
@@ -197,11 +205,18 @@ chips(document.getElementById('edges'), tally(edges, e => e.kind), S.rels,
 document.getElementById('stats').textContent =
   `${GRAPH.stats.nodes.toLocaleString()} nodes · ${GRAPH.stats.edges.toLocaleString()} edges`;
 
+
 document.getElementById('legend').innerHTML =
   Object.entries(KIND).filter(([k]) => nodes.some(n => n.kind === k))
     .map(([k,v]) => `<span><i style="background:${v.c}"></i><b>${v.label}</b></span>`).join('') +
   `<span><span class="ln" style="border-color:#8b5cf6"></span>anchored</span>` +
   `<span><span class="ln dash" style="border-color:#34d399"></span>guarded by</span>` +
+  (edges.some(e => e.kind === 'EXTENDS')
+    ? `<span><span class="ln" style="border-color:#2dd4bf"></span>extends</span>` : '') +
+  (edges.some(e => e.kind === 'CONTRADICTS')
+    ? `<span><span class="ln dash" style="border-color:#f4677c"></span>contradicts</span>` : '') +
+  (edges.some(e => e.kind === 'DERIVES_FROM')
+    ? `<span><span class="ln dash" style="border-color:#c084fc"></span>derived from</span>` : '') +
   `<span><span class="ln" style="border-color:#39436e"></span>calls</span>` +
   `<span style="color:var(--faint)">size = connections</span>`;
 
@@ -932,6 +947,9 @@ function readerRows() {
   const q = S.q;
   let out = nodes.filter(n => n.kind === 'memory');
   if (S.kinds.size && !S.kinds.has('memory')) out = [];
+  // In review mode the sidebar filters still apply, but the queue itself is
+  // fixed: only what ICN proposed and nobody has settled.
+  if (S.mode === 'review') out = out.filter(n => n.detail?.is_inference);
   out = out.filter(n => {
     const d = n.detail || {};
     if (d.severity && S.sevs.size && !S.sevs.has(d.severity)) return false;
@@ -943,6 +961,13 @@ function readerRows() {
 
   const by = sortSel.value;
   const at = n => n.detail?.created_at || '';
+  // Best-supported proposals first: an inference drawn from six memories is a
+  // stronger signal than one drawn from three, and a reviewer working down a
+  // queue should meet the strongest evidence while they are still fresh.
+  if (S.mode === 'review') {
+    return out.sort((a, b) => (b.detail?.parent_count || 0) - (a.detail?.parent_count || 0)
+                              || at(b).localeCompare(at(a)));
+  }
   out.sort((a, b) => {
     if (by === 'severity') {
       const r = (SEV_RANK[a.detail?.severity] ?? 9) - (SEV_RANK[b.detail?.severity] ?? 9);
@@ -966,13 +991,20 @@ function readerRows() {
 function renderReader() {
   if (!readerEl.classList.contains('on')) return;
   const list = readerRows();
-  const total = nodes.filter(n => n.kind === 'memory').length;
-  readerCount.textContent = list.length === total
-    ? total + ' memories'
-    : list.length + ' of ' + total + ' memories';
+  const reviewing = S.mode === 'review';
+  const total = nodes.filter(n =>
+    n.kind === 'memory' && (!reviewing || n.detail?.is_inference)).length;
+  readerCount.textContent = reviewing
+    ? (list.length === total ? total + ' awaiting review'
+                             : list.length + ' of ' + total + ' awaiting review')
+    : (list.length === total ? total + ' memories'
+                             : list.length + ' of ' + total + ' memories');
 
   if (!list.length) {
-    readerList.innerHTML = '<div class="reader-empty">No memory matches these filters.</div>';
+    readerList.innerHTML = '<div class="reader-empty">' + (reviewing
+      ? 'Nothing is waiting to be reviewed. Run memory(action=&#39;infer&#39;) to look for ' +
+        'patterns across what is already recorded.'
+      : 'No memory matches these filters.') + '</div>';
     return;
   }
 
@@ -1000,6 +1032,22 @@ function renderReader() {
         '</div></div>'
       : '';
 
+    // An unreviewed inference must never be mistaken for something an agent
+    // asserted. It says so in the body, not only in a tag, because a tag is
+    // the first thing a reader stops seeing.
+    const inferNote = d.is_inference
+      ? '<div class="sect"><div class="sect-text" style="color:#c084fc">' +
+        'ICN derived this from ' + (d.parent_count || 0) + ' existing ' +
+        ((d.parent_count === 1) ? 'memory' : 'memories') +
+        '. Nobody has confirmed it: it is down-ranked in search and is not treated ' +
+        'as a rule. Approve or decline it with memory(action=&#39;review&#39;).' +
+        '</div></div>'
+      : (d.review_status === 'approved'
+         ? '<div class="sect"><div class="sect-text" style="color:#34d399">' +
+           'ICN derived this and a reviewer approved it. It now ranks as a stated fact.' +
+           '</div></div>'
+         : '');
+
     const foot = '<div class="entry-foot">' +
       (d.authority ? '<span><b>' + esc(d.authority) + '</b>-authored</span>' : '') +
       (d.created_at ? '<span>recorded ' + esc(String(d.created_at).slice(0, 10)) + '</span>' : '') +
@@ -1017,11 +1065,14 @@ function renderReader() {
             tag(d.memory_kind || 'memory', KIND.memory || '#8b5cf6') +
             (d.severity ? tag(d.severity, SEV[d.severity]) : '') +
             (stale ? tag(d.anchor_status, '#ff9f43') : '') +
+            (d.is_inference ? tag('inferred · needs review', '#c084fc') : '') +
+            (d.review_status === 'approved' ? tag('inferred · approved', '#34d399') : '') +
+            (d.evidence_count > 1 ? tag(d.evidence_count + '× asserted', '#4d7cfe') : '') +
           '</div>' +
         '</div>' +
         '<div class="entry-chev">' + (allOpen ? '▾' : '▸') + '</div>' +
       '</div>' +
-      '<div class="entry-body">' + sections + staleNote + foot + '</div>' +
+      '<div class="entry-body">' + sections + inferNote + staleNote + foot + '</div>' +
     '</div>';
   }).join('');
 
@@ -1051,16 +1102,20 @@ function renderReader() {
 
 function setMode(mode) {
   S.mode = mode;
-  readerEl.classList.toggle('on', mode === 'read');
+  // Review is the reader restricted to unreviewed inferences, not a third
+  // rendering path: a proposal has to be read the same way a fact is read, or
+  // a reviewer is judging it on less than they would judge anything else on.
+  const reading = mode === 'read' || mode === 'review';
+  readerEl.classList.toggle('on', reading);
   for (const b of document.querySelectorAll('#modes button'))
     b.classList.toggle('on', b.dataset.mode === mode);
   // The scope buttons steer the canvas only; showing them over the reader
   // implies they filter it, and they do not.
-  const hide = mode === 'read' ? 'none' : '';
+  const hide = reading ? 'none' : '';
   document.getElementById('scopes').style.display = hide;
   document.getElementById('scope-note').style.display = hide;
   document.getElementById('area-list').style.display = hide;
-  if (mode === 'read') { inspect(null); renderReader(); }
+  if (reading) { inspect(null); renderReader(); }
 }
 
 for (const b of document.querySelectorAll('#modes button'))
@@ -1076,6 +1131,63 @@ expandAllBtn.onclick = () => {
    one event every filter and search already fires keeps a single source of
    truth, rather than a second copy of the wiring that drifts out of step. */
 addEventListener('icn:filters', renderReader);
+
+/* The repository profile: what holds whatever you are doing, and what has been
+   going on lately. Rendered in the rail rather than behind a click, because
+   the whole argument for it is that nobody should have to ask.
+
+   Declared here, at the end, rather than beside the other sidebar wiring: it
+   calls esc() and setMode(), which are `const`/`function` declarations further
+   down the file. Run earlier it hits the temporal dead zone, throws
+   "Cannot access 'esc' before initialization", and takes the rest of the
+   script with it - which is exactly what happened, and left the page with
+   headings and no content. */
+(function renderProfile() {
+  const profile = GRAPH.profile || {};
+  const panel = document.getElementById('profile-panel');
+  const stat = profile.static || [], dyn = profile.dynamic || [];
+  if (!stat.length && !dyn.length) return;
+  panel.hidden = false;
+
+  const row = m => '<button class="profile-row" data-find="' + esc(m.memory_id || '') + '">' +
+    '<i style="background:' + (SEV[m.severity] || '#7b849f') + '"></i>' +
+    '<span>' + esc((m.title || '').slice(0, 110)) + '</span></button>';
+
+  document.getElementById('profile-static').innerHTML =
+    stat.length ? stat.map(row).join('')
+                : '<p class="scope-note">Nothing settled yet.</p>';
+  document.getElementById('profile-dynamic').innerHTML =
+    dyn.length ? dyn.map(row).join('')
+               : '<p class="scope-note">No recent activity recorded.</p>';
+
+  // Clicking a profile line finds that memory in the reader, which is the
+  // question a header line always raises: "where does that come from?"
+  for (const btn of panel.querySelectorAll('.profile-row')) {
+    btn.onclick = () => {
+      const node = byId.get(btn.dataset.find);
+      if (!node) return;
+      setMode('read');
+      document.getElementById('q').value = '';
+      S.q = '';
+      renderReader();
+      const entry = readerList.querySelector('[data-id="' + CSS.escape(node.id) + '"]');
+      if (entry) {
+        entry.classList.add('open');
+        entry.querySelector('.entry-chev').textContent = '▾';
+        entry.scrollIntoView({behavior:'smooth', block:'center'});
+      }
+    };
+  }
+})();
+
+/* The review queue is only offered when there is something in it. An empty tab
+   teaches people the feature is dead. */
+(function reviewBadge() {
+  const pending = nodes.filter(n => n.kind === 'memory' && n.detail?.is_inference).length;
+  if (!pending) return;
+  document.getElementById('mode-review').hidden = false;
+  document.getElementById('review-n').textContent = pending;
+})();
 
 // Memories are what people come here to read, so that is what opens.
 setMode('read');

@@ -24,7 +24,17 @@
       <h2>View</h2>
       <div class="scopes" id="modes">
         <button data-mode="read" class="on">Read</button>
+        <button data-mode="review" id="mode-review" hidden>Review <span class="pill" id="review-n"></span></button>
         <button data-mode="graph">Graph</button>
+      </div>
+      <!-- What holds regardless of the task, and what is currently in flight.
+           Search cannot surface these: a fact like "this environment has no
+           pymupdf" is semantically close to almost nothing anyone types. -->
+      <div id="profile-panel" hidden>
+        <h2>Always true here</h2>
+        <div id="profile-static" class="profile-list"></div>
+        <h2>Recently in flight</h2>
+        <div id="profile-dynamic" class="profile-list"></div>
       </div>
       <div class="scopes" id="scopes">
         <button data-scope="areas" class="on">Areas</button>

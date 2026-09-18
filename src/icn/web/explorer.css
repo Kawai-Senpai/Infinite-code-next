@@ -74,6 +74,25 @@ body {
                     box-shadow:0 1px 3px rgba(0,0,0,.35); }
 .scope-note { margin:0 8px 14px; color:var(--faint); font-size:11px; line-height:1.5; }
 
+/* The count of proposals waiting. Sits inside its button so the number and the
+   thing it counts cannot drift apart on screen. */
+.pill { display:inline-block; min-width:16px; padding:0 5px; margin-left:4px;
+        border-radius:999px; background:#c084fc; color:#1a1030;
+        font-size:10px; font-weight:700; line-height:16px; }
+
+/* The repository profile. Quiet by design: it is a standing header, and a
+   standing header that shouts becomes something people learn to skip. */
+.profile-list { margin:0 6px 12px; display:flex; flex-direction:column; gap:2px; }
+.profile-row {
+  display:flex; align-items:flex-start; gap:7px; width:100%; padding:6px 8px;
+  border:0; border-radius:8px; background:transparent; color:var(--faint);
+  font:inherit; font-size:11.5px; line-height:1.45; text-align:left; cursor:pointer;
+}
+.profile-row:hover { background:var(--card-2); color:var(--text); }
+.profile-row i { flex:none; width:6px; height:6px; margin-top:5px; border-radius:50%; }
+.profile-row span { overflow:hidden; display:-webkit-box;
+                    -webkit-line-clamp:2; -webkit-box-orient:vertical; }
+
 #area-list { margin:0 6px 18px; display:flex; flex-direction:column; gap:3px; }
 .area-row {
   display:flex; align-items:center; gap:8px; width:100%; padding:7px 9px;

@@ -57,6 +57,9 @@ def build(conn: sqlite3.Connection, limit: int = 5) -> dict[str, Any]:
         " MIN(a.status) AS anchor_status"
         " FROM memories m LEFT JOIN anchors a ON a.memory_id = m.memory_id"
         " WHERE m.status='ACTIVE' AND m.kind IN ('invariant','warning','contract','security')"
+        # An unreviewed inference is a proposal, not a rule that governs this
+        # code, and the briefing is the one place read without checking.
+        "   AND COALESCE(m.is_inference, 0) = 0"
         " GROUP BY m.memory_id"
         " ORDER BY " + _SEVERITY_SQL + ", m.created_at DESC LIMIT ?", (limit,)))
 
@@ -103,10 +106,19 @@ def build(conn: sqlite3.Connection, limit: int = 5) -> dict[str, Any]:
     entries = {r["kind"]: r["n"] for r in rows(conn.execute(
         "SELECT kind, COUNT(*) AS n FROM entry_points GROUP BY kind"))}
 
+    # Inferences ICN proposed and nobody has settled. Counted, never quoted:
+    # an unreviewed guess must not read like a rule in the one place an agent
+    # trusts without checking.
+    pending_review = _count(
+        conn, "SELECT COUNT(*) AS n FROM memories WHERE status='ACTIVE'"
+              " AND is_inference=1 AND review_status IS NULL")
+
     briefing: dict[str, Any] = {
         "memories": total,
         "by_kind": by_kind,
+        "profile": profile(conn, limit),
         "rules": rules,
+        "inferences_pending_review": pending_review,
         "already_rejected": rejected,
         "needs_verification": unverified,
         "knowledge_hotspots": hotspots,
@@ -116,8 +128,76 @@ def build(conn: sqlite3.Connection, limit: int = 5) -> dict[str, Any]:
     }
 
     briefing["read_this_first"] = _headline(
-        total, rules, rejected, stale, hotspots, has_causal, areas, entries)
+        total, rules, rejected, stale, hotspots, has_causal, areas, entries,
+        briefing["profile"], pending_review)
     return briefing
+
+
+# Kinds whose claims stay true regardless of what anyone is working on. These
+# describe the world the code lives in - the toolchain, the conventions, the
+# contracts - rather than anything in flight.
+STATIC_KINDS = ("convention", "contract", "migration", "rationale")
+
+# How recent a memory has to be to count as "what is happening now". Two weeks
+# is roughly the span over which a repository's in-flight work stays relevant;
+# beyond it a memory is history, and history belongs to search, not to a
+# standing header.
+DYNAMIC_WINDOW_DAYS = 14
+
+
+def profile(conn: sqlite3.Connection, limit: int = 6) -> dict[str, Any]:
+    """What is always true here, and what is true right now.
+
+    Search answers "what is relevant to this query". It cannot answer "what
+    should I know regardless of what I asked", and those are different
+    questions: a fact like "this environment runs Python 3.12 without pymupdf"
+    is semantically close to almost no query anyone will type, so retrieval
+    correctly leaves it out and the agent correctly walks into it. Anything an
+    agent must not have to ask for belongs here instead.
+
+    Split in two because the two halves decay differently. `static` is the
+    repository's standing shape and is cheap to keep: it changes when a
+    convention changes. `dynamic` is what is in flight, and is worth exactly as
+    much as it is fresh - an agent told about last month's migration as though
+    it were live is worse off than one told nothing.
+
+    Derived entirely from fields the store already has, so it describes all
+    existing knowledge from the moment it ships rather than only what is
+    recorded afterwards.
+    """
+    placeholders = ",".join("?" for _ in STATIC_KINDS)
+    static = rows(conn.execute(
+        f"SELECT m.memory_id, m.kind, m.severity, m.title, m.evidence_count"
+        f" FROM memories m"
+        f" WHERE m.status='ACTIVE' AND COALESCE(m.is_inference, 0) = 0"
+        f"   AND (m.kind IN ({placeholders})"
+        # A rule somebody promoted into CLAUDE.md is by definition something
+        # every session must know: that is what promoting it meant.
+        f"        OR EXISTS (SELECT 1 FROM promoted_rules p WHERE p.memory_id = m.memory_id)"
+        # Settled by repetition: independently asserted by several separate
+        # events, which is the store's own evidence that it is not situational.
+        f"        OR COALESCE(m.evidence_count, 1) >= 3)"
+        f" ORDER BY " + _SEVERITY_SQL + ", COALESCE(m.evidence_count, 1) DESC LIMIT ?",
+        (*STATIC_KINDS, limit)))
+
+    dynamic = rows(conn.execute(
+        "SELECT m.memory_id, m.kind, m.severity, m.title, m.created_at"
+        " FROM memories m"
+        " WHERE m.status='ACTIVE' AND COALESCE(m.is_inference, 0) = 0"
+        "   AND m.created_at >= datetime('now', ?)"
+        # Not the standing shape of the repo: the work that has been going on.
+        "   AND m.kind IN ('decision','fix_history','bug_history','failed_attempt',"
+        "                  'performance','test_evidence')"
+        " ORDER BY m.created_at DESC LIMIT ?",
+        (f"-{DYNAMIC_WINDOW_DAYS} days", limit)))
+
+    return {
+        "static": static,
+        "dynamic": dynamic,
+        "dynamic_window_days": DYNAMIC_WINDOW_DAYS,
+        "note": ("static facts hold whatever you are doing; dynamic is what this repository "
+                 "has been working on lately and may already be finished"),
+    }
 
 
 def _areas(conn: sqlite3.Connection, limit: int) -> list[dict[str, Any]]:
@@ -142,9 +222,23 @@ def _areas(conn: sqlite3.Connection, limit: int) -> list[dict[str, Any]]:
 def _headline(total: int, rules: list[dict[str, Any]], rejected: list[dict[str, Any]],
               stale: int, hotspots: list[dict[str, Any]], has_causal: int,
               areas: list[dict[str, Any]] | None = None,
-              entries: dict[str, int] | None = None) -> str:
+              entries: dict[str, int] | None = None,
+              repo_profile: dict[str, Any] | None = None,
+              pending_review: int = 0) -> str:
     """One paragraph an agent reads before doing anything else."""
     parts = [str(total) + " memories recorded here."]
+
+    # Before the rules, because these are the facts that hold whatever the
+    # agent turns out to be doing, and it is about to start doing something.
+    if repo_profile and repo_profile.get("static"):
+        parts.append("Always true here, whatever you are working on: "
+                     + "; ".join((s["title"] or "")[:70]
+                                 for s in repo_profile["static"][:2]) + ".")
+    if repo_profile and repo_profile.get("dynamic"):
+        parts.append("Recently in flight: "
+                     + "; ".join((d["title"] or "")[:60]
+                                 for d in repo_profile["dynamic"][:2])
+                     + " - this may already be finished.")
 
     if rules:
         top = rules[0]
@@ -173,6 +267,10 @@ def _headline(total: int, rules: list[dict[str, Any]], rejected: list[dict[str, 
     if has_causal:
         parts.append("Causal history exists: investigate(action='why', symbol=...)"
                      " explains why a given piece of code exists before you change it.")
+    if pending_review:
+        parts.append(str(pending_review) + " inference(s) ICN derived itself are awaiting"
+                     " review; they are down-ranked until settled -"
+                     " memory(action='review_queue') reads them.")
 
     parts.append("Call investigate() with what you are about to do, rather than"
                  " reading files to orient yourself.")
