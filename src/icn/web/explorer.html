@@ -22,6 +22,10 @@
         <input type="search" id="q" placeholder="Search"><kbd>/</kbd>
       </div>
       <h2>View</h2>
+      <div class="scopes" id="modes">
+        <button data-mode="read" class="on">Read</button>
+        <button data-mode="graph">Graph</button>
+      </div>
       <div class="scopes" id="scopes">
         <button data-scope="areas" class="on">Areas</button>
         <button data-scope="focus">Focus</button>
@@ -38,6 +42,26 @@
 
   <div class="stage">
     <canvas id="c"></canvas>
+    <!-- The reading surface. A force graph shows how knowledge connects but it
+         cannot be read: every memory is one dot, and only the handful in view
+         are on screen at all. This lists them in full, and is the default. -->
+    <div class="reader" id="reader">
+      <div class="reader-head">
+        <div class="reader-count" id="reader-count"></div>
+        <div class="reader-sort">
+          <label for="sort">Sort</label>
+          <select id="sort">
+            <option value="severity">Severity</option>
+            <option value="kind">Kind</option>
+            <option value="recent">Newest</option>
+            <option value="oldest">Oldest</option>
+            <option value="longest">Longest</option>
+          </select>
+          <button class="btn" id="expandAll" title="Expand or collapse every entry">Expand all</button>
+        </div>
+      </div>
+      <div class="reader-list" id="reader-list"></div>
+    </div>
     <div class="float toolbar">
       <button class="btn" id="fit" title="Fit to view">Fit</button>
       <button class="btn" id="relayout" title="Re-run layout">Re-layout</button>

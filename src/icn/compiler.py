@@ -24,7 +24,7 @@ from . import catalog as catalog_mod
 from . import causal
 from . import crossrepo
 from . import ids
-from .db import jdump, one, rows, write_tx
+from .db import jdump, jload, one, rows, write_tx
 
 # payload field -> (memory kind, default severity)
 FIELD_KINDS = {
@@ -398,9 +398,19 @@ def guard_memory(conn: sqlite3.Connection, memory_id: str, test_memory_id: str) 
     return {"ok": True, "memory_id": memory_id, "guarded_by": test_memory_id,
             "test": test["title"]}
 
-# How much surrounding context a memory carries. Enough that it reads as a
-# self-contained note, capped so a capsule does not become a file dump.
-CONTEXT_CHARS = 900
+# No limit. A memory is stored exactly as it was composed.
+#
+# There used to be a 900-character cap here, and because composition runs
+# before the row is inserted, it destroyed text rather than hiding it: 225 of
+# 277 memories in this repository (81%) were stored cut mid-word, a median of
+# 903 characters each, and 97,784 characters had to be rebuilt from the event
+# log by recover.py. Storage is not the scarce resource; what an agent reads in
+# one response is, and that belongs to the READ path, which pages and budgets
+# (investigate's `budget`, list's `limit`). Capping the WRITE path bought a
+# smaller response once and lost the knowledge forever.
+#
+# Kept as None so the old name still resolves for anything that imports it.
+CONTEXT_CHARS = None
 
 
 def _event_context(payload: dict[str, Any], summary: str,
@@ -452,7 +462,14 @@ def _compose(claim: str, context: dict[str, Any], is_summary: bool = False) -> s
         parts.append("Applies to: " + ", ".join(context["where"]))
 
     body = "\n\n".join(parts)
-    return body if len(body) <= CONTEXT_CHARS else body[:CONTEXT_CHARS].rstrip() + "..."
+    if CONTEXT_CHARS is None or len(body) <= CONTEXT_CHARS:
+        return body
+    # Only reachable if someone sets a cap again. Even then, drop whole context
+    # sections from the end rather than slicing mid-sentence: parts[0] is the
+    # claim and is never dropped, so the knowledge itself always survives.
+    while len(parts) > 1 and len("\n\n".join(parts)) > CONTEXT_CHARS:
+        parts.pop()
+    return "\n\n".join(parts)
 
 
 
@@ -984,6 +1001,35 @@ def resolve_memory(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_i
     return {"ok": True, "memory_id": memory_id, "status": "RESOLVED"}
 
 
+def _reanchor_summary(raw: str | None) -> str | None:
+    """An anchor's history as one line, or None when nothing ever moved.
+
+    A stable anchor is the overwhelmingly common case and it is not news, so it
+    reports nothing at all: an anchor that never moved says so by its absence.
+    Only movement is worth the reader's attention. The full log, which is what
+    made a 110-character warning cost 12 KB, stays available via
+    action='history'.
+    """
+    entries = [e for e in (jload(raw, []) or []) if isinstance(e, dict)]
+    if not entries:
+        return None
+
+    counts: dict[str, int] = {}
+    for entry in entries:
+        name = entry.get("transition") or "unknown"
+        # `repeats` collapses identical consecutive re-checks at write time, so
+        # counting rows alone understates how often this actually happened.
+        counts[name] = counts.get(name, 0) + int(entry.get("repeats") or 1)
+
+    moved = {k: v for k, v in counts.items() if k != "unchanged"}
+    if not moved:
+        return None
+
+    last = entries[-1]
+    parts = ", ".join(f"{name} x{n}" for name, n in sorted(moved.items()))
+    return f"{parts}; last {last.get('transition')} at {last.get('at')}"
+
+
 def get_memory(conn: sqlite3.Connection, memory_id: str) -> dict[str, Any] | None:
     memory = one(conn.execute("SELECT * FROM memories WHERE memory_id=?", (memory_id,)))
     if memory is None:
@@ -998,6 +1044,15 @@ def get_memory(conn: sqlite3.Connection, memory_id: str) -> dict[str, Any] | Non
         "SELECT anchor_id, target_kind, symbol_path, file_path, status, anchor_confidence,"
         " last_verified_commit, reanchor_history FROM anchors WHERE memory_id=?", (memory_id,)
     ))
+    # reanchor_history is an append-only audit log and it dwarfs the knowledge:
+    # a 110-character warning came back as ~12 KB, over 90% of it the same
+    # "cascade does not restore trust" note repeated per re-index. Summarise it
+    # here and serve the raw log through action='history' for anyone who wants
+    # it, so reading a memory costs roughly what the memory is worth.
+    for anchor in memory["anchors"]:
+        summary = _reanchor_summary(anchor.pop("reanchor_history", None))
+        if summary:
+            anchor["reanchor"] = summary
     memory["edges"] = rows(conn.execute(
         "SELECT kind, to_id, edge_class, confidence, status FROM memory_edges WHERE from_id=?",
         (memory_id,)
@@ -1025,9 +1080,16 @@ _RANK_SQL = ("MAX(CASE a.status WHEN 'ACTIVE' THEN 0 WHEN 'DRIFTED' THEN 1"
 
 def list_memories(conn: sqlite3.Connection, kind: str | None = None, status: str | None = None,
                   anchor_status: str | None = None, limit: int = 50,
-                  offset: int = 0) -> list[dict[str, Any]]:
+                  offset: int = 0, bodies: bool = True) -> list[dict[str, Any]]:
+    """Browse memories. With bodies=True (the default) they are readable here.
+
+    A listing that returns titles only forces one get() per memory to read
+    anything, and titles are stored pre-cut, so browsing knowledge cost N round
+    trips and still showed severed sentences. That is the reason accumulated
+    knowledge went unread, so the body travels with the row.
+    """
     sql = (f"SELECT m.memory_id, m.kind, m.title, m.severity, m.status, m.authority,"
-           f" m.last_verified_commit, {_RANK_SQL} AS anchor_rank,"
+           f" m.last_verified_commit,{' m.body,' if bodies else ''} {_RANK_SQL} AS anchor_rank,"
            f" MIN(a.anchor_confidence) AS anchor_confidence, COUNT(a.anchor_id) AS anchor_count"
            f" FROM memories m LEFT JOIN anchors a ON a.memory_id = m.memory_id WHERE 1=1")
     args: list[Any] = []

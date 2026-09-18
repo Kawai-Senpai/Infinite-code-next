@@ -272,8 +272,10 @@ def workspace(
         if act in ("open", "reindex"):
             report = ws_mod.ensure_indexed(current, force_full=force_full or act == "reindex")
             state = ws_mod.status(current)
+            # Titles only: this is a five-row pointer inside the open briefing,
+            # not a reading surface. memory(action='list') carries the bodies.
             urgent = compiler.list_memories(current.store, anchor_status=anchor_mod.NEEDS_REVIEW,
-                                            status="ACTIVE", limit=5)
+                                            status="ACTIVE", limit=5, bodies=False)
             # What already exists here. An agent cannot ask the right question
             # before it knows what is on the shelf, so open() volunteers it.
             brief = briefing_mod.build(current.store)
@@ -930,7 +932,8 @@ def record(
         # seven-memory record answer with ~5k tokens of its own input.
         for memory in result.get("memories_created", []):
             memory.pop("body", None)
-        result["memories_note"] = "bodies omitted; memory(action='get', memory_id=...) returns one"
+        result["memories_note"] = ("bodies omitted here; memory(action='list') returns them for "
+                                   "many at once, memory(action='get', memory_id=...) for one")
         return result
     finally:
         current.close()
@@ -968,7 +971,11 @@ def memory(
 
     Actions:
       list        browse memories, filterable by kind, status, anchor_status.
+                  Bodies are included, so this reads many at once rather than
+                  costing one get() per memory.
       get         one memory with its anchors, edges and version history.
+                  Re-anchoring logs are summarised; action='history' has them raw.
+      history     the full re-anchoring audit trail for one memory.
       verify      confirm a memory still applies. Clears NEEDS_REVIEW/DRIFTED.
       correct     edit a memory in place. Previous text is versioned, not lost.
       supersede   replace a memory, keeping both and the link between them.
@@ -1078,6 +1085,14 @@ def memory(
             found = compiler.get_memory(current.store, memory_id)
             return ({"ok": True, "resolved_root": str(current.root), "memory": found}
                     if found else _fail(f"unknown memory {memory_id}", str(current.root)))
+        if act == "history":
+            # The raw re-anchoring log, which get() summarises. Separate because
+            # it is an audit trail: large, repetitive, and rarely what a reader
+            # of the knowledge itself is after.
+            return {"ok": True, "resolved_root": str(current.root), "memory_id": memory_id,
+                    "anchors": rows(current.store.execute(
+                        "SELECT anchor_id, symbol_path, file_path, status, reanchor_history"
+                        " FROM anchors WHERE memory_id=?", (memory_id,)))}
         if act == "verify":
             return {"resolved_root": str(current.root),
                     **anchor_mod.mark_verified(current.store, memory_id, current.commit, actor)}

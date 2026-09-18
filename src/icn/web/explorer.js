@@ -247,7 +247,13 @@ function recompute() {
 const REP = 2100 + nodes.length * 13;
 const LINK = 74 + Math.min(95, nodes.length / 7);
 let alpha = 1;
-const kick = a => { alpha = Math.max(alpha, a); };
+// Every filter and search change funnels through here, so it is also the one
+// place the reader needs to hear about: it re-renders off this event rather
+// than each control wiring itself up twice and drifting out of step.
+const kick = a => {
+  alpha = Math.max(alpha, a);
+  dispatchEvent(new CustomEvent('icn:filters'));
+};
 
 function step() {
   if (alpha < .004) return;
@@ -854,3 +860,222 @@ if (!nodes.length) {
   resize(); applyScope(); settle(180); fit();
   (function loop(){ draw(); requestAnimationFrame(loop); })();
 }
+
+/* ------------------------------------------------------------------ reader */
+/* Why this exists: the graph is a map, not a document. It draws 60 of 2,024
+   nodes at a time, every memory is one dot, and reading one means finding its
+   dot and clicking it. Knowledge that costs a search to read does not get
+   read. This lists every memory in full, structured into the sections the
+   compiler composed, and it is what the page opens on. */
+
+/* The markers compiler._compose appends after the claim. Splitting on them
+   turns one stored blob back into labelled sections. Kept in step with
+   compiler.MARKERS: if they diverge, bodies render as one wall of text again
+   rather than breaking, which is why this degrades to "everything is claim". */
+const SECTIONS = [
+  ['\n\nRecorded while: ', 'recorded while'],
+  ['\n\nWhy: ',            'why'],
+  ['\n\nChanged: ',        'changed'],
+  ['\n\nApplies to: ',     'applies to'],
+];
+
+function splitBody(body) {
+  const text = (body || '').trim();
+  if (!text) return {claim:'', sections:[]};
+
+  // Find each marker's position, then cut between consecutive ones. Scanning
+  // for positions first keeps the sections in the order they appear rather
+  // than the order this list happens to declare them.
+  const found = [];
+  for (const [marker, label] of SECTIONS) {
+    const at = text.indexOf(marker);
+    if (at >= 0) found.push({at, label, skip:marker.length});
+  }
+  found.sort((a, b) => a.at - b.at);
+
+  const claim = (found.length ? text.slice(0, found[0].at) : text).trim();
+  const sections = found.map((cur, i) => ({
+    label: cur.label,
+    text: text.slice(cur.at + cur.skip,
+                     i + 1 < found.length ? found[i + 1].at : text.length).trim(),
+  })).filter(s => s.text);
+  return {claim, sections};
+}
+
+const SEV_RANK = {critical:0, high:1, medium:2, low:3};
+const KIND_RANK = ['security','invariant','warning','contract','failed_attempt',
+                   'bug_history','fix_history','decision','performance','migration',
+                   'convention','test_evidence','rationale'];
+
+/* Highlight matches so a search result shows WHY it matched. Escaping happens
+   first and the marker is inserted into the escaped string, so page content
+   can never become markup. */
+function hl(text, query) {
+  const safe = esc(text);
+  if (!query) return safe;
+  const needle = esc(query).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return safe.replace(new RegExp(needle, 'gi'), m => '<mark class="mark">' + m + '</mark>');
+}
+
+const readerEl = document.getElementById('reader');
+const readerList = document.getElementById('reader-list');
+const readerCount = document.getElementById('reader-count');
+const sortSel = document.getElementById('sort');
+const expandAllBtn = document.getElementById('expandAll');
+let allOpen = false;
+
+/* The memories the reader shows: filtered by the same sidebar controls as the
+   graph, so the two views never disagree about what is in scope. Search here
+   covers the whole body, not just the title, because the answer is usually in
+   the "Why" section. */
+function readerRows() {
+  const q = S.q;
+  let out = nodes.filter(n => n.kind === 'memory');
+  if (S.kinds.size && !S.kinds.has('memory')) out = [];
+  out = out.filter(n => {
+    const d = n.detail || {};
+    if (d.severity && S.sevs.size && !S.sevs.has(d.severity)) return false;
+    if (d.anchor_status && S.anchors.size && !S.anchors.has(d.anchor_status)) return false;
+    if (q) return ((n.label || '') + ' ' + (d.body || '') + ' ' + (d.memory_kind || ''))
+                    .toLowerCase().includes(q);
+    return true;
+  });
+
+  const by = sortSel.value;
+  const at = n => n.detail?.created_at || '';
+  out.sort((a, b) => {
+    if (by === 'severity') {
+      const r = (SEV_RANK[a.detail?.severity] ?? 9) - (SEV_RANK[b.detail?.severity] ?? 9);
+      if (r) return r;
+    } else if (by === 'kind') {
+      const r = KIND_RANK.indexOf(a.detail?.memory_kind) -
+                KIND_RANK.indexOf(b.detail?.memory_kind);
+      if (r) return r;
+    } else if (by === 'recent') {
+      return at(b).localeCompare(at(a));
+    } else if (by === 'oldest') {
+      return at(a).localeCompare(at(b));
+    } else if (by === 'longest') {
+      return (b.detail?.body || '').length - (a.detail?.body || '').length;
+    }
+    return at(b).localeCompare(at(a));
+  });
+  return out;
+}
+
+function renderReader() {
+  if (!readerEl.classList.contains('on')) return;
+  const list = readerRows();
+  const total = nodes.filter(n => n.kind === 'memory').length;
+  readerCount.textContent = list.length === total
+    ? total + ' memories'
+    : list.length + ' of ' + total + ' memories';
+
+  if (!list.length) {
+    readerList.innerHTML = '<div class="reader-empty">No memory matches these filters.</div>';
+    return;
+  }
+
+  const tag = (text, c) => '<span class="tag" style="color:' + c + ';border-color:' + c +
+                           '55;background:' + c + '14">' + esc(text) + '</span>';
+
+  readerList.innerHTML = list.map(n => {
+    const d = n.detail || {};
+    const parts = splitBody(d.body);
+    const col = SEV[d.severity] || KIND.memory || '#8b5cf6';
+    const stale = d.anchor_status && d.anchor_status !== 'ACTIVE';
+
+    const sections = parts.sections.map(s => {
+      const inner = s.label === 'applies to'
+        ? '<div class="applies">' + s.text.split(', ').filter(Boolean)
+            .map(p => '<code>' + hl(p, S.q) + '</code>').join('') + '</div>'
+        : '<div class="sect-text">' + hl(s.text, S.q) + '</div>';
+      return '<div class="sect"><div class="sect-label">' + esc(s.label) + '</div>' +
+             inner + '</div>';
+    }).join('');
+
+    const staleNote = stale
+      ? '<div class="sect"><div class="sect-text" style="color:#ff9f43">' +
+        'Not verified against the current code. Treat this as a lead, not a fact.' +
+        '</div></div>'
+      : '';
+
+    const foot = '<div class="entry-foot">' +
+      (d.authority ? '<span><b>' + esc(d.authority) + '</b>-authored</span>' : '') +
+      (d.created_at ? '<span>recorded ' + esc(String(d.created_at).slice(0, 10)) + '</span>' : '') +
+      '<span>' + (d.body || '').length + ' chars</span>' +
+      '<span>' + esc(n.id) + '</span>' +
+      '<button class="entry-open" data-graph="' + esc(n.id) + '">Show in graph</button>' +
+      '</div>';
+
+    return '<div class="entry' + (allOpen ? ' open' : '') + '" data-id="' + esc(n.id) + '">' +
+      '<div class="entry-head">' +
+        '<div class="entry-bar" style="background:' + col + '"></div>' +
+        '<div class="entry-main">' +
+          '<div class="entry-title">' + hl(parts.claim || n.label || '(no text)', S.q) + '</div>' +
+          '<div class="entry-tags">' +
+            tag(d.memory_kind || 'memory', KIND.memory || '#8b5cf6') +
+            (d.severity ? tag(d.severity, SEV[d.severity]) : '') +
+            (stale ? tag(d.anchor_status, '#ff9f43') : '') +
+          '</div>' +
+        '</div>' +
+        '<div class="entry-chev">' + (allOpen ? '▾' : '▸') + '</div>' +
+      '</div>' +
+      '<div class="entry-body">' + sections + staleNote + foot + '</div>' +
+    '</div>';
+  }).join('');
+
+  for (const entry of readerList.querySelectorAll('.entry')) {
+    entry.querySelector('.entry-head').onclick = () => {
+      entry.classList.toggle('open');
+      entry.querySelector('.entry-chev').textContent =
+        entry.classList.contains('open') ? '▾' : '▸';
+    };
+  }
+  // Jumping to the graph answers the question the reader cannot: what else
+  // does this touch. It switches view, focuses the node and opens its panel.
+  for (const btn of readerList.querySelectorAll('.entry-open')) {
+    btn.onclick = ev => {
+      ev.stopPropagation();
+      const node = byId.get(btn.dataset.graph);
+      if (!node) return;
+      setMode('graph');
+      S.scope = 'all';
+      applyScope();
+      inspect(node);
+      S.px = -node.x * S.zoom;
+      S.py = -node.y * S.zoom;
+    };
+  }
+}
+
+function setMode(mode) {
+  S.mode = mode;
+  readerEl.classList.toggle('on', mode === 'read');
+  for (const b of document.querySelectorAll('#modes button'))
+    b.classList.toggle('on', b.dataset.mode === mode);
+  // The scope buttons steer the canvas only; showing them over the reader
+  // implies they filter it, and they do not.
+  const hide = mode === 'read' ? 'none' : '';
+  document.getElementById('scopes').style.display = hide;
+  document.getElementById('scope-note').style.display = hide;
+  document.getElementById('area-list').style.display = hide;
+  if (mode === 'read') { inspect(null); renderReader(); }
+}
+
+for (const b of document.querySelectorAll('#modes button'))
+  b.onclick = () => setMode(b.dataset.mode);
+sortSel.onchange = renderReader;
+expandAllBtn.onclick = () => {
+  allOpen = !allOpen;
+  expandAllBtn.textContent = allOpen ? 'Collapse all' : 'Expand all';
+  renderReader();
+};
+
+/* The reader follows the same sidebar controls as the graph. Listening to the
+   one event every filter and search already fires keeps a single source of
+   truth, rather than a second copy of the wiring that drifts out of step. */
+addEventListener('icn:filters', renderReader);
+
+// Memories are what people come here to read, so that is what opens.
+setMode('read');
