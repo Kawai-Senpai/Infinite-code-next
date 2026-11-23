@@ -610,6 +610,7 @@ published page must stay a single self-contained file.
 | `agit` | `status` · `diff` · `commit` · `log` · `branches` · `switch` · `restore` · `reset` · `show` |
 | `experiment` | `init` · `tree` · `create` · `checkout` · `commit` · `diff` · `run` · `status` · `log` · `wait` · `cancel` · `runs` · `conclude` · `promote` · `apply` · `set_command` |
 | `paper` | `search` (arXiv, alphaXiv, OpenAlex, bioRxiv) · `fetch` · `read` · `grep` · `render` · `figures` · `download` · `list` · `forget` · `remember` |
+| `preview` | local images, document pages, video filmstrips, and paginated text as MCP images |
 | `conversations` | `search` · `list` · `get` · `digest` · `refresh` · `status` · `doctor` · `schema` · `purge` · `restore` |
 
 `agit` keeps agent checkpoints in `.agit/`, entirely separate from the user's
@@ -641,6 +642,37 @@ adapter parses a file as JSON but finds no conversation, it reports
 investigated; `conversations` is for reading a whole session, its `digest`, or
 searching across every codebase. Vendor stores are only ever read, and the
 index and archive never leave the machine.
+
+### Visual previews
+
+Install the renderers into the environment that launches the MCP server. From
+this checkout, run `python -m pip install -e ".[preview]"` and restart the client.
+For a packaged install, use `uvx --from "infinite-code-next[preview]" infinite-code-next`
+as the server command once your installed version includes `preview`.
+
+| Input | Example tool arguments | Output |
+|---|---|---|
+| JPEG, PNG, WebP, GIF, TIFF and other supported images | `{"path":"assets/screenshot.png"}` | A fitted image. Use `page` to select a GIF frame or TIFF page. |
+| PDF, SVG, XPS, EPUB and other supported documents | `{"path":"report.pdf","page":3,"count":2}` | One image per selected page, including scanned pages. |
+| Word, PowerPoint, Excel, OpenDocument and RTF | `{"path":"slides.pptx","count":2}` | Images of the pages LibreOffice exports. Requires LibreOffice on the server machine. |
+| MP4, MOV, WebM, MKV and other supported videos | `{"path":"demo.mp4","start_seconds":10,"end_seconds":20,"count":8}` | One filmstrip with the actual timestamps of sampled frames. |
+| Logs, Markdown, code and other plain text | `{"path":"build.log","page":4,"count":2}` | Paginated, line-numbered images with long lines wrapped. |
+
+Paths can be absolute or relative to the ICN root. You can also pass inline
+`text`. Use `kind` to override detection, for example `kind="text"` to view SVG
+source markup. The result contains a short summary and native MCP image blocks
+for an image-capable client. Previews read local files without adding them to
+the knowledge store.
+
+Use the returned `next_page` to continue a multi-page preview. Keep `max_side`
+fixed across text pages so wrapping stays consistent. A call can return up to
+4 pages or sample up to 12 video frames into one filmstrip. `max_side` ranges
+from 640 to 2048 pixels and defaults to 1440.
+
+Passing a text file path keeps the source text out of the tool arguments and
+result metadata. Text previews support UTF-8 and BOM-marked UTF-16/32 files up
+to 16 MiB. Image inputs still use vision tokens, and exact transcription
+depends on the model, font coverage, and resolution.
 
 ## Knowledge that arrives without being asked
 

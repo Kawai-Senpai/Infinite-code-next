@@ -10,10 +10,12 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from conftest import record_baseline
 
 from icn import imports as import_mod
+from icn import indexer as index_mod
 from icn import parsing, search as search_mod
 from icn import workspace as ws_mod
 from icn.db import init_repo_store, one, rows
@@ -377,6 +379,8 @@ def b():
 
     monkeypatch.setattr(Indexer, "resolve_calls", spy)
 
+    tick = time.time()
+    monkeypatch.setattr(index_mod, "time", SimpleNamespace(time=lambda: tick))
     conn = init_repo_store(tmp_path / "store.db")
     try:
         report = Indexer(conn, repo.root, "repo_deferred").full_index(
@@ -387,6 +391,8 @@ def b():
         conn.close()
 
     assert report["truncated"], "budget_seconds=0 means no time at all, not no budget"
+    assert report["files_seen"] == 0
+    assert report["files_indexed"] == 0
     assert not seen, "a truncated index must not resolve the whole repository"
     assert report["call_edges"] == 0
     assert report["import_edges"]["deferred"] == "index truncated"
@@ -395,7 +401,7 @@ def b():
     assert edges["n"] == 0
 
 
-def test_the_resolution_passes_stop_at_their_deadline(project, tmp_path):
+def test_the_resolution_passes_stop_at_their_deadline(project, tmp_path, monkeypatch):
     """Resolution is resumable, so it is allowed to stop: it rewrites one
     file's or one symbol's edges wholesale inside a transaction, never half."""
     conn = init_repo_store(tmp_path / "store.db")
@@ -404,12 +410,15 @@ def test_the_resolution_passes_stop_at_their_deadline(project, tmp_path):
         report = idx.full_index(project.head())
         assert not report["truncated"] and report["call_edges"] > 0
 
-        past = time.time() - 1
-        assert idx.resolve_calls(None, project.head(), deadline=past) == 0
+        deadline = time.time()
+        clock = SimpleNamespace(time=lambda: deadline)
+        monkeypatch.setattr(index_mod, "time", clock)
+        monkeypatch.setattr(import_mod, "time", clock)
+        assert idx.resolve_calls(None, project.head(), deadline=deadline) == 0
         assert idx.resolution_truncated
 
         stopped = import_mod.resolve_file_imports(conn, None, project.head(),
-                                                  deadline=past)
+                                                  deadline=deadline)
         assert stopped["truncated"] and stopped["files"] == 0
 
         # And the edges the completed run wrote are still there: stopping

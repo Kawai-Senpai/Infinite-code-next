@@ -1,4 +1,4 @@
-"""MCP surface: nine tools.
+"""MCP surface: ten tools.
 
 PLAN 2 section 10. Agents waste turns choosing between near-identical tools, so
 the surface is deliberately small and grouped by action:
@@ -16,16 +16,15 @@ the surface is deliberately small and grouped by action:
                  wait, cancel, runs, conclude, promote, apply, set_command
     paper        search, fetch, read, grep, render, figures, download, list,
                  forget, remember
+    preview      local images, document pages, video filmstrips, and text pages
     conversations search, list, get, digest, refresh, status, doctor, schema,
                  purge, restore - past chats from every agent on this machine
 
 Every response carries the resolved root, so a wrong workspace is visible at
 once instead of quietly poisoning the store.
 
-paper() is annotated `-> Any` rather than `-> dict[str, Any]` like its
-siblings, and that difference is load-bearing: FastMCP builds an output model
-from the return annotation and validates against it, so a dict annotation
-rejects the mixed [summary, Image, Image] list that action='render' returns.
+paper() and preview() use `-> Any` because a dict output annotation would
+make FastMCP reject their mixed [summary, Image, Image] results.
 """
 
 from __future__ import annotations
@@ -53,6 +52,7 @@ from . import memscore as memscore_mod
 from . import rules as rules_mod
 from . import lab as lab_mod
 from . import papers as papers_mod
+from . import preview as preview_mod
 from . import search as search_mod
 from . import workspace as ws_mod
 from .db import rows
@@ -100,6 +100,10 @@ answers one question without loading the rest, and render() returns page images
 for the figures and tables the text layer drops. paper(action='remember') writes
 what a paper settled into this repository's memory graph, so the next agent
 asking why the code is shaped this way finds the citation instead of guessing.
+
+Use preview() to inspect local images, document pages, timestamped video
+filmstrips, or large text files as MCP images. Pass a path for text already
+on disk, and use page/count or a video time range to narrow what you see.
 
 experiment() is for questions only a measurement can settle: is this change
 faster, more accurate, cheaper? Each experiment is exact code on its own branch
@@ -1602,6 +1606,48 @@ def experiment(
         return _fail(str(err), str(work))
     finally:
         current.close()
+
+
+@mcp.tool()
+def preview(
+    path: str | None = None,
+    text: str | None = None,
+    kind: str = "auto",
+    page: int = 1,
+    count: int | None = None,
+    max_side: int = 1440,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+    root: str | None = None,
+) -> Any:
+    """Preview a local file or inline text as native MCP images.
+
+    Args:
+        path: Absolute local path or path relative to root. Supply path or text.
+        text: Inline text to render. Use a path for large text already on disk.
+        kind: auto, image, document (PDF, SVG, XPS, ebook), office, text, or video.
+        page: First page or animated image frame, starting at 1.
+        count: Consecutive pages or frames (1-4, default 1). For video, sample
+            1-12 frames (default 6) into one annotated filmstrip.
+        max_side: Maximum image dimension in pixels, 640-2048. Keep this the
+            same when using next_page to resume a text preview.
+        start_seconds: Video interval start, default 0.
+        end_seconds: Video interval end, default video duration.
+        root: Base directory for relative paths, default ICN workspace root.
+    """
+    resolved = None
+    try:
+        resolved = ws_mod.resolve_root(root)
+        summary, images = preview_mod.render(
+            resolved, path=path, text=text, kind=kind, page=page, count=count,
+            max_side=max_side, start_seconds=start_seconds, end_seconds=end_seconds,
+        )
+        return [summary, *(
+            Image(data=data, format=info["mime_type"].split("/")[1])
+            for info, data in zip(summary["images"], images)
+        )]
+    except (preview_mod.PreviewError, OSError, RuntimeError, ValueError) as exc:
+        return _fail(str(exc), str(resolved) if resolved is not None else root)
 
 
 @mcp.tool()

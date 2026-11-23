@@ -13,7 +13,7 @@ from typing import Any
 
 PROTOCOL_VERSION = "2025-06-18"
 EXPECTED_TOOLS = {"agit", "conversations", "experiment", "graph", "investigate",
-                  "memory", "paper", "record", "workspace"}
+                  "memory", "paper", "preview", "record", "workspace"}
 
 
 def _read_response(proc: subprocess.Popen[str], request_id: int, timeout: float) -> dict[str, Any]:

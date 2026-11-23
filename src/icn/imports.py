@@ -285,14 +285,14 @@ def resolve_file_imports(conn: sqlite3.Connection, file_ids: set[str] | None,
     import stops being reported and edges written by an older, statement-text
     scheme are replaced rather than accumulating alongside the real ones.
 
-    `deadline` is a wall-clock time (time.time()) after which the pass stops
+    `deadline` is a wall-clock time (time.time()) at which the pass stops
     between batches and reports `truncated`. A stopped pass resolves fewer
     files; it never leaves one half-resolved, because a file's IMPORTS edges
     are rewritten wholesale inside one transaction.
     """
     if file_ids is not None and not file_ids:
         return {"resolved": 0, "external": 0, "files": 0, "truncated": False}
-    if deadline is not None and time.time() > deadline:
+    if deadline is not None and time.time() >= deadline:
         # Before the queries, not after: building the file index and reading
         # every specifier is itself the expensive part on a large repository.
         return {"resolved": 0, "external": 0, "files": 0, "truncated": True}
@@ -319,7 +319,7 @@ def resolve_file_imports(conn: sqlite3.Connection, file_ids: set[str] | None,
     truncated = False
     stamp = now()
     for start in range(0, len(targets), IMPORT_BATCH):
-        if deadline is not None and time.time() > deadline:
+        if deadline is not None and time.time() >= deadline:
             truncated = True
             targets = targets[:start]
             break

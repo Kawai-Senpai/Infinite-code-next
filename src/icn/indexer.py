@@ -658,7 +658,7 @@ class Indexer:
         self.resolution_truncated = False
         if symbol_ids is not None and not symbol_ids:
             return 0
-        if deadline is not None and time.time() > deadline:
+        if deadline is not None and time.time() >= deadline:
             # Reading every symbol row and building the resolution tables is
             # itself minutes of work on a large repository, so the check comes
             # before the query, not after it.
@@ -693,7 +693,7 @@ class Indexer:
         created = 0
         stamp = now()
         for start in range(0, len(source_rows), CALL_BATCH):
-            if deadline is not None and time.time() > deadline:
+            if deadline is not None and time.time() >= deadline:
                 self.resolution_truncated = True
                 break
             with write_tx(self.conn):
@@ -763,7 +763,7 @@ class Indexer:
         seen_paths: set[str] = set()
 
         def out_of_time() -> bool:
-            return deadline is not None and time.time() > deadline
+            return deadline is not None and time.time() >= deadline
 
         # Discovery is streamed and batched: one transaction per file on a
         # 4000-file repo is thousands of fsyncs, and the budget must cover
@@ -810,18 +810,21 @@ class Indexer:
                         report["files_indexed"] += 1
                         report["symbols"] += result.get("symbols", 0)
 
-        for abs_path in iter_source_files(self.root, self.excludes):
-            report["files_seen"] += 1
-            seen_paths.add(abs_path.relative_to(self.root).as_posix())
-            batch.append(abs_path)
-            if len(batch) >= 40:
-                flush()
-                if report["truncated"] or out_of_time():
-                    report["truncated"] = True
-                    break
+        report["truncated"] = out_of_time()
         if not report["truncated"]:
-            flush()
+            for abs_path in iter_source_files(self.root, self.excludes):
+                report["files_seen"] += 1
+                seen_paths.add(abs_path.relative_to(self.root).as_posix())
+                batch.append(abs_path)
+                if len(batch) >= 40:
+                    flush()
+                    if report["truncated"] or out_of_time():
+                        report["truncated"] = True
+                        break
+            if not report["truncated"]:
+                flush()
 
+        report["truncated"] = report["truncated"] or out_of_time()
         if not report["truncated"]:
             with write_tx(self.conn):
                 report["files_tombstoned"] = self._tombstone_missing(seen_paths, commit)
