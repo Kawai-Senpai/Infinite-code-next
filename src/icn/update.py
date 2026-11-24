@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from contextlib import closing
 from pathlib import Path
 
@@ -17,7 +19,7 @@ from .paths import storage_root
 UPSTREAM = "https://github.com/Kawai-Senpai/Infinite-code-next.git"
 BRANCH = "refs/heads/main"
 COMMIT = re.compile(r"[0-9a-f]{40}")
-# Verify the candidate can import the MCP server without opening a workspace.
+SLOT = re.compile(r"[a-z0-9_]{8}")
 PROBE = ("from icn.server import mcp; from icn.db import SCHEMA_VERSION; "
          f"raise SystemExit(SCHEMA_VERSION != {SCHEMA_VERSION})")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -27,39 +29,54 @@ def _state_file() -> Path:
     return storage_root() / "cache" / "updates.db"
 
 
-def _revision(conn: sqlite3.Connection, extras: str) -> str | None:
-    row = conn.execute("SELECT revision FROM prepared WHERE extras = ?", (extras,)).fetchone()
-    return row[0] if row and isinstance(row[0], str) and COMMIT.fullmatch(row[0]) else None
+def _environments() -> Path:
+    return _state_file().parent / "update-envs"
 
 
-def _prepared(extras: str) -> str | None:
+def _slot(conn: sqlite3.Connection, extras: str) -> tuple[str, str] | None:
+    row = conn.execute("SELECT revision, slot FROM installed WHERE extras = ?", (extras,)).fetchone()
+    if row is None:
+        return None
+    revision, slot = row
+    if not isinstance(revision, str) or not isinstance(slot, str):
+        return None
+    return (revision, slot) if COMMIT.fullmatch(revision) and SLOT.fullmatch(slot) else None
+
+
+def _prepared(extras: str) -> tuple[str, str] | None:
     try:
         with closing(sqlite3.connect(_state_file().as_uri() + "?mode=ro", uri=True, timeout=0)) as conn:
-            return _revision(conn, extras)
+            return _slot(conn, extras)
     except sqlite3.Error:
         return None
 
 
-def _command(uv: str, revision: str, extras: str, *, offline: bool) -> list[str]:
-    package = f"infinite-code-next[{extras}]" if extras else "infinite-code-next"
-    command = [uv, "run", "--quiet", "--no-project", "--no-config", "--no-env-file",
-               "--no-python-downloads", "--python", sys.executable,
-               "--with", f"{package} @ git+{UPSTREAM}@{revision}"]
-    if offline:
-        command.append("--offline")
-    return [*command, "--", "python", "-I"]
+def _python(directory: Path) -> Path:
+    return directory / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def _probe(command: list[str], timeout: int) -> bool:
+def _windowless(python: Path) -> Path:
+    if os.name == "nt":
+        gui = python.with_name("pythonw.exe")
+        if gui.is_file():
+            return gui
+    return python
+
+
+def _run(command: list[str], timeout: int) -> bool:
     try:
         result = subprocess.run(
-            [*command, "-c", PROBE], stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout,
-            creationflags=NO_WINDOW,
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=timeout, creationflags=NO_WINDOW,
+            cwd=_state_file().parent,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0
+
+
+def _probe(python: Path) -> bool:
+    return _run([str(_windowless(python)), "-I", "-c", PROBE], 15)
 
 
 def _latest(git: str) -> str | None:
@@ -74,41 +91,66 @@ def _latest(git: str) -> str | None:
     return None
 
 
+def _stage(uv: str, revision: str, extras: str) -> str | None:
+    base = _environments().resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    # Keep the environment path short enough for deeply nested wheel files
+    # on Windows. The full revision is stored in the database.
+    directory = Path(tempfile.mkdtemp(prefix="", dir=base))
+    python = _python(directory)
+    package = f"infinite-code-next[{extras}]" if extras else "infinite-code-next"
+    prepared = False
+    try:
+        prepared = (
+            _run([uv, "venv", "--no-config", "--no-python-downloads", "--python",
+                  sys.executable, str(directory)], 30)
+            and _run([uv, "pip", "install", "--no-config", "--link-mode", "copy", "--python",
+                      str(python), f"{package} @ git+{UPSTREAM}@{revision}"], 120)
+            and _probe(python)
+        )
+        return directory.name if prepared else None
+    finally:
+        # Only remove the unique, unpublished environment this attempt created.
+        if not prepared and directory.resolve().parent == base:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
 def prepare(uv: str, git: str, extras: str) -> None:
-    """Cache one validated upstream revision. Called by a background process."""
+    """Download and validate an upstream commit in a separate environment."""
     path = _state_file()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(path, timeout=0)) as conn, conn:
-            # This lock is only for update workers. MCP sessions read the
-            # previous committed revision while this worker downloads.
+            # Other launchers can still read the last committed pointer.
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute("CREATE TABLE IF NOT EXISTS prepared (extras TEXT PRIMARY KEY, revision TEXT NOT NULL)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS installed (extras TEXT PRIMARY KEY,"
+                " revision TEXT NOT NULL, slot TEXT NOT NULL)"
+            )
             revision = _latest(git)
             if revision is None:
                 return
-            current = _revision(conn, extras)
-            offline = _command(uv, revision, extras, offline=True)
-            if current == revision and _probe(offline, 10):
+            current = _slot(conn, extras)
+            if current and current[0] == revision and _probe(_python(_environments() / current[1])):
                 return
-            if _probe(_command(uv, revision, extras, offline=False), 120) and _probe(offline, 10):
+            candidate = _stage(uv, revision, extras)
+            if candidate is not None:
                 conn.execute(
-                    "INSERT INTO prepared(extras, revision) VALUES (?,?)"
-                    " ON CONFLICT(extras) DO UPDATE SET revision=excluded.revision",
-                    (extras, revision),
+                    "INSERT INTO installed(extras, revision, slot) VALUES (?,?,?)"
+                    " ON CONFLICT(extras) DO UPDATE SET revision=excluded.revision, slot=excluded.slot",
+                    (extras, revision, candidate),
                 )
     except (OSError, sqlite3.Error, subprocess.SubprocessError):
-        # A failed lookup, build, or concurrent update leaves the old pointer usable.
+        # A failed lookup, build, or competing worker leaves the old pointer usable.
         return
 
 
 def _start_worker(flags: list[str]) -> None:
     try:
         subprocess.Popen(
-            [sys.executable, "-I", "-m", "icn", "--prepare-update", *flags],
+            [str(_windowless(Path(sys.executable))), "-I", "-m", "icn", "--prepare-update", *flags],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=NO_WINDOW,
-            start_new_session=True,
+            creationflags=NO_WINDOW, start_new_session=True,
         )
     except OSError:
         pass
@@ -122,23 +164,27 @@ def main(argv: list[str], *, worker: bool = False) -> int:
     enabled = [name for name in ("preview", "semantic") if getattr(args, name)]
     extras = ",".join(enabled)
     uv, git = shutil.which("uv"), shutil.which("git")
+    fetch = uv and git and os.getenv("UV_OFFLINE", "").strip().lower() not in {"1", "true"}
     if worker:
-        if uv and git:
+        if fetch:
             prepare(uv, git, extras)
         return 0
 
-    # Read the pointer before starting this launch's download. The candidate
-    # prepared here becomes eligible only on a later launch.
-    revision = _prepared(extras) if uv else None
-    if uv and git:
+    # A pointer published by this launch's worker is for a later launch.
+    prepared = _prepared(extras)
+    if fetch:
         _start_worker([f"--{name}" for name in enabled])
-    if uv and revision:
-        command = _command(uv, revision, extras, offline=True)
-        if _probe(command, 10):
+    if prepared:
+        python = _python(_environments() / prepared[1])
+        if _probe(python):
             try:
-                # Preserve the client's stdin and stdout for MCP. Once any
-                # server starts, let the client decide if it wants to restart.
-                return subprocess.call([*command, "-m", "icn"], creationflags=NO_WINDOW)
+                # Preserve the MCP client's pipes and working directory. The
+                # prepared interpreter runs directly without resolving packages.
+                return subprocess.call(
+                    [str(_windowless(python)), "-I", "-m", "icn"],
+                    stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+                    creationflags=NO_WINDOW,
+                )
             except OSError:
                 pass
     from .server import main as serve

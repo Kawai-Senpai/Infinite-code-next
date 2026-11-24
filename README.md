@@ -109,11 +109,12 @@ args = ["--auto-update"]
 ```
 
 The installed launcher serves the first session and checks for a newer
-commit in the background. It prepares a commit-pinned environment and checks
-that it can load offline with the launcher's store schema. A later MCP
-restart uses that cached revision. If the cache is unavailable, the installed
-server can still launch. A schema-changing update requires a newer installed
-launcher. Add `--preview` or `--semantic` to the arguments to include those
+commit in the background. It installs and checks a commit-pinned environment
+under ICN's `cache/update-envs/` using the launcher's store schema. A later MCP
+restart runs that environment directly, including offline. If it is unavailable,
+the installed server can still launch. A schema-changing update requires a newer installed
+launcher. Set `UV_OFFLINE=1` to skip the update check and use the cache.
+Add `--preview` or `--semantic` to the arguments to include those
 optional features in the cached environment. Remove `--auto-update` to use
 the installed version on every restart.
 
