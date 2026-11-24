@@ -129,10 +129,10 @@ def _lease_for(repo_id: str) -> Lease:
 def _background_finish(repo_id: str, root: Path, commit: str | None, excludes: list[str]) -> None:
     """Finish a truncated first index without blocking the caller."""
     lease = _lease_for(repo_id)
-    if not lease.try_acquire():
-        return
     store = None
     try:
+        if not lease.try_acquire():
+            return
         store = init_repo_store(paths.repo_db_path(repo_id))
         idx = indexer_mod.Indexer(store, root, repo_id, excludes)
         idx.full_index(commit)
@@ -297,8 +297,7 @@ def ensure_indexed(ws: Workspace, force_full: bool = False,
     if not lease.try_acquire():
         holder = lease.holder() or {}
         return {"indexed": False, "reason": "another process holds the indexer lease",
-                "lease_holder_pid": holder.get("pid"),
-                "index_state": "partial" if cold else "ready", **state}
+                "lease_holder_pid": holder.get("pid"), "index_state": "partial", **state}
 
     try:
         idx = indexer_mod.Indexer(ws.store, ws.root, ws.repo_id, ws.excludes)

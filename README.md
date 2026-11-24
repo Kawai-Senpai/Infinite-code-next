@@ -97,6 +97,26 @@ If the client was already running when ICN was installed or configured,
 restart it after the doctor reports `READY` so its deferred tool catalogue is
 refreshed.
 
+### Opt-in updates on restart
+
+With Git and [uv](https://docs.astral.sh/uv/) installed, add `--auto-update`
+to your existing MCP command to follow this project's GitHub `main` branch.
+
+```toml
+[mcp_servers.icn]
+command = "infinite-code-next"
+args = ["--auto-update"]
+```
+
+The installed launcher serves the first session and checks for a newer
+commit in the background. It prepares a commit-pinned environment and checks
+that it can load offline with the launcher's store schema. A later MCP
+restart uses that cached revision. If the cache is unavailable, the installed
+server can still launch. A schema-changing update requires a newer installed
+launcher. Add `--preview` or `--semantic` to the arguments to include those
+optional features in the cached environment. Remove `--auto-update` to use
+the installed version on every restart.
+
 ### The loop
 
 ```
@@ -236,11 +256,19 @@ to report symbol counts, which tells you nothing about what you are walking
 into. **You cannot ask the right question before you know what is on the
 shelf.**
 
-### 2. Investigate in plain language — not with grep
+### 2. Investigate, then check the source
 
 ```python
 investigate("I need to change refresh token rotation. What will I break?")
 ```
+
+Include a qualified symbol, path, config key, or exact error text when you have
+one. Broad queries return ranked leads. If the top results miss the question,
+check `index_state`, then use repository search to find concrete identifiers.
+For example, if "repository map token budget" returns unrelated hits, look for
+`max_map_tokens` in the source and use that name in a follow-up investigation.
+Read the relevant implementation and tests before relying on a result. A
+partial index can omit files, so use source search or retry when it is ready.
 
 For one bounded investigation across several repositories, pass their roots
 explicitly. This does not require pre-existing contract edges:
@@ -270,6 +298,7 @@ first call.
 ## Infinite Code Next (ICN)
 - For any task involving an existing codebase, use ICN. At the beginning of a session and whenever you switch repositories, discover deferred tools if necessary and call `mcp__icn__workspace(action="open", root=<repo>)`.
 - Before investigating, diagnosing, designing, or modifying code, call `mcp__icn__investigate(query=<task>, intent=<intent>, root=<repo>)`. Treat memories whose anchor status is not `ACTIVE` as unverified leads.
+- Include known symbol names, paths, configuration keys, or exact error text. Treat broad results as leads. If the results are weak or the index is partial, search the repository directly and read the source and tests before drawing conclusions.
 - After verified findings or changes, call `mcp__icn__record` with the decision, failure prevented, affected files/symbols, invariants, warnings, failed attempts, contracts, and tests. Skip investigation and recording only for purely mechanical actions such as correcting a typo or running an explicitly requested command.
 - Checkpoint your own work with `mcp__icn__agit(action="commit", message=...)` before risky edits or broad refactors, and roll back with `mcp__icn__agit(action="restore", paths=[...])`. It commits to `.agit/`, never the user's `.git`, so it is not a substitute for asking before a real commit.
 - If `mcp__icn__*` is not visible, search the available/deferred tool catalogue and load it. If it still cannot be loaded, explicitly report that ICN is unavailable and continue with the best evidence. Never silently skip ICN or claim it was used when it was not.
@@ -281,6 +310,7 @@ first call.
 ## Infinite Code Next (ICN)
 - For any task involving an existing codebase, use ICN. At the beginning of a session and whenever you switch repositories, ensure the `icn` MCP server and its tools are loaded and call `workspace(action="open", root=<repo>)`.
 - Before investigating, diagnosing, designing, or modifying code, call `investigate(query=<task>, intent=<intent>, root=<repo>)`. Treat memories whose anchor status is not `ACTIVE` as unverified leads.
+- Include known symbol names, paths, configuration keys, or exact error text. Treat broad results as leads. If the results are weak or the index is partial, search the repository directly and read the source and tests before drawing conclusions.
 - After verified findings or changes, call `record` with the decision, failure prevented, affected files/symbols, invariants, warnings, failed attempts, contracts, and tests. Skip investigation and recording only for purely mechanical actions such as correcting a typo or running an explicitly requested command.
 - Checkpoint your own work with `agit(action="commit", message=...)` before risky edits or broad refactors, and roll back with `agit(action="restore", paths=[...])`. It commits to `.agit/`, never the user's `.git`, so it is not a substitute for asking before a real commit.
 - If ICN is not loaded, try to reconnect or load the configured `icn` MCP server. If it remains unavailable, explicitly report that fact and continue with the best evidence. Never silently skip ICN or claim it was used when it was not.
@@ -612,6 +642,21 @@ published page must stay a single self-contained file.
 | `paper` | `search` (arXiv, alphaXiv, OpenAlex, bioRxiv) · `fetch` · `read` · `grep` · `render` · `figures` · `download` · `list` · `forget` · `remember` |
 | `preview` | local images, document pages, video filmstrips, and paginated text as MCP images |
 | `conversations` | `search` · `list` · `get` · `digest` · `refresh` · `status` · `doctor` · `schema` · `purge` · `restore` |
+
+A plain `record(summary="…")` returns a memory ID. When you provide typed
+claims, such as invariants or warnings, those claims remain separate memories
+with the summary as context. `investigate` returns directly matching
+repository-wide memories in `repo_memories`, including when no symbol matches.
+Use `memory(action="get", memory_id="…")` for the full stored body.
+
+### Snapshot a repository store
+
+Run `icn backup icn-repo.sqlite --root /path/to/repository` to make a checked
+SQLite snapshot of an existing repository store. It includes events, full
+memory bodies, versions, anchors, and graph edges, including committed
+writes still in SQLite's WAL. The destination must be a new file. The central
+catalog and transcript archive are separate stores. Use the knowledge export
+workflow for sharing selected memories across installations.
 
 `agit` keeps agent checkpoints in `.agit/`, entirely separate from the user's
 `.git`. Checkpoint risky work, restore it, never touch their history.

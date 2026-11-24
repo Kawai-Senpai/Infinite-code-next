@@ -67,6 +67,15 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
     os.replace(temp, path)
 
 
+def hidden_windows_kwargs(flags: int = 0) -> dict:
+    if sys.platform != "win32":
+        return {}
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = subprocess.SW_HIDE
+    return {"creationflags": subprocess.CREATE_NO_WINDOW | flags, "startupinfo": startup}
+
+
 def _kill_tree(child: subprocess.Popen) -> None:
     """Stop the command and everything it started.
 
@@ -78,7 +87,7 @@ def _kill_tree(child: subprocess.Popen) -> None:
     if sys.platform == "win32":
         subprocess.run(["taskkill", "/PID", str(child.pid), "/T", "/F"],
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, creationflags=0x08000000, check=False)
+                       stderr=subprocess.DEVNULL, check=False, **hidden_windows_kwargs())
     else:
         try:
             os.killpg(child.pid, signal.SIGTERM)
@@ -114,7 +123,7 @@ def run(run_dir: Path) -> int:
         # CREATE_NO_WINDOW: this watcher has no console, so without it every
         # cmd.exe it starts would open a visible window. New process group so
         # the kill below reaches the whole tree.
-        kwargs["creationflags"] = 0x08000000 | 0x00000200
+        kwargs = hidden_windows_kwargs(subprocess.CREATE_NEW_PROCESS_GROUP)
     else:
         kwargs["start_new_session"] = True
 

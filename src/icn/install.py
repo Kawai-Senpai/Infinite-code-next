@@ -65,9 +65,8 @@ that is no longer there.
 1. `workspace(action="open", root=<repo>)` once per session, and again on every
    repository switch. Read the briefing it returns before opening any file.
 2. `investigate(query=<what you are about to do>, intent=<intent>)` before
-   investigating, diagnosing, designing or modifying. It searches code and
-   knowledge together, so prefer it over grep for anything but a literal
-   string.
+   investigating, diagnosing, designing or modifying. Include known symbols,
+   paths, config keys, or error text to focus the search.
 3. `graph(action="impact", target=<symbol>)` before changing a symbol other
    things depend on. `graph(action="trace", target=A, to=B)` to prove two
    symbols are actually connected rather than assuming.
@@ -98,6 +97,12 @@ Skip steps 2 and 5 only for purely mechanical work - fixing a typo, running a
 command you were explicitly asked to run.
 
 ## Reading results honestly
+
+**Search coverage.** Broad queries produce ranked leads. For weak or empty
+matches, check `index_state` (under `index` on `workspace(action="open")`).
+A partial index can omit files and symbols. Use repository search to find
+concrete identifiers, inspect the relevant source and tests, and retry
+`investigate` with those identifiers when you need their stored history.
 
 **Anchor status.** Every memory carries one. Anything other than `ACTIVE` has
 not been checked against the current code: treat it as a lead, not a fact, and

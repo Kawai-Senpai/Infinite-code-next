@@ -20,7 +20,11 @@ def test_install_writes_the_skill_and_the_hook(tmp_path):
 
     skill = tmp_path / install_mod.SKILL_DIR / "SKILL.md"
     assert skill.exists()
-    assert skill.read_text(encoding="utf-8").startswith("---\nname: icn-workflow")
+    guidance = skill.read_text(encoding="utf-8")
+    assert guidance.startswith("---\nname: icn-workflow")
+    assert "Broad queries produce ranked leads" in guidance
+    assert "index_state" in guidance
+    assert "Use repository search" in guidance
 
     settings = json.loads((tmp_path / install_mod.SETTINGS_PATH).read_text(encoding="utf-8"))
     entries = settings["hooks"]["SessionStart"]

@@ -119,20 +119,20 @@ def open_workspace(conn: sqlite3.Connection, root: Path) -> dict[str, Any]:
     and cheap; it does not index anything.
     """
     pr = probe(root)
-    repo_id, confidence, matched_on = identify(conn, pr)
     created = False
     reattached = False
     forked_from = None
 
-    # A fork shares upstream's root commit, so identity alone would merge the
-    # two. Split them, and record the lineage instead of discarding it.
-    if repo_id is not None and matched_on == "root_commit" and detect_fork(conn, pr, repo_id):
-        forked_from = repo_id
-        repo_id = None
-        matched_on = "none"
-        confidence = 0.0
-
     with write_tx(conn):
+        # Read identity under the same lock as registration. Two first opens
+        # must not create separate repositories for the same checkout.
+        repo_id, confidence, matched_on = identify(conn, pr)
+        if repo_id is not None and matched_on == "root_commit" and detect_fork(conn, pr, repo_id):
+            forked_from = repo_id
+            repo_id = None
+            matched_on = "none"
+            confidence = 0.0
+
         if repo_id is None:
             repo_id = ids.new_id(ids.REPO)
             created = True

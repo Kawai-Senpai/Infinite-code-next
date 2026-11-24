@@ -166,6 +166,7 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
 
     created_memories: list[dict[str, Any]] = []
     reinforced: list[dict[str, Any]] = []
+    reinforced_ids: set[str] = set()
     created_edges = 0
     contradictions: list[dict[str, Any]] = []
     extensions: list[dict[str, Any]] = []
@@ -208,9 +209,13 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
             for claim in _as_list(payload.get(field)):
                 entries.append((memory_kind, severity, _compose(claim, context), str(claim).strip()))
 
-        # The summary itself is a memory when the event describes a change.
-        if summary and kind in EVENT_KIND_TO_MEMORY:
-            memory_kind, severity = EVENT_KIND_TO_MEMORY[kind]
+        # A plain note with no typed claims still needs something a caller can
+        # retrieve. Typed notes keep their substantive claims as the primary.
+        summary_kind = EVENT_KIND_TO_MEMORY.get(kind)
+        if kind == "note" and not entries:
+            summary_kind = ("rationale", "low")
+        if summary and summary_kind:
+            memory_kind, severity = summary_kind
             reasoning = str(payload.get("reasoning") or "").strip()
             body = f"{summary}\n\n{reasoning}".strip() if reasoning else summary
             entries.insert(0, (memory_kind, severity,
@@ -221,7 +226,10 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
         for memory_kind, severity, body, claim in entries:
             duplicate, near = _find_duplicate(conn, memory_kind, claim, resolved_ids, event_id)
             if duplicate is not None:
-                reinforced.append(_reinforce(conn, duplicate, event_id, resolved, commit))
+                memory_id = duplicate["memory_id"]
+                if memory_id not in reinforced_ids:
+                    reinforced.append(_reinforce(conn, duplicate, event_id, resolved, commit))
+                    reinforced_ids.add(memory_id)
                 continue
 
             memory_id = ids.new_id(ids.MEMORY)
@@ -237,7 +245,7 @@ def record_event(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id:
             )
             conn.execute("INSERT OR IGNORE INTO memory_evidence (memory_id, event_id, similarity,"
                          " created_at) VALUES (?,?,1.0,?)", (memory_id, event_id, now()))
-            _index_memory(conn, memory_id, title, body, memory_kind)
+            _index_memory(conn, memory_id, title, body, memory_kind, replace=False)
             conn.execute(
                 "INSERT INTO memory_edges (edge_id, from_id, to_id, kind, edge_class, status,"
                 " confidence, source, created_at) VALUES (?,?,?,'DERIVED_FROM','deterministic',"
@@ -659,8 +667,12 @@ def _find_duplicate(conn: sqlite3.Connection, kind: str, claim: str,
         return None, None
 
     best_dup, best_near = None, None
+    negated = bool(NEGATION.search(claim))
     for memory in candidates:
-        similarity = claim_similarity(claim, _stored_claim(memory))
+        previous = _stored_claim(memory)
+        if negated != bool(NEGATION.search(previous)):
+            continue
+        similarity = claim_similarity(claim, previous)
         if similarity < (1.0 if short else NEAR_SIMILARITY):
             continue
         targets = {r["to_id"] for r in conn.execute(
@@ -783,7 +795,7 @@ def title_for(body: str) -> str:
     return (body or "").strip().split("\n", 1)[0][:200]
 
 def _index_memory(conn: sqlite3.Connection, memory_id: str, title: str, body: str,
-                  kind: str) -> None:
+                  kind: str, *, replace: bool = True) -> None:
     """Keep fts_memories in step with the memories table.
 
     Without this, half of investigate()'s retrieval is dead: a memory is only
@@ -792,7 +804,8 @@ def _index_memory(conn: sqlite3.Connection, memory_id: str, title: str, body: st
     "can I store the full token text?" failed to surface the memory that
     says no.
     """
-    conn.execute("DELETE FROM fts_memories WHERE memory_id = ?", (memory_id,))
+    if replace:
+        conn.execute("DELETE FROM fts_memories WHERE memory_id = ?", (memory_id,))
     conn.execute(
         "INSERT INTO fts_memories (memory_id, title, body, kind) VALUES (?,?,?,?)",
         (memory_id, title or "", (body or "")[:4000], kind or ""),
@@ -986,7 +999,7 @@ def supersede(conn: sqlite3.Connection, catalog: sqlite3.Connection, repo_id: st
              actor if actor == "human" else "agent", 0.85, old["scope"], old["source_event"],
              now(), now(), commit, commit, now(), now()),
         )
-        _index_memory(conn, new_id, title_for(body), body, old["kind"])
+        _index_memory(conn, new_id, title_for(body), body, old["kind"], replace=False)
         conn.execute("UPDATE memories SET status='SUPERSEDED', valid_until=?, updated_at=?"
                      " WHERE memory_id=?", (now(), now(), memory_id))
         # A superseded memory leaves the search index; it stays fully readable

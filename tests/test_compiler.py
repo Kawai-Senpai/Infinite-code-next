@@ -295,13 +295,7 @@ def test_a_claim_that_adds_detail_extends_rather_than_contradicts(workspace):
 
 
 def test_an_opposing_claim_still_contradicts_and_does_not_extend(workspace):
-    """Adding EXTENDS must not have stolen the conflict case.
-
-    The two claims are worded differently on purpose. `_CLAIM_STOP` strips
-    "not", so a rule and its exact negation read as one claim to duplicate
-    detection and are reinforced before they ever reach this path - which is
-    pre-existing behaviour, not something EXTENDS changed.
-    """
+    """Differently worded opposing claims are still a conflict."""
     compiler.record_event(
         workspace.store, workspace.catalog, workspace.repo_id, workspace.root, workspace.commit,
         {"kind": "note", "summary": "base",

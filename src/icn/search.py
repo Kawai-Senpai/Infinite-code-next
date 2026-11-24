@@ -483,8 +483,10 @@ def _seed_memories(conn: sqlite3.Connection, terms: list[str]) -> dict[str, floa
         return {}
     try:
         hits = rows(conn.execute(
-            "SELECT memory_id, bm25(fts_memories) AS score FROM fts_memories"
-            " WHERE fts_memories MATCH ? ORDER BY score LIMIT 60", (_fts_query(terms),)
+            "SELECT m.memory_id, bm25(fts_memories) AS score FROM fts_memories f"
+            " JOIN memories m ON m.memory_id = f.memory_id"
+            " WHERE fts_memories MATCH ? AND m.status NOT IN ('FORGOTTEN', 'SUPERSEDED')"
+            " ORDER BY score LIMIT 60", (_fts_query(terms),)
         ))
     except sqlite3.OperationalError:
         hits = []
@@ -496,6 +498,31 @@ def _seed_memories(conn: sqlite3.Connection, terms: list[str]) -> dict[str, floa
     worst = max(h["score"] for h in hits)
     span = (worst - best) or 1.0
     return {h["memory_id"]: 1.0 - ((h["score"] - best) / span) for h in hits}
+
+
+def _direct_memories(conn: sqlite3.Connection, hits: dict[str, float],
+                     budget: int) -> tuple[list[dict[str, Any]], int]:
+    """Return matching repository memories that cannot enter a symbol capsule."""
+    if not hits or budget <= 0:
+        return [], 0
+    placeholders = ",".join("?" for _ in hits)
+    candidates = rows(conn.execute(
+        f"SELECT m.memory_id, m.kind, m.title, m.body, m.severity, m.authority, m.review_status"
+        f" FROM memories m WHERE m.memory_id IN ({placeholders}) AND m.status='ACTIVE'"
+        f" AND NOT EXISTS (SELECT 1 FROM anchors a WHERE a.memory_id=m.memory_id"
+        f" AND a.target_kind IN ('symbol', 'file'))", tuple(hits),
+    ))
+    candidates.sort(key=lambda memory: -hits[memory["memory_id"]])
+    selected, used = [], 0
+    for memory in candidates[:5]:
+        # Like capsule excerpts, this is a bounded view; get returns the full body.
+        entry = {**memory, "scope": "repo", "anchor_status": "UNVERIFIED"}
+        entry["text"] = (entry.pop("body") or "")[:600]
+        cost = _estimate_tokens(entry)
+        if used + cost <= budget:
+            selected.append(entry)
+            used += cost
+    return selected, used
 
 
 def _expand(conn: sqlite3.Connection, seeds: dict[str, dict[str, Any]], depth: int) -> dict[str, float]:
@@ -1049,7 +1076,14 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
     proximity = _expand(conn, seeds, depth)
     candidate_ids = list(proximity.keys())[:400]
     if not candidate_ids:
-        return _empty_result(query, chosen, terms, recalled)
+        result = _empty_result(query, chosen, terms, recalled)
+        direct, used = _direct_memories(conn, memory_hits, budget)
+        if direct:
+            result["repo_memories"] = direct
+            result["budget"] = {"limit": budget, "used_estimate": used}
+            result["note"] = "Matching repository memories have no symbol anchor."
+            note_surfaced(conn, [memory["memory_id"] for memory in direct])
+        return result
 
     placeholders = ",".join("?" for _ in candidate_ids)
     symbols = {
@@ -1128,7 +1162,10 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
         for _, symbol, _, _ in scored[:max(len(capsules), 8)]
     ]
     # Record what this answer actually showed, so ranking learns from use.
-    note_surfaced(conn, [m["memory_id"] for c in capsules for m in c["memory"]])
+    direct, direct_cost = _direct_memories(conn, memory_hits, budget - used)
+    used += direct_cost
+    note_surfaced(conn, [m["memory_id"] for c in capsules for m in c["memory"]] +
+                  [m["memory_id"] for m in direct])
 
     problems = detect_problems(conn, catalog, top_ids) if find_problems else []
 
@@ -1155,6 +1192,7 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
         "intent": chosen,
         "terms": terms,
         "capsules": capsules,
+        "repo_memories": direct,
         "problems": problems,
         "unanchored_knowledge": unanchored,
         "considered": len(scored),

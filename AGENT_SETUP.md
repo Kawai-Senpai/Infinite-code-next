@@ -30,6 +30,10 @@ icn doctor --client codex --root /path/to/repository
 
 Do not consider setup complete until the final line says `READY`.
 
+For optional background updates, use `args = ["--auto-update"]` with the
+same command once Git and uv are installed. See the
+[update setup and behavior](README.md#opt-in-updates-on-restart).
+
 ## 2. Install the skill and hook (Claude Code)
 
 The MCP registration makes ICN callable. It does not make it called: the server can be registered, `doctor` can say `READY`, and the agent can still never touch it because nothing told it to.
@@ -98,6 +102,7 @@ Steps 2 and 3 cover Claude Code per project. This covers every client, and is wh
 ## Infinite Code Next (ICN)
 - For any task involving an existing codebase, use ICN. At the beginning of a session and whenever you switch repositories, discover deferred tools if necessary and call `mcp__icn__workspace(action="open", root=<repo>)`.
 - Before investigating, diagnosing, designing, or modifying code, call `mcp__icn__investigate(query=<task>, intent=<intent>, root=<repo>)`. Treat memories whose anchor status is not `ACTIVE` as unverified leads.
+- Include known symbol names, paths, configuration keys, or exact error text. Treat broad results as leads. If the results are weak or the index is partial, search the repository directly and read the source and tests before drawing conclusions.
 - After verified findings or changes, call `mcp__icn__record` with the decision, failure prevented, affected files/symbols, invariants, warnings, failed attempts, contracts, and tests. Skip investigation and recording only for purely mechanical actions such as correcting a typo or running an explicitly requested command.
 - Checkpoint your own work with `mcp__icn__agit(action="commit", message=...)` before risky edits or broad refactors, and roll back with `mcp__icn__agit(action="restore", paths=[...])`. It commits to `.agit/`, never the user's `.git`, so it is not a substitute for asking before a real commit.
 - If `mcp__icn__*` is not visible, search the available/deferred tool catalogue and load it. If it still cannot be loaded, explicitly report that ICN is unavailable and continue with the best evidence. Never silently skip ICN or claim it was used when it was not.
@@ -109,6 +114,7 @@ Steps 2 and 3 cover Claude Code per project. This covers every client, and is wh
 ## Infinite Code Next (ICN)
 - For any task involving an existing codebase, use ICN. At the beginning of a session and whenever you switch repositories, ensure the `icn` MCP server and its tools are loaded and call `workspace(action="open", root=<repo>)`.
 - Before investigating, diagnosing, designing, or modifying code, call `investigate(query=<task>, intent=<intent>, root=<repo>)`. Treat memories whose anchor status is not `ACTIVE` as unverified leads.
+- Include known symbol names, paths, configuration keys, or exact error text. Treat broad results as leads. If the results are weak or the index is partial, search the repository directly and read the source and tests before drawing conclusions.
 - After verified findings or changes, call `record` with the decision, failure prevented, affected files/symbols, invariants, warnings, failed attempts, contracts, and tests. Skip investigation and recording only for purely mechanical actions such as correcting a typo or running an explicitly requested command.
 - Checkpoint your own work with `agit(action="commit", message=...)` before risky edits or broad refactors, and roll back with `agit(action="restore", paths=[...])`. It commits to `.agit/`, never the user's `.git`, so it is not a substitute for asking before a real commit.
 - If ICN is not loaded, try to reconnect or load the configured `icn` MCP server. If it remains unavailable, explicitly report that fact and continue with the best evidence. Never silently skip ICN or claim it was used when it was not.

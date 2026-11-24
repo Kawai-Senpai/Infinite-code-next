@@ -165,6 +165,14 @@ def test_every_tool_documents_itself(live):
         assert "properties" in tool["inputSchema"]
 
 
+def test_search_guidance_is_visible_in_tool_descriptions(live):
+    descriptions = {tool["name"]: tool["description"] for tool in live["tools"]}
+    assert "index.index_state" in descriptions["workspace"]
+    assert "qualified symbol" in descriptions["investigate"]
+    assert "search the repository directly" in descriptions["investigate"]
+    assert "source and tests before making claims or edits" in descriptions["investigate"]
+
+
 def test_workspace_opens_and_indexes_after_a_first_call_why(live):
     opened = live["opened"]
     assert opened["ok"] is True

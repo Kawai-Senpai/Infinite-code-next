@@ -176,7 +176,8 @@ class Lab:
         proc = subprocess.run(command, capture_output=True, stdin=subprocess.DEVNULL,
                               text=True, encoding="utf-8", errors="replace",
                               timeout=GIT_TIMEOUT, env=env,
-                              cwd=str(work_tree or self.root), check=False)
+                              cwd=str(work_tree or self.root), check=False,
+                              **labrun.hidden_windows_kwargs())
         if check and proc.returncode != 0:
             raise LabError(f"git {' '.join(args[:2])} failed: "
                            f"{(proc.stderr or proc.stdout).strip()[:800]}")
@@ -439,7 +440,8 @@ def init(root: Path, command: str, title: str = "baseline", hypothesis: str = ""
     git_dir = directory / "repo.git"
     if not (git_dir / "HEAD").exists():
         proc = subprocess.run(["git", "init", "--bare", "-q", str(git_dir)], capture_output=True,
-                              stdin=subprocess.DEVNULL, text=True, check=False)
+                              stdin=subprocess.DEVNULL, text=True, check=False,
+                              **labrun.hidden_windows_kwargs())
         if proc.returncode != 0:
             raise LabError(f"git init failed: {(proc.stderr or proc.stdout).strip()}")
     gitignored = _register_gitignore(root)
@@ -654,12 +656,14 @@ def _detached_kwargs() -> list[dict[str, Any]]:
     base = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL, "close_fds": True}
     if sys.platform == "win32":
-        detached, group, no_window, breakaway = 0x08, 0x200, 0x08000000, 0x01000000
+        group = subprocess.CREATE_NEW_PROCESS_GROUP
+        breakaway = subprocess.CREATE_BREAKAWAY_FROM_JOB
         # Breaking away from the client's job object is what lets a run survive
         # the editor closing; a job that forbids breakaway refuses the flag with
-        # access denied, and then plain detachment is the best available.
-        return [{**base, "creationflags": detached | group | no_window | breakaway},
-                {**base, "creationflags": detached | group | no_window}]
+        # access denied, and then we keep the watcher windowless inside the
+        # job. DETACHED_PROCESS would cancel CREATE_NO_WINDOW.
+        return [{**base, **labrun.hidden_windows_kwargs(group | breakaway)},
+                {**base, **labrun.hidden_windows_kwargs(group)}]
     return [{**base, "start_new_session": True}]
 
 

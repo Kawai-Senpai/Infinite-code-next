@@ -7,6 +7,7 @@ wrong code, a kill that misses the child) do not exist in a mock.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -29,6 +30,15 @@ print("ICN_METRIC steps=10")
 '''
 
 PY = f'"{sys.executable}"'
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process flags")
+def test_lab_watcher_keeps_windows_console_disabled():
+    for options in lab._detached_kwargs():
+        flags = options["creationflags"]
+        assert flags & subprocess.CREATE_NO_WINDOW
+        assert not flags & subprocess.DETACHED_PROCESS
+        assert options["startupinfo"].wShowWindow == subprocess.SW_HIDE
 
 
 @pytest.fixture

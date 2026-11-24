@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # Columns added after a schema version shipped. Migration is first-class
 # (PLAN.md section 11): additive, idempotent, and never destructive.
@@ -560,23 +560,45 @@ def connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
     """Open a store with the pragmas the concurrency model depends on."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=BUSY_TIMEOUT_MS / 1000.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        # Two clients can try to switch a new store to WAL at once. SQLite
+        # can return BUSY here before the configured busy handler runs.
+        delay = 0.05
+        for attempt in range(WRITE_RETRIES):
+            try:
+                conn.execute("PRAGMA journal_mode = WAL").fetchone()
+                break
+            except sqlite3.OperationalError as exc:
+                busy = "locked" in str(exc) or "busy" in str(exc)
+                if not busy or attempt == WRITE_RETRIES - 1:
+                    raise
+                time.sleep(delay)
+                delay *= 2
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
 def init_catalog(path: Path) -> sqlite3.Connection:
-    conn = connect(path)
-    _apply_schema(conn, CATALOG_SCHEMA)
-    return conn
+    return _open_store(path, CATALOG_SCHEMA)
 
 
 def init_repo_store(path: Path) -> sqlite3.Connection:
+    return _open_store(path, REPO_SCHEMA)
+
+
+def _open_store(path: Path, schema: str) -> sqlite3.Connection:
     conn = connect(path)
-    _apply_schema(conn, REPO_SCHEMA)
+    try:
+        _apply_schema(conn, schema)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -591,11 +613,12 @@ def _apply_schema(conn: sqlite3.Connection, schema: str) -> None:
     for attempt in range(WRITE_RETRIES):
         try:
             conn.executescript(schema)
-            _migrate(conn)
-            _backfill_fts(conn)
-            _repair_ref_commits(conn)
-            _retire_sibling_contradictions(conn)
-            _backfill_test_coverage(conn)
+            if schema == REPO_SCHEMA:
+                _migrate(conn)
+                _backfill_fts(conn)
+                _repair_ref_commits(conn)
+                _retire_sibling_contradictions(conn)
+                _backfill_test_coverage(conn)
             _set_version(conn)
             return
         except sqlite3.OperationalError as exc:
@@ -614,31 +637,34 @@ def _backfill_fts(conn: sqlite3.Connection) -> None:
     returns fewer results, with nothing to indicate why. Measured on a real
     store, 25 of 34 memories were invisible to text search.
 
-    Cheap and idempotent - it inserts only what is missing, so it costs one
-    indexed anti-join on every open after the first.
+    FTS5 cannot look up its unindexed memory_id column efficiently. Read the
+    existing IDs once instead of rescanning the virtual table for every memory.
     """
-    try:
-        missing = conn.execute(
-            "SELECT m.memory_id, m.title, m.body, m.kind FROM memories m"
-            " LEFT JOIN fts_memories f ON f.memory_id = m.memory_id"
-            " WHERE f.memory_id IS NULL LIMIT 5000"
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return          # table not created yet on this connection
-    if not missing:
+    missing_sql = (
+        "SELECT memory_id, title, body, kind FROM memories"
+        " WHERE status NOT IN ('FORGOTTEN', 'SUPERSEDED')"
+        " AND memory_id NOT IN (SELECT memory_id FROM fts_memories WHERE memory_id IS NOT NULL)"
+    )
+    upgrading = conn.execute("PRAGMA user_version").fetchone()[0] < 11
+    if not upgrading and conn.execute(missing_sql + " LIMIT 1").fetchone() is None:
         return
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.executemany(
-            "INSERT INTO fts_memories (memory_id, title, body, kind) VALUES (?,?,?,?)",
-            [(r[0], r[1] or "", (r[2] or "")[:4000], r[3] or "") for r in missing],
-        )
-        conn.execute("COMMIT")
-    except sqlite3.OperationalError:
-        try:
-            conn.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
+    with write_tx(conn):
+        if upgrading:
+            conn.execute(
+                "DELETE FROM fts_memories WHERE memory_id IN (SELECT memory_id FROM memories"
+                " WHERE status IN ('FORGOTTEN', 'SUPERSEDED'))"
+            )
+            conn.execute(
+                "DELETE FROM fts_memories WHERE rowid IN (SELECT duplicate.rowid FROM fts_memories duplicate"
+                " JOIN (SELECT memory_id, MAX(rowid) AS keep FROM fts_memories"
+                " GROUP BY memory_id HAVING COUNT(*) > 1) latest ON latest.memory_id=duplicate.memory_id"
+                " WHERE duplicate.rowid != latest.keep)"
+            )
+        while missing := conn.execute(missing_sql + " LIMIT 5000").fetchall():
+            conn.executemany(
+                "INSERT INTO fts_memories (memory_id, title, body, kind) VALUES (?,?,?,?)",
+                [(r[0], r[1] or "", (r[2] or "")[:4000], r[3] or "") for r in missing],
+            )
 
 
 # Ref names are not commit ids. A store that recorded one has a permanently
@@ -770,13 +796,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
     Only columns are added, never dropped or retyped. A durable knowledge graph
     must not lose data to a schema bump.
     """
-    for table, column, decl in ADDED_COLUMNS:
-        exists = one(conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)))
-        if not exists:
-            continue
-        columns = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
-        if column not in columns:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    def missing_columns() -> list[tuple[str, str, str]]:
+        columns_by_table: dict[str, set[str]] = {}
+        pending = []
+        for table, column, decl in ADDED_COLUMNS:
+            if table not in columns_by_table:
+                columns_by_table[table] = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            columns = columns_by_table[table]
+            if columns and column not in columns:
+                pending.append((table, column, decl))
+        return pending
+
+    if missing_columns():
+        # Recheck after taking the lock. Another client may have migrated
+        # the same schema while this connection waited.
+        with write_tx(conn):
+            for table, column, decl in missing_columns():
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 def _set_version(conn: sqlite3.Connection) -> None:

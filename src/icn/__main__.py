@@ -10,6 +10,9 @@ import sys
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] in ("--auto-update", "--prepare-update"):
+        from .update import main as update_main
+        raise SystemExit(update_main(sys.argv[2:], worker=sys.argv[1] == "--prepare-update"))
     if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
         from . import __version__
         print(__version__)
@@ -18,6 +21,9 @@ def main() -> None:
         from . import paths
         print(paths.storage_root())
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "backup":
+        from .backup import main as backup_main
+        raise SystemExit(backup_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "hook":
         # Before anything heavy is imported: this runs before every tool call.
         from .hooks import run as hook_run

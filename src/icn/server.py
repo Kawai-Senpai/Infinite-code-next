@@ -64,12 +64,12 @@ govern this code, what has already been tried and rejected, and what is
 currently unverified. Read it before opening files - it exists so you do not
 have to rediscover by reading.
 
-Then investigate() with what you are about to do, in plain language. One call
-returns code structure, the rationale behind it, prior failures, invariants,
-tests and blast radius, as compact capsules rather than file dumps, plus what
-earlier sessions from any coding agent said while working in this repository.
-Prefer it over grepping: it searches code, knowledge and past conversations
-together.
+Then investigate() with the task and any known symbol names, paths, config
+keys, or error text. Broad queries return ranked leads. If results are weak
+or empty, check index_state, then use repository search and source reading
+to find concrete identifiers. Retry investigate() with those identifiers
+when you need their stored history. If index_state is partial, indexing is
+still incomplete. Verify important claims and references in source.
 
 Before changing or deleting something load-bearing, investigate(action='why',
 symbol=...) reconstructs why it exists - the decision, the bug that followed,
@@ -210,8 +210,9 @@ def workspace(
     WHEN TO USE: first call of any session, and again whenever you switch
     repository. action='open' returns the briefing - the rules that govern this
     code, what has already been tried and rejected, and what is unverified.
-    AFTER THIS: investigate() with what you are about to do. Do not start by
-    reading files; the briefing exists so you do not have to.
+    AFTER THIS: investigate() with the task and any known symbols or paths.
+    Check index.index_state on open. A partial index can omit relevant files
+    and symbols. Use source search for immediate answers or retry once ready.
 
 
     Actions:
@@ -331,11 +332,14 @@ def investigate(
     focus: str = "",
     symbol: str = "",
 ) -> dict[str, Any]:
-    """Get up to speed on code in one call: structure, rationale, risks.
+    """Find code and project knowledge, with evidence to guide source review.
 
     WHEN TO USE: before investigating, diagnosing, designing or modifying
-    anything. Prefer it over grep: it searches code and knowledge together, so
-    it returns the reason a thing is shaped the way it is, not just where it is.
+    anything. Include a qualified symbol, path, config key, or error text when
+    available. Broad natural-language results are leads. If matches are weak
+    or empty, check index_state and search the repository directly. Read
+    relevant source and tests before making claims or edits. A partial index
+    can omit symbols, and a ready index can still miss relevant results.
     AFTER THIS: graph(action='impact') if you are about to change a symbol;
     investigate(action='why', symbol=...) before deleting something
     load-bearing; record() once you have verified something.
@@ -343,7 +347,8 @@ def investigate(
 
     Searches code and knowledge together - lexical, symbol, code graph, memory
     graph, anchor status and git history - and returns compact capsules under a
-    token budget rather than file dumps. The `conversations` section is what
+    token budget rather than file dumps. Direct matches without a code anchor
+    can appear in `repo_memories`. The `conversations` section is what
     past sessions from any coding agent (Codex, Claude Code, Copilot, Cursor,
     ...) said about the same terms while working in this repository: leads to
     follow with conversations(action='get'), not anchored facts.
@@ -356,7 +361,7 @@ def investigate(
               decision -> bug -> failed fix -> accepted fix -> invariant -> test.
 
     Args:
-        query: what you are trying to do, in plain language.
+        query: task in plain language, with any known symbol, path, or exact term.
         intent: locate | understand | modify | debug | audit. Inferred if omitted.
         root: primary repository path. Defaults to the server's working directory.
         roots: explicit repository paths for one bounded multi-repository search.
@@ -831,6 +836,8 @@ def record(
     already knows. Nothing you write is ever silently overwritten.
 
     Use kind='checkpoint' at the end of a task to distil the session.
+    When index_state is partial, unresolved references may appear in the
+    index later. Check which references resolved before relying on a code link.
 
     WRITE LIKE THE NEXT AGENT HAS NO CONTEXT, because it does not. Every entry
     should survive being read alone, months later, by someone who was not here.
@@ -926,7 +933,7 @@ def record(
             except (lab_mod.LabError, ValueError) as err:
                 return _fail(str(err), str(current.root))
             reasoning = "\n".join([reasoning.strip(), *proof]).strip()
-        ws_mod.ensure_indexed(current)
+        index_report = ws_mod.ensure_indexed(current)
         payload = {
             "kind": kind, "summary": summary, "reasoning": reasoning,
             "files": files or [], "symbols": symbols or [], "changes": changes or [],
@@ -942,14 +949,17 @@ def record(
         result = compiler.record_event(current.store, current.catalog, current.repo_id,
                                        current.root, current.commit, payload)
         result["resolved_root"] = str(current.root)
+        result["index_state"] = index_report.get("index_state", "ready")
         if run_ids:
             lab_mod.link_evidence(current.root, [m["memory_id"] for m in result["memories_created"]],
                                   run_ids, None)
             result["evidence"] = run_ids
         if result.get("unresolved_references"):
-            result["hint"] = ("some names did not resolve to indexed code; they were kept as "
-                              "repo-scoped knowledge. Check spelling or run "
-                              "workspace(action='reindex').")
+            result["hint"] = ("Some names did not resolve against a partial index. "
+                              "Wait for workspace(action='open') to report ready before checking them."
+                              if result["index_state"] == "partial"
+                              else "Some names did not resolve to indexed code. Check the references "
+                                   "or run workspace(action='reindex').")
         # The caller wrote these bodies moments ago. Echoing each composed body
         # (claim plus the shared reasoning, ~900 characters apiece) made a
         # seven-memory record answer with ~5k tokens of its own input.
