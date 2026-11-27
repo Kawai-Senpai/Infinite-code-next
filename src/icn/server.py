@@ -331,6 +331,7 @@ def investigate(
     investigation_id: str | None = None,
     focus: str = "",
     symbol: str = "",
+    use_concepts: bool = True,
 ) -> dict[str, Any]:
     """Find code and project knowledge, with evidence to guide source review.
 
@@ -362,6 +363,8 @@ def investigate(
 
     Args:
         query: task in plain language, with any known symbol, path, or exact term.
+            A standalone path:line or path:line:column locates the indexed
+            symbol at that source location.
         intent: locate | understand | modify | debug | audit. Inferred if omitted.
         root: primary repository path. Defaults to the server's working directory.
         roots: explicit repository paths for one bounded multi-repository search.
@@ -373,6 +376,8 @@ def investigate(
             it works even when those repositories are missing.
         conversations: also search past agent transcripts scoped to this
             repository. Off skips the transcript index entirely.
+        use_concepts: use reviewed phrases from .icn-concepts.json. Grounding
+            lists matched phrases, target status, and terms unmapped by the glossary.
         action: search, expand, or verify.
         investigation_id: required for expand.
         focus: what to drill into, for expand.
@@ -401,7 +406,8 @@ def investigate(
                     intent=intent, depth=depth, budget=per_repo_budget,
                     find_problems=find_problems, commit=current.commit,
                     cross_repos=cross_repos, repo_id=current.repo_id,
-                    conversations=conversations,
+                    conversations=conversations, use_concepts=use_concepts,
+                    index_ready=index_report.get("index_state", "ready") == "ready",
                 )
                 repository_results.append({
                     "root": str(current.root), "repo_id": current.repo_id,
@@ -502,7 +508,8 @@ def investigate(
             intent=intent, depth=depth, budget=budget,
             find_problems=find_problems, commit=current.commit,
             cross_repos=cross_repos, repo_id=current.repo_id,
-            conversations=conversations,
+            conversations=conversations, use_concepts=use_concepts,
+            index_ready=index_report.get("index_state", "ready") == "ready",
         )
         result["ok"] = True
         result["resolved_root"] = str(current.root)

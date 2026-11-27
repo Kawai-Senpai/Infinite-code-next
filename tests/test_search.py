@@ -345,6 +345,42 @@ def test_usage_tracking_never_breaks_a_search(workspace, monkeypatch):
 # ------------------------------------------------------- past conversations
 
 
+def test_source_location_prefers_the_innermost_symbol(workspace):
+    from icn import search
+
+    line = workspace.store.execute(
+        "SELECT line_start FROM symbols WHERE symbol_path='RefreshCoordinator.acquire'"
+    ).fetchone()[0]
+    for query in (f"auth.py:{line}", f"{workspace.root / 'auth.py'}:{line}:1"):
+        result = search.investigate(workspace.store, workspace.catalog, workspace.root, query,
+                                    conversations=False, find_problems=False)
+        capsule = result["capsules"][0]
+        assert capsule["symbol"] == "RefreshCoordinator.acquire"
+        assert capsule["score_breakdown"]["exact_source_location"] > 0
+
+
+def test_explicit_path_preserves_relevance_and_excludes_other_files_with_the_same_name(workspace, project):
+    from icn import search, workspace as workspace_mod
+
+    project.write("other/auth.py", "def acquire():\n    return 'different file'\n")
+    assert workspace_mod.ensure_indexed(workspace)["index_state"] == "ready"
+    result = search.investigate(workspace.store, workspace.catalog, workspace.root,
+                                "Find acquire in auth.py", conversations=False, find_problems=False)
+    assert result["capsules"][0]["symbol"] == "RefreshCoordinator.acquire"
+    assert result["capsules"][0]["score_breakdown"]["explicit_path"] > 0
+    assert all("explicit_path" not in capsule["score_breakdown"]
+               for capsule in result["capsules"] if capsule["path"] == "other/auth.py")
+
+
+def test_qualified_symbol_lookup_accepts_unique_case_insensitive_match(workspace):
+    from icn import search
+
+    result = search.investigate(workspace.store, workspace.catalog, workspace.root,
+                                "refreshcoordinator.ACQUIRE()", conversations=False)
+    assert result["capsules"][0]["symbol"] == "RefreshCoordinator.acquire"
+    assert result["capsules"][0]["score_breakdown"]["exact_qualified_symbol"] > 0
+
+
 def _index_chat(tmp_path, name: str, cwd: str, turns: list[tuple[str, str]]) -> None:
     """Put one synthetic Claude Code session into the (isolated) transcript index."""
     import json

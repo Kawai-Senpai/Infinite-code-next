@@ -1,0 +1,49 @@
+{
+  "concepts": [
+    {
+      "name": "Offline updates",
+      "aliases": [
+        "restart updates",
+        {
+          "phrase": "background download",
+          "requires_any": ["update", "updates", "release", "wheel", "next launch", "next restart"]
+        }
+      ],
+      "targets": [
+        {
+          "path": "src/icn/update.py",
+          "symbol": "prepare",
+          "fingerprint": "33fa8fa9a36d6873f9bc0ccd2e822394"
+        }
+      ]
+    },
+    {
+      "name": "Memory deduplication",
+      "aliases": [
+        "repeated claims",
+        "duplicate memories"
+      ],
+      "targets": [
+        {
+          "path": "src/icn/compiler.py",
+          "symbol": "_find_duplicate",
+          "fingerprint": "ca528ed2e87d53b35bc4ce45e32522bb"
+        }
+      ]
+    },
+    {
+      "name": "Background indexing",
+      "aliases": [
+        "partial indexing",
+        "finish indexing"
+      ],
+      "targets": [
+        {
+          "path": "src/icn/workspace.py",
+          "symbol": "_background_finish",
+          "fingerprint": "91af34769cc803fe5cde9be5d3a78f06"
+        }
+      ]
+    }
+  ]
+}

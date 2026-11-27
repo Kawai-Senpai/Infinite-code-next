@@ -31,7 +31,7 @@ from typing import Any, Iterable
 from . import flows, ids, imports as import_resolution, parsing
 from .diagnostics import TEST_PATH
 from .db import jdump, jload, one, rows, write_tx
-from .identity import changed_files, run_git
+from .identity import GIT_TIMEOUT, changed_files, run_git, worktree_files
 
 MAX_FILE_BYTES = 2_000_000
 
@@ -203,7 +203,7 @@ class Indexer:
     def _file_row(self, rel_path: str) -> dict[str, Any] | None:
         return one(self.conn.execute("SELECT * FROM files WHERE path = ?", (rel_path,)))
 
-    def read_and_parse(self, abs_path: Path) -> dict[str, Any] | None:
+    def read_and_parse(self, abs_path: Path, *, skip_hash: str | None = None) -> dict[str, Any] | None:
         """Read and parse a file with no database involvement.
 
         Parsing must happen outside the write transaction. Doing it inside
@@ -211,6 +211,8 @@ class Indexer:
         files blocked every other server process for seconds - observed live as
         `database is locked` on a large repository. Reads are cheap and
         parallel-safe; only the write needs the lock.
+        An incremental caller may supply the hash of an active file indexed
+        by the current extractor, so unchanged bytes never reach the parser.
         """
         rel_path = abs_path.relative_to(self.root).as_posix()
         lang = parsing.language_for(abs_path)
@@ -223,11 +225,15 @@ class Indexer:
         if len(data) > MAX_FILE_BYTES:
             return {"path": rel_path, "skipped": "too large"}
 
+        digest = parsing.content_hash(data)
+        if digest == skip_hash:
+            return {"path": rel_path, "unchanged": True}
+
         return {
             "path": rel_path,
             "lang": lang,
             "data": data,
-            "digest": parsing.content_hash(data),
+            "digest": digest,
             "symbols": parsing.parse_file(abs_path, data, lang),
             "imports": parsing.file_import_specs(data, lang),
             # Computed here, with the parse, so it lands outside the write
@@ -752,6 +758,19 @@ class Indexer:
 
     # ------------------------------------------------------------------- runs
 
+    def _worktree_state(self) -> tuple[set[str], bool]:
+        row = one(self.conn.execute("SELECT dirty_paths, baseline_ready FROM index_worktree"))
+        return (set(jload(row["dirty_paths"], [])), bool(row["baseline_ready"])) if row else (set(), False)
+
+    def _save_worktree_state(self, paths: set[str], ready: bool) -> None:
+        with write_tx(self.conn):
+            self.conn.execute(
+                "INSERT INTO index_worktree (singleton, dirty_paths, baseline_ready) VALUES (1,?,?)"
+                " ON CONFLICT(singleton) DO UPDATE SET dirty_paths=excluded.dirty_paths,"
+                " baseline_ready=excluded.baseline_ready",
+                (jdump(sorted(paths)), int(ready)),
+            )
+
     def full_index(self, commit: str | None, budget_seconds: float | None = None) -> dict[str, Any]:
         started = time.time()
         # A deadline, not a duration: every pass below has to be able to ask
@@ -761,6 +780,11 @@ class Indexer:
         report = {"mode": "full", "files_seen": 0, "files_indexed": 0,
                   "symbols": 0, "skipped": 0, "deferred": 0, "truncated": False}
         seen_paths: set[str] = set()
+        previous_dirty, baseline_ready = self._worktree_state()
+        dirty = worktree_files(self.root) if commit and deadline is None else None
+        pending = previous_dirty | (dirty or set())
+        if pending != previous_dirty:
+            self._save_worktree_state(pending, baseline_ready)
 
         def out_of_time() -> bool:
             return deadline is not None and time.time() >= deadline
@@ -871,6 +895,18 @@ class Indexer:
             report["entry_points"] = flows.detect_entry_points(self.conn, commit)
             report["areas"] = flows.detect_communities(self.conn)
 
+        if not report["truncated"] and commit:
+            # Let a short foreground pass index source first. If it runs out
+            # of time, the unbounded continuation captures the dirty paths.
+            if deadline is not None:
+                timeout = min(GIT_TIMEOUT, deadline - time.time())
+                dirty = worktree_files(self.root, timeout=timeout) if timeout > 0 else None
+            if dirty is not None:
+                if not baseline_ready or not dirty <= pending:
+                    self._save_worktree_state(pending | dirty, True)
+            elif not baseline_ready and deadline is not None:
+                report["truncated"] = True
+
         report["seconds"] = round(time.time() - started, 2)
         return report
 
@@ -884,23 +920,49 @@ class Indexer:
         foreground just because git could not say what changed.
         """
         started = time.time()
-        paths_changed, complete = changed_files(self.root, since_commit)
+        previous_dirty, baseline_ready = self._worktree_state()
+        dirty = worktree_files(self.root) if baseline_ready else None
+        if dirty is None:
+            return self.full_index(commit, budget_seconds=budget_seconds)
+        paths_changed, complete = changed_files(self.root, since_commit, dirty=dirty)
         if not complete:
             return self.full_index(commit, budget_seconds=budget_seconds)
 
+        # A reverted edit disappears from Git status. Revisit what the previous
+        # pass saw so a clean worktree cannot leave dirty symbols in the index.
+        # Save new paths before writing any symbols so an interrupted pass can
+        # also be repaired after Git stops reporting those paths.
+        pending = previous_dirty | dirty
+        if pending != previous_dirty:
+            self._save_worktree_state(pending, True)
+        paths_changed = sorted(set(paths_changed) | previous_dirty)
+        retry = set()
         report = {"mode": "incremental", "files_seen": len(paths_changed),
                   "files_indexed": 0, "symbols": 0, "skipped": 0, "files_tombstoned": 0}
         for rel in paths_changed:
-            abs_path = self.root / rel
+            relative = Path(rel)
+            abs_path = self.root / relative
             if not abs_path.exists():
                 with write_tx(self.conn):
                     report["files_tombstoned"] += self._tombstone_path(rel, commit)
                 continue
-            if not abs_path.is_file() or parsing.language_for(abs_path) is None:
+            if (_excluded(relative, self.excludes)
+                    or (self.excludes and any(_excluded(parent, self.excludes) for parent in relative.parents))
+                    or abs_path.is_symlink()
+                    or not abs_path.is_file() or parsing.language_for(abs_path) is None):
                 continue
-            parsed = self.read_and_parse(abs_path)
+            existing = self._file_row(rel)
+            skip_hash = None
+            if (existing and existing["status"] == "ACTIVE"
+                    and (existing["extract_version"] or 0) >= parsing.EXTRACT_VERSION):
+                skip_hash = existing["content_hash"]
+            parsed = self.read_and_parse(abs_path, skip_hash=skip_hash)
             if parsed is None or parsed.get("skipped"):
                 report["skipped"] += 1
+                if rel in pending:
+                    retry.add(rel)
+                continue
+            if parsed.get("unchanged"):
                 continue
             with write_tx(self.conn):
                 result = self.store_parsed(parsed, commit)
@@ -930,6 +992,9 @@ class Indexer:
         if report["files_indexed"] or report["files_tombstoned"]:
             report["entry_points"] = flows.detect_entry_points(self.conn, commit)
             report["areas"] = flows.detect_communities(self.conn)
+
+        if dirty | retry != pending:
+            self._save_worktree_state(dirty | retry, True)
 
         report["seconds"] = round(time.time() - started, 2)
         return report

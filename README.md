@@ -286,6 +286,67 @@ investigate(
 contracts. `roots=[...]` is the explicit search scope for repositories that
 have not yet had those contracts recorded.
 
+#### Ground broad searches with a repository glossary
+
+Add a reviewed `.icn-concepts.json` at the repository root. A concept connects
+phrases people use to the source symbols that implement them. Review each
+target in the code, then generate its path, qualified name, and fingerprint:
+
+```bash
+icn concept-anchor src/icn/update.py prepare
+```
+
+Put the command's output in the concept's `targets` array:
+
+```json
+{
+  "concepts": [
+    {
+      "name": "Offline updates",
+      "aliases": [
+        "restart updates",
+        {
+          "phrase": "background download",
+          "requires_any": ["update", "updates", "release", "wheel", "next launch", "next restart"]
+        }
+      ],
+      "targets": [
+        {
+          "path": "src/icn/update.py",
+          "symbol": "prepare",
+          "fingerprint": "<fingerprint from concept-anchor>"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Use forward slashes in repository-relative paths. Names and aliases match
+whole phrases of at least two words, with case and punctuation normalized.
+Use `requires_any` for an alias shared by unrelated parts of a project.
+ICN matches that alias only when the query contains at least one of its
+context phrases, which can be a single word.
+Code review is the review step for changes to the glossary.
+
+`investigate()` returns phrase matches, source locations, and target status in
+`grounding`. A target contributes to ranking only when it resolves uniquely
+and its indexed fingerprint matches. A changed fingerprint calls for source
+review and a fresh anchor. Shared phrases are reported as ambiguous. An
+incomplete index can report phrase matches while withholding their ranking
+boost. `unmapped_terms` describes glossary coverage. Code search may still find
+answers for those terms. When grounding does not affect ranking, code and
+memory results get first use of the response budget.
+
+Use `investigate(..., use_concepts=False)` to compare results with ordinary
+retrieval. A uniquely indexed qualified symbol entered on its own takes
+precedence over glossary matches.
+
+Paste a source reference such as `src/icn/search.py:344` or a stack-frame
+location with a column to find the most specific indexed symbol on that line.
+For a question that names an exact file, glossary matches can boost reviewed
+targets inside that file.
+
 ### Recommended global agent instruction
 
 Installing an MCP server does not guarantee an agent will proactively use it.

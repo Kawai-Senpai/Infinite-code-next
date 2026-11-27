@@ -50,6 +50,7 @@ def run_git(args: list[str], cwd: Path, timeout: float = GIT_TIMEOUT,
             errors="replace",
             timeout=timeout,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return 127, "", str(exc)
@@ -112,7 +113,17 @@ def probe(path: Path) -> Probe:
     root = Path(path).expanduser().resolve()
     result = Probe(root=root)
 
-    code, top, _ = run_git(["rev-parse", "--show-toplevel"], root)
+    code, directories, _ = run_git(
+        ["rev-parse", "--show-toplevel", "--git-common-dir", "--absolute-git-dir"], root)
+    if code == 0 and len(parts := directories.splitlines()) == 3 and parts[2] != "--absolute-git-dir":
+        top, common, gitdir = parts
+    elif code == 0:
+        # Git versions predating --absolute-git-dir can echo the flag.
+        code, top, _ = run_git(["rev-parse", "--show-toplevel"], root)
+        _, common, _ = run_git(["rev-parse", "--git-common-dir"], root)
+        _, gitdir, _ = run_git(["rev-parse", "--absolute-git-dir"], root)
+    else:
+        top = ""
     if code != 0 or not top:
         # Not a git repo. Supported, but every git-derived signal is gone.
         result.project_id, result.project_name = _read_project_file(root)
@@ -122,20 +133,13 @@ def probe(path: Path) -> Probe:
     result.toplevel = Path(top).resolve()
     result.root = result.toplevel
 
-    _, common, _ = run_git(["rev-parse", "--git-common-dir"], result.root)
-    _, gitdir, _ = run_git(["rev-parse", "--absolute-git-dir"], result.root)
     if common:
         common_abs = Path(common)
         if not common_abs.is_absolute():
-            common_abs = (result.root / common).resolve()
+            common_abs = (root / common).resolve()
         result.git_common_dir = str(common_abs)
         # A linked worktree has its own git dir but shares the common dir.
         result.is_worktree = bool(gitdir) and Path(gitdir).resolve() != common_abs.resolve()
-
-    _, head, _ = run_git(["rev-parse", "HEAD"], result.root)
-    result.head = head or None
-    _, branch, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], result.root)
-    result.branch = branch or None
 
     _, remotes_raw, _ = run_git(["remote", "-v"], result.root)
     seen: set[str] = set()
@@ -147,16 +151,40 @@ def probe(path: Path) -> Probe:
                 seen.add(norm)
                 result.remotes.append(norm)
 
-    # The first commit. This is the strongest identity we can get for free.
-    code, roots, _ = run_git(["rev-list", "--max-parents=0", "HEAD"], result.root)
-    if code == 0 and roots:
-        result.root_commit = roots.splitlines()[0].strip() or None
-
-    code, status, _ = run_git(["status", "--porcelain"], result.root)
-    result.dirty = bool(status.strip()) if code == 0 else False
+    _read_checkout_status(result)
+    if result.head:
+        # Resolve identity against the same revision as the status snapshot.
+        code, roots, _ = run_git(["rev-list", "--max-parents=0", result.head], result.root)
+        if code == 0 and roots:
+            result.root_commit = roots.splitlines()[0].strip() or None
 
     result.project_id, result.project_name = _read_project_file(result.root)
     return result
+
+
+def _read_checkout_status(result: Probe) -> None:
+    """Read the checkout's head, branch and dirty flag from one Git snapshot."""
+    code, status, _ = run_git(
+        ["status", "--porcelain=v2", "--branch", "--no-ahead-behind", "-z"],
+        result.root, strip=False,
+    )
+    if code == 0:
+        records = status.split("\0")
+        head = next((entry[13:] for entry in records if entry.startswith("# branch.oid ")), "")
+        branch = next((entry[14:] for entry in records if entry.startswith("# branch.head ")), "")
+        if head and branch:
+            result.head = None if head == "(initial)" else head
+            result.branch = ("HEAD" if branch == "(detached)" else branch) if result.head else None
+            result.dirty = any(entry and not entry.startswith("# ") for entry in records)
+            return
+
+    # Older Git builds may lack porcelain v2 or --no-ahead-behind.
+    code, head, _ = run_git(["rev-parse", "HEAD"], result.root)
+    result.head = head if code == 0 and head else None
+    code, branch, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], result.root)
+    result.branch = branch if code == 0 and branch else None
+    code, status, _ = run_git(["status", "--porcelain"], result.root)
+    result.dirty = bool(status.strip()) if code == 0 else False
 
 
 def _read_project_file(root: Path) -> tuple[str | None, str | None]:
@@ -192,18 +220,14 @@ def read_repo_config(root: Path) -> dict:
         return {}
 
 
-def changed_files(root: Path, since_commit: str | None) -> tuple[list[str], bool]:
-    """Files touched since a commit, plus everything currently uncommitted.
-
-    Returns (paths, complete). complete=False means "could not tell, assume
-    everything changed" - the caller falls back to a full scan rather than
-    silently indexing a stale subset.
-    """
+def worktree_files(root: Path, timeout: float = GIT_TIMEOUT) -> set[str] | None:
+    """Uncommitted paths, or None when Git could not report them."""
     paths: set[str] = set()
 
-    code, out, _ = run_git(["status", "--porcelain", "-z"], root, strip=False)
+    code, out, _ = run_git(["status", "--porcelain", "-z", "--untracked-files=all"], root,
+                           timeout=timeout, strip=False)
     if code != 0:
-        return [], False
+        return None
 
     # -z records are "XY <path>\0", and a rename or copy is followed by a bare
     # "<original path>\0" record. Both sides matter: the old path's symbols need
@@ -225,11 +249,24 @@ def changed_files(root: Path, since_commit: str | None) -> tuple[list[str], bool
                 if original:
                     paths.add(original)
 
+    return paths
+
+
+def changed_files(root: Path, since_commit: str | None, *,
+                  dirty: set[str] | None = None) -> tuple[list[str], bool]:
+    """Files touched since a commit and in the worktree. False requires a full scan."""
+    paths = worktree_files(root) if dirty is None else set(dirty)
+    if paths is None:
+        return [], False
+
     if since_commit:
-        code, out, _ = run_git(["diff", "--name-only", f"{since_commit}..HEAD"], root)
+        # NUL output keeps non-ASCII and newline-containing paths literal.
+        # Listing a committed rename as a deletion and addition includes both sides.
+        code, out, _ = run_git(["diff", "--name-only", "--no-renames", "-z",
+                                f"{since_commit}..HEAD"], root, strip=False)
         if code != 0:
             return [], False
-        paths.update(p for p in out.splitlines() if p.strip())
+        paths.update(p for p in out.split("\0") if p)
 
     return sorted(paths), True
 

@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from conftest import record_baseline
+from conftest import git, record_baseline
 
 from icn import imports as import_mod
 from icn import indexer as index_mod
@@ -78,6 +78,88 @@ def test_parsing_happens_outside_the_write_transaction(project):
     assert parsed["symbols"], "parsing must not depend on the database"
     assert parsed["digest"]
     ws.catalog.close()
+
+
+def test_warm_index_reads_unchanged_worktree_edits_without_reparsing(workspace, project, monkeypatch):
+    project.write("auth.py", "def replacement():\n    return 2\n")
+    assert ws_mod.ensure_indexed(workspace)["files_indexed"] == 1
+    real_parse = parsing.parse_file
+    parsed = []
+
+    def count_parse(path, *args):
+        parsed.append(path.name)
+        return real_parse(path, *args)
+
+    monkeypatch.setattr(parsing, "parse_file", count_parse)
+    assert ws_mod.ensure_indexed(workspace)["files_indexed"] == 0
+    assert not parsed
+
+    workspace.store.execute("UPDATE files SET extract_version=0 WHERE path='auth.py'")
+    assert ws_mod.ensure_indexed(workspace)["files_indexed"] == 1
+    assert parsed == ["auth.py"]
+
+
+def test_index_repairs_reverted_edits_after_a_restart(project):
+    project.write("auth.py", "def replacement():\n    return 2\n")
+    project.write("new/nested.py", "def transient():\n    return 3\n")
+    first = ws_mod.open_workspace(str(project.root))
+    try:
+        assert ws_mod.ensure_indexed(first)["index_state"] == "ready"
+        assert {row["name"] for row in rows(first.store.execute(
+            "SELECT name FROM symbols WHERE status='ACTIVE'"))} >= {"replacement", "transient"}
+    finally:
+        first.close()
+
+    git(project.root, "restore", "auth.py")
+    (project.root / "new/nested.py").unlink()
+    reopened = ws_mod.open_workspace(str(project.root))
+    try:
+        report = ws_mod.ensure_indexed(reopened)
+        assert report["mode"] == "incremental"
+        active = {row["name"] for row in rows(reopened.store.execute(
+            "SELECT name FROM symbols WHERE status='ACTIVE'"))}
+        assert "refresh_session" in active
+        assert {"replacement", "transient"}.isdisjoint(active)
+    finally:
+        reopened.close()
+
+
+def test_incremental_index_handles_nested_discovery_and_committed_unicode_rename(workspace, project):
+    project.write("nested/café.py", "def imported_symbol():\n    return 3\n")
+    project.write("vendor/ignored.py", "def ignored_symbol():\n    return 4\n")
+    project.write(".icn.toml", '[index]\nexclude = ["private"]\n')
+    project.write("private/nested/ignored.py", "def private_symbol():\n    return 5\n")
+    assert ws_mod.ensure_indexed(workspace)["mode"] == "incremental"
+    assert one(workspace.store.execute(
+        "SELECT status FROM files WHERE path=?", ("nested/café.py",)))["status"] == "ACTIVE"
+    project.commit("add source")
+    git(project.root, "mv", "auth.py", "renamé.py")
+    project.commit("rename source")
+    reopened = ws_mod.open_workspace(str(project.root))
+    try:
+        report = ws_mod.ensure_indexed(reopened)
+        assert report["mode"] == "incremental"
+        files = dict(reopened.store.execute("SELECT path,status FROM files"))
+        assert files["auth.py"] == "DELETED"
+        assert files["renamé.py"] == "ACTIVE"
+        assert files["nested/café.py"] == "ACTIVE"
+        assert "vendor/ignored.py" not in files
+        assert "private/nested/ignored.py" not in files
+    finally:
+        reopened.close()
+
+
+def test_old_store_gets_a_worktree_baseline_before_incremental_reuse(workspace, project):
+    project.write("auth.py", "def replacement():\n    return 2\n")
+    assert ws_mod.ensure_indexed(workspace)["files_indexed"] == 1
+    workspace.store.execute("DELETE FROM index_worktree")
+    git(project.root, "restore", "auth.py")
+
+    assert ws_mod.ensure_indexed(workspace)["mode"] == "full"
+    assert ws_mod.ensure_indexed(workspace)["mode"] == "incremental"
+    found = one(workspace.store.execute(
+        "SELECT status FROM symbols WHERE name='replacement'"))
+    assert found["status"] == "DELETED"
 
 
 def test_two_indexers_on_one_repo_do_not_deadlock(project):

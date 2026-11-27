@@ -32,6 +32,7 @@ from typing import Any
 
 from . import anchors as anchor_mod
 from . import causal
+from . import concepts
 from . import crossrepo
 from . import diagnostics
 from . import embed
@@ -364,13 +365,14 @@ def _seed_symbols(conn: sqlite3.Connection, terms: list[str]) -> dict[str, dict[
             seeds[hit["symbol_id"]]["lex"] = 1.0 - ((hit["score"] - best) / span)
 
     for term in terms:
-        for row in rows(conn.execute(
-            "SELECT symbol_id, name, symbol_path FROM symbols WHERE status='ACTIVE'"
-            " AND (name = ? COLLATE NOCASE OR symbol_path = ? COLLATE NOCASE) LIMIT 10",
+        for row in conn.execute(
+            "SELECT symbol_id FROM symbols WHERE rowid IN ("
+            " SELECT rowid FROM symbols WHERE status='ACTIVE' AND name=? COLLATE NOCASE"
+            " UNION SELECT rowid FROM symbols WHERE status='ACTIVE' AND symbol_path=? COLLATE NOCASE"
+            " ORDER BY rowid LIMIT 10) ORDER BY rowid",
             (term, term),
-        )):
-            seeds.setdefault(row["symbol_id"], {"lex": 0.0, "sym": 0.0})
-            seeds[row["symbol_id"]]["sym"] = 1.0
+        ):
+            seeds.setdefault(row[0], {"lex": 0.0, "sym": 0.0})["sym"] = 1.0
         for row in rows(conn.execute(
             "SELECT symbol_id FROM symbols WHERE status='ACTIVE' AND name LIKE ? LIMIT 10",
             (f"%{term}%",),
@@ -378,6 +380,53 @@ def _seed_symbols(conn: sqlite3.Connection, terms: list[str]) -> dict[str, dict[
             seeds.setdefault(row["symbol_id"], {"lex": 0.0, "sym": 0.0})
             seeds[row["symbol_id"]]["sym"] = max(seeds[row["symbol_id"]]["sym"], 0.5)
     return seeds
+
+
+def _exact_qualified_symbol(conn: sqlite3.Connection, query: str) -> str | None:
+    qualified = concepts.qualified_name(query)
+    if not qualified:
+        return None
+    candidates = conn.execute(
+        "SELECT symbol_id FROM symbols WHERE symbol_path=? AND status='ACTIVE' LIMIT 2",
+        (qualified,),
+    ).fetchall()
+    if not candidates:
+        candidates = conn.execute(
+            "SELECT symbol_id FROM symbols WHERE symbol_path=? COLLATE NOCASE"
+            " AND status='ACTIVE' LIMIT 2", (qualified,),
+        ).fetchall()
+    return candidates[0][0] if len(candidates) == 1 else None
+
+
+def _relative_search_path(root: Path, value: str) -> str | None:
+    path = Path(value.strip("'\"").replace("\\", "/"))
+    if path.is_absolute():
+        try:
+            path = path.relative_to(root)
+        except ValueError:
+            return None
+    return path.as_posix()
+
+
+def _source_location(conn: sqlite3.Connection, root: Path, query: str) -> str | None:
+    """Resolve a pasted path:line to the most specific active symbol on that line."""
+    match = re.fullmatch(r"(?P<path>.+?):(?P<line>[1-9][0-9]{0,8})(?::[1-9][0-9]{0,8})?",
+                         query.strip().strip("`"))
+    if not match:
+        return None
+    # A trailing column is optional. The non-greedy path leaves both numbers
+    # available while still allowing a Windows drive letter.
+    path = _relative_search_path(root, match["path"])
+    if path is None:
+        return None
+    row = conn.execute(
+        "SELECT s.symbol_id FROM files f JOIN symbols s ON s.file_id=f.file_id"
+        " WHERE f.path=? AND f.status='ACTIVE' AND s.status='ACTIVE'"
+        " AND ? BETWEEN s.line_start AND s.line_end"
+        " ORDER BY (s.kind='module'), s.line_end-s.line_start, s.line_start DESC, s.symbol_path LIMIT 1",
+        (path, int(match["line"])),
+    ).fetchone()
+    return row[0] if row else None
 
 
 def _rank_score(rank: int) -> float:
@@ -456,26 +505,43 @@ def _fuse_memory_hits(lexical: dict[str, float], semantic: list[tuple[str, float
     return {memory_id: score / top for memory_id, score in fused.items()}
 
 
-def _boost_explicit_paths(conn: sqlite3.Connection, query: str,
-                          seeds: dict[str, dict[str, Any]]) -> None:
-    """Give exact filenames and path fragments precedence over generic nouns."""
+def _boost_explicit_paths(conn: sqlite3.Connection, root: Path, query: str,
+                          seeds: dict[str, dict[str, Any]]) -> set[str]:
+    """Boost path matches and return the file IDs of exact repository paths."""
     candidates = re.findall(
-        r"(?:[A-Za-z]:[\\/])?[^\s,;:'\"()]+[\\/][^\s,;:'\"()]+|"
+        r"(?:[A-Za-z]:[\\/])?[^\s,;:'\"()?]+[\\/][^\s,;:'\"()?]+|"
         r"\b[A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|cs|md|toml|yaml|yml|json)\b",
         query or "",
     )
-    for raw in candidates:
-        needle = raw.replace("\\", "/").lower().strip("./")
-        basename = needle.rsplit("/", 1)[-1]
-        for row in rows(conn.execute(
-            "SELECT symbol_id, last_known_path FROM symbols WHERE status='ACTIVE' "
-            "AND (LOWER(REPLACE(last_known_path, '\\', '/')) LIKE ? "
-            "OR LOWER(REPLACE(last_known_path, '\\', '/')) LIKE ?) LIMIT 80",
-            (f"%{needle}%", f"%/{basename}"),
-        )):
-            seed = seeds.setdefault(row["symbol_id"], {"lex": 0.0, "sym": 0.0})
-            seed["lex"] = 1.0
-            seed["sym"] = 1.0
+    exact_files: set[str] = set()
+    for raw in dict.fromkeys(candidates):
+        needle = _relative_search_path(root, raw.rstrip("."))
+        if not needle:
+            continue
+        exact = conn.execute(
+            "SELECT file_id FROM files WHERE status='ACTIVE' AND path=?", (needle,),
+        ).fetchone()
+        if exact:
+            exact_files.add(exact[0])
+            hits = conn.execute(
+                "SELECT symbol_id FROM symbols WHERE status='ACTIVE' AND file_id=? LIMIT 80",
+                (exact[0],),
+            )
+        else:
+            # Short filenames and directory fragments can refer to several
+            # paths. Match at a component boundary and keep wildcard characters literal.
+            folded = needle.lower()
+            suffix = folded.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+            hits = conn.execute(
+                "SELECT s.symbol_id FROM files f JOIN symbols s ON s.file_id=f.file_id"
+                " WHERE f.status='ACTIVE' AND s.status='ACTIVE'"
+                " AND (LOWER(f.path)=? OR LOWER(f.path) LIKE ? ESCAPE '!'"
+                " OR LOWER(f.path) LIKE ? ESCAPE '!' OR LOWER(f.path) LIKE ? ESCAPE '!') LIMIT 80",
+                (folded, f"%/{suffix}", f"{suffix}/%", f"%/{suffix}/%"),
+            )
+        for (symbol_id,) in hits:
+            seeds.setdefault(symbol_id, {"lex": 0.0, "sym": 0.0})["path"] = 1.0
+    return exact_files
 
 
 def _seed_memories(conn: sqlite3.Connection, terms: list[str]) -> dict[str, float]:
@@ -898,6 +964,12 @@ def _estimate_tokens(payload: Any) -> int:
     return max(1, len(jdump(payload) or "") // 4)
 
 
+def _fit_grounding(grounding: dict | None, cost: int, remaining: int) -> tuple[dict, int]:
+    if grounding is None or (not grounding["used_for_ranking"] and cost > remaining):
+        return {}, 0
+    return {"grounding": grounding}, cost
+
+
 # ------------------------------------------------------------ problem detection
 
 def detect_problems(conn: sqlite3.Connection, catalog: sqlite3.Connection,
@@ -1036,7 +1108,8 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
                 query: str, intent: str | None = None, depth: int = 2,
                 budget: int = 9000, find_problems: bool = True,
                 commit: str | None = None, cross_repos: bool = False,
-                repo_id: str | None = None, conversations: bool = True) -> dict[str, Any]:
+                repo_id: str | None = None, conversations: bool = True,
+                use_concepts: bool = True, index_ready: bool = True) -> dict[str, Any]:
     """One call, many engines, one budgeted answer."""
     chosen = intent if intent in INTENTS else infer_intent(query)
     weights = INTENT_WEIGHTS[chosen]
@@ -1044,7 +1117,7 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
     recalled = _recall_conversations(root, terms, budget) if conversations else None
 
     seeds = _seed_symbols(conn, terms)
-    _boost_explicit_paths(conn, query, seeds)
+    exact_files = _boost_explicit_paths(conn, root, query, seeds)
     memory_hits = _seed_memories(conn, terms)
 
     # Semantic recall, when a model is loaded. load_encoder() never blocks and
@@ -1073,14 +1146,50 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
                 seeds[row["symbol_id"]]["lex"], memory_hits[row["memory_id"]] * 0.8
             )
 
+    location = _source_location(conn, root, query) if index_ready else None
+    exact_symbol = (location or _exact_qualified_symbol(conn, query)) if index_ready else None
+    grounding = None
+    reviewed: set[str] = set()
+    if use_concepts:
+        reviewed, grounding = concepts.ground(conn, root, query, index_ready=index_ready)
+    grounding_cost = 0
+    if grounding is not None:
+        covered = set(grounding.pop("grounded_words", []))
+        grounding["unmapped_terms"] = [
+            term for term in terms if not set(concepts.normalized_phrase(term).split()) <= covered
+        ]
+        if reviewed:
+            if exact_symbol or concepts.explicitly_names_code(conn, query, include_files=not exact_files):
+                grounding["ranking_note"] = "Explicit code lookup takes precedence."
+                reviewed.clear()
+            elif exact_files:
+                markers = ",".join("?" for _ in reviewed)
+                in_scope = {sid for sid, file_id in conn.execute(
+                    f"SELECT symbol_id, file_id FROM symbols WHERE symbol_id IN ({markers})", sorted(reviewed),
+                ) if file_id in exact_files}
+                reviewed.intersection_update(in_scope)
+                grounding["ranking_note"] = "Glossary ranking is scoped to the explicitly named files."
+        grounding["used_for_ranking"] = bool(reviewed)
+        grounding_cost = _estimate_tokens(grounding)
+    priority_ids = [exact_symbol] if exact_symbol else sorted(reviewed)
+    if priority_ids:
+        # Put explicit and reviewed targets before lexical seeds so the candidate cap
+        # cannot remove their source evidence before scoring.
+        seeds = {sid: seeds.get(sid, {"lex": 0.0, "sym": 0.0}) for sid in priority_ids} | seeds
+    priority_weight = sum(weights.values()) + 1.0 if priority_ids else 0.0
+
     proximity = _expand(conn, seeds, depth)
     candidate_ids = list(proximity.keys())[:400]
     if not candidate_ids:
         result = _empty_result(query, chosen, terms, recalled)
         direct, used = _direct_memories(conn, memory_hits, budget)
+        details, cost = _fit_grounding(grounding, grounding_cost, budget - used)
+        result.update(details)
+        if details:
+            result["budget"] = {"limit": budget, "used_estimate": cost + used}
         if direct:
             result["repo_memories"] = direct
-            result["budget"] = {"limit": budget, "used_estimate": used}
+            result["budget"] = {"limit": budget, "used_estimate": cost + used}
             result["note"] = "Matching repository memories have no symbol anchor."
             note_surfaced(conn, [memory["memory_id"] for memory in direct])
         return result
@@ -1118,6 +1227,7 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
             weights["lex"] * seed["lex"]
             + weights.get("sem", 0.0) * seed.get("sem", 0.0)
             + weights["sym"] * seed["sym"]
+            + (weights["lex"] + weights["sym"]) * seed.get("path", 0.0)
             + weights["graph"] * proximity.get(symbol_id, 0.0)
             + weights["sev"] * severity
             + weights["time"] * recency
@@ -1135,13 +1245,22 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
             "specificity_discount": round(specificity.get(symbol_id, 0.0), 3),
             "stale_penalty": round(0.25 * stale, 3),
         }
+        if symbol_id == exact_symbol:
+            score += priority_weight
+            key = "exact_source_location" if location else "exact_qualified_symbol"
+            breakdown[key] = round(priority_weight, 3)
+        elif symbol_id in reviewed:
+            score += priority_weight
+            breakdown["reviewed_concept"] = round(priority_weight, 3)
+        if seed.get("path"):
+            breakdown["explicit_path"] = round(weights["lex"] + weights["sym"], 3)
         scored.append((score, symbol, attached, breakdown))
 
     scored.sort(key=lambda item: -item[0])
 
     capsules: list[dict[str, Any]] = []
     shown: dict[str, str] = {}
-    used = 0
+    used = grounding_cost if reviewed else 0
     for score, symbol, attached, breakdown in scored:
         if score <= 0.05:
             break
@@ -1164,6 +1283,9 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
     # Record what this answer actually showed, so ranking learns from use.
     direct, direct_cost = _direct_memories(conn, memory_hits, budget - used)
     used += direct_cost
+    details, cost = _fit_grounding(grounding, grounding_cost, budget - used)
+    if not reviewed:
+        used += cost
     note_surfaced(conn, [m["memory_id"] for c in capsules for m in c["memory"]] +
                   [m["memory_id"] for m in direct])
 
@@ -1200,6 +1322,7 @@ def investigate(conn: sqlite3.Connection, catalog: sqlite3.Connection, root: Pat
         "conversations": recalled,
         "budget": {"limit": budget, "used_estimate": used},
         "note": "memories carry an anchor_status; anything not ACTIVE is unverified against current code",
+        **details,
     }
 
 

@@ -35,6 +35,21 @@ def test_root_commit_is_the_strong_identity(project):
     assert "root_commit" in kinds and "path" in kinds
 
 
+def test_checkout_snapshot_tracks_branch_dirty_and_detached_head(project):
+    clean = probe(project.root)
+    assert clean.branch == "main"
+    assert clean.head == project.head()
+    assert not clean.dirty
+
+    project.write("new.py", "def f(): pass\n")
+    git(project.root, "checkout", "--detach", clean.head)
+    detached = probe(project.root)
+    assert detached.branch == "HEAD"
+    assert detached.head == clean.head
+    assert detached.root_commit == clean.root_commit
+    assert detached.dirty
+
+
 def test_moving_a_clone_keeps_its_memories(project, tmp_path):
     """A moved checkout must reattach, not start a fresh memory universe."""
     first = ws_mod.open_workspace(str(project.root))

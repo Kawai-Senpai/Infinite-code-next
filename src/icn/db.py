@@ -201,6 +201,12 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 
+CREATE TABLE IF NOT EXISTS index_worktree (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    dirty_paths TEXT NOT NULL,
+    baseline_ready INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS symbols (
     symbol_id            TEXT PRIMARY KEY,
     file_id              TEXT NOT NULL,
@@ -234,6 +240,8 @@ CREATE INDEX IF NOT EXISTS idx_sym_fp     ON symbols(content_fingerprint);
 CREATE INDEX IF NOT EXISTS idx_sym_skel   ON symbols(skeleton_fingerprint);
 CREATE INDEX IF NOT EXISTS idx_sym_file   ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_sym_status ON symbols(status);
+CREATE INDEX IF NOT EXISTS idx_sym_active_name_lookup ON symbols(name COLLATE NOCASE) WHERE status='ACTIVE';
+CREATE INDEX IF NOT EXISTS idx_sym_active_path_lookup ON symbols(symbol_path COLLATE NOCASE) WHERE status='ACTIVE';
 
 -- Edges carry validity, not just existence (PLAN.md sections 5 and 6).
 CREATE TABLE IF NOT EXISTS code_edges (
